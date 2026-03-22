@@ -165,6 +165,7 @@ Notes:
 - `submit=true` indicates the daemon should treat this as the start of a new interaction boundary for `current` capture mode
 - `keys` is optional and supports named special inputs: `enter`, `tab`, `escape`/`esc`, `up`, `down`, `left`, `right`, `backspace`, and `ctrl_c`
 - `text` and `keys` can be combined in one request; special keys are translated to terminal byte sequences before dispatch
+- for attached shell-like takeover flows, a submit-text send now refreshes the current screen boundary and clears any pending unsubmitted line input before dispatch so the new command does not get appended onto partially typed shell text
 - `submit=false` is suitable for raw printable input into an interactive TUI, for example sending `q` to quit `lazygit`
 - printable input is verified in `lazygit`, and named `up`/`escape` key sequences have been verified live through a raw terminal pane
 - function keys and richer modified key combinations are still out of scope for phase 1
@@ -196,6 +197,7 @@ Response:
 Notes:
 
 - `zellij_wait` uses `zjctl pane wait-idle`, so it observes rendered-screen stability rather than process completion
+- if the backend temporarily fails to resolve a freshly managed pane, the daemon retries and can fall back to capture-based stability polling before declaring the handle stale
 - this has been verified live for a spawned `lazygit` pane, but should still be read as an idle heuristic rather than an exact app-ready guarantee
 
 ### `zellij_capture`
