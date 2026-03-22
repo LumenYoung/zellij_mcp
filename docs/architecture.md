@@ -22,7 +22,13 @@ Phase 1 implements:
 Current implementation status:
 
 - live `spawn`, `attach`, `send`, `wait`, `capture`, `close`, and managed `list` are implemented and verified against a real Zellij session
+- live read-only pane discovery is implemented through `zellij_discover`
 - lifecycle state is persisted across `spawn`, `wait`, and `close`, including closed-handle registry updates
+- startup and per-operation stale revalidation are implemented for persisted handles
+- MCP stdio transport is implemented through `rmcp` and verified through local `mcp2cli`
+- named special-key input is implemented for common controls such as arrows, escape, tab, enter, backspace, and ctrl-c
+- `current` capture is repaint-aware for redraw-heavy TUIs, while `full` and `delta` keep snapshot semantics
+- spawn now supports either shell-style `command` or explicit `argv`
 
 Phase 1 does not implement automatic pane scheduling, pane replacement, layout management, or external message bridges.
 
@@ -48,11 +54,16 @@ The current implementation now serves a real MCP stdio endpoint through `rmcp`, 
 
 Handlers validate input, resolve a handle or selector, call the appropriate domain service, and return structured output with stable error codes.
 
+This layer also supports the takeover flow for an already-running pane: `attach` resolves an existing pane selector, creates a fresh daemon handle for it, captures a baseline immediately, and then lets the agent use normal `send`, `wait`, `capture`, `close`, and `list` operations against that handle.
+
+`discover` now sits before that step as a read-only inspection path. It returns live pane metadata plus a bounded preview so the agent can confirm the right target before creating a durable handle.
+
 ### Domain services
 
 Services own business semantics:
 
 - spawn vs attach behavior
+- discover vs attach behavior
 - command boundary resets
 - delta and current capture behavior
 - stale target revalidation
@@ -87,6 +98,8 @@ The daemon returns a stable handle to the agent. The handle is the only durable 
 ### Terminal binding
 
 A binding maps a daemon handle to a live Zellij target.
+
+Bindings can come from either a daemon-created pane (`spawned`) or a user-existing pane (`attached`). The attached path is the current answer to agent takeover of an already-running job: find the pane, attach it, get a new handle, then poll and interact through that handle.
 
 Fields include:
 
@@ -136,11 +149,15 @@ Returns the best-effort textual difference between the latest full capture and t
 
 This is a best-effort interaction boundary, not a true process stdout boundary.
 
+For attached panes, this means the first handle is created against a pane that may already contain user history. The daemon captures that state as the initial baseline at attach time, so follow-up polling is relative to the moment the agent took over rather than to original process start.
+
 Live testing with `lazygit` showed that printable-key input sent through `zjctl pane send` can manipulate a TUI directly. That makes `send` useful beyond shell commands, but it also makes prefix-based `delta` and `current` extraction less trustworthy for redraw-heavy interfaces.
 
 The current implementation now special-cases repaint-heavy captures for `current`: when the pane content includes clear-screen, home-cursor, or carriage-return style redraws, the daemon normalizes the latest visible frame and returns that snapshot instead of trying raw prefix subtraction. `full` and `delta` remain unchanged so append-only shell flows keep their previous behavior.
 
 The daemon now also supports a small named-key layer for common control sequences such as arrows, escape, tab, enter, backspace, and ctrl-c by translating them to terminal byte sequences before dispatch.
+
+`capture` also supports optional line-window shaping through `tail_lines`. This clips the already-computed `full`, `delta`, or `current` result before it is returned, while observation baselines continue to update from the untrimmed full snapshot.
 
 ## Persistence and Recovery
 
@@ -204,3 +221,6 @@ Verified so far:
 4. named `up` and `escape` key input have been verified through a real pane using the daemon's special-key send path
 5. `mcp2cli --mcp-stdio` can initialize the daemon, list tools, and call `zellij_list` against the stdio transport
 6. `current` capture against a live `btop` pane now returns a normalized readable screen snapshot after redraws instead of ANSI-heavy prefix noise
+7. both string-command and explicit-argv spawn forms are validated and covered by tests, with invalid input rejected before any Zellij tab action runs
+8. attach already supports taking over an existing pane by selector and converting it into a managed daemon handle
+9. `zellij_discover` has been verified live in a non-`gpu` session and returns command, focus state, and bounded preview text for candidate panes

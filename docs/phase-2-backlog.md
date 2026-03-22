@@ -27,6 +27,7 @@ The following features are intentionally deferred to phase 2 or later.
 
 - replace a running pane process with a new command
 - controlled reuse of an existing pane without manual attach semantics
+- higher-level takeover helpers that search candidate panes and attach automatically; manual attach-by-selector already exists in phase 1
 
 ### Richer orchestration
 
@@ -37,7 +38,7 @@ The following features are intentionally deferred to phase 2 or later.
 ### Layout and targeting enhancements
 
 - layout inspection and mutation
-- richer selector support surfaced directly to tool inputs
+- richer selector support surfaced directly to tool inputs beyond the current discover-plus-attach flow
 - safer multi-client focus handling
 
 ### Improved output semantics
@@ -46,6 +47,7 @@ The following features are intentionally deferred to phase 2 or later.
 - larger output windows with chunking and resume cursors
 - ANSI-aware normalization controls
 - TUI-aware diffing that handles redraw-heavy screens more gracefully than simple prefix subtraction
+- richer preview and clipping controls beyond the current `preview_lines` and `tail_lines` line windows
 
 ## Why These Are Deferred
 
@@ -59,3 +61,15 @@ Phase 2 work should begin once phase 1 proves these behaviors in practice:
 - full and delta capture are useful in real agent loops
 - persistence plus stale revalidation survive daemon restarts
 - backend `zjctl` behavior is stable enough to support stronger guarantees
+
+## Current Position
+
+Phase 1 now covers the core control loop:
+
+- spawn a managed pane or attach to an existing pane to create a handle
+- discover unmanaged panes before attach when the agent needs to identify an existing job first
+- send text or a basic named-key set to that handle
+- wait for idle, capture in `full` / `delta` / repaint-aware `current`, and close when appropriate
+- restart the daemon and rely on persisted bindings plus stale revalidation
+
+Phase 2 should therefore focus on stronger guarantees and better ergonomics, not on basic daemon control-plane coverage.

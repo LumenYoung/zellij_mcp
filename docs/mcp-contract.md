@@ -76,6 +76,8 @@ Response:
 
 Attach a live pane to daemon management.
 
+This is the current takeover path when a pane already exists and the agent should start managing it after the fact.
+
 Input:
 
 ```json
@@ -92,14 +94,54 @@ Notes:
 - the selector must resolve to exactly one target
 - attach establishes a baseline observation immediately
 - attached panes are considered interactive and may already contain user state
+- after attach returns, the pane behaves like any other managed handle: the agent can `send`, `wait`, `capture`, `close`, and `list` against it
+- this is the intended flow when a human or another tool already spawned the job and the agent should continue from the current pane state rather than spawn a fresh one
+- recommended flow: call `zellij_discover` first, inspect the returned metadata and preview, then attach with the exact returned `selector`
+
+### `zellij_discover`
+
+Discover live panes before attaching.
+
+Input:
+
+```json
+{
+  "session_name": "zellij-lazygit-demo",
+  "tab_name": "Tab 4",
+  "selector": "id:terminal:7",
+  "include_preview": true,
+  "preview_lines": 8
+}
+```
+
+Notes:
+
+- `zellij_discover` is read-only and does not create handles or persistence state
+- `tab_name` and `selector` are optional narrowing filters
+- `include_preview=false` returns metadata only
+- `preview_lines` must be greater than zero when provided
+- shell-like panes return `preview_basis="recent_lines"`
+- repaint-heavy panes return `preview_basis="visible_frame"`
+- the returned `selector` is attach-ready and should be reused directly for `zellij_attach`
 
 Response:
 
 ```json
 {
-  "handle": "zh_...",
-  "attached": true,
-  "baseline_established": true
+  "candidates": [
+    {
+      "selector": "id:terminal:7",
+      "pane_id": "terminal:7",
+      "session_name": "zellij-lazygit-demo",
+      "tab_name": "Tab 4",
+      "title": "step5-argv",
+      "command": "sh -c printf argv-form-demo\\n; exec cat",
+      "focused": true,
+      "preview": "...",
+      "preview_basis": "recent_lines",
+      "captured_at": "2026-03-22T00:00:00Z"
+    }
+  ]
 }
 ```
 
@@ -165,7 +207,8 @@ Input:
 ```json
 {
   "handle": "zh_...",
-  "mode": "full"
+  "mode": "full",
+  "tail_lines": 20
 }
 ```
 
@@ -182,6 +225,8 @@ Response:
   "handle": "zh_...",
   "mode": "delta",
   "content": "new lines...",
+  "tail_lines": 20,
+  "line_window_applied": true,
   "truncated": false,
   "captured_at": "2026-03-22T00:00:00Z",
   "baseline": "last_capture"
@@ -194,6 +239,8 @@ Semantics:
 - `current` is best-effort and may over-include prior output if the pane was already active before attach
 - for redraw-heavy TUIs, `current` now prefers a normalized latest visible frame over raw prefix subtraction when the capture contains clear-screen, home-cursor, or carriage-return style repaint sequences
 - `delta` and `full` intentionally keep their previous snapshot semantics so shell-style append flows do not regress
+- `tail_lines` is optional output shaping applied after semantic capture computation; it does not change baseline tracking
+- `tail_lines` must be greater than zero when provided
 
 ### `zellij_close`
 
@@ -254,6 +301,10 @@ Input:
 - `send` supports a basic named-key layer for common control sequences in addition to printable text
 - `spawn`, `wait`, and `close` are available through the daemon and have been verified against a real Zellij session
 - `spawn` preserves quoted command arguments using shell-aware parsing
+- `spawn` also supports explicit `argv` input without shell parsing
+- `attach` can convert an existing live pane into a managed daemon handle for takeover-style agent workflows
+- `discover` can inspect unmanaged panes before attach and returns attach-ready selectors with bounded preview text
+- `capture` can clip returned output with `tail_lines` while keeping `full` / `delta` / `current` semantics stable
 
 ## Phase 1 Limitations
 
