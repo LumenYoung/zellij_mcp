@@ -175,6 +175,8 @@ Semantics:
 
 - first `delta` call may return the full captured content and initialize the baseline
 - `current` is best-effort and may over-include prior output if the pane was already active before attach
+- for redraw-heavy TUIs, `current` now prefers a normalized latest visible frame over raw prefix subtraction when the capture contains clear-screen, home-cursor, or carriage-return style repaint sequences
+- `delta` and `full` intentionally keep their previous snapshot semantics so shell-style append flows do not regress
 
 ### `zellij_close`
 

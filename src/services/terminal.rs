@@ -100,6 +100,78 @@ where
         }
     }
 
+    fn is_repaint_heavy(content: &str) -> bool {
+        let mut chars = content.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\r' {
+                return true;
+            }
+
+            if ch != '\u{1b}' || chars.peek() != Some(&'[') {
+                continue;
+            }
+
+            chars.next();
+            let mut sequence = String::new();
+            while let Some(&next) = chars.peek() {
+                sequence.push(next);
+                chars.next();
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+
+            if Self::is_full_frame_reset_sequence(&sequence) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn normalize_current_frame(content: &str) -> String {
+        let mut output = String::new();
+        let mut chars = content.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    let mut sequence = String::new();
+                    while let Some(&next) = chars.peek() {
+                        sequence.push(next);
+                        chars.next();
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+
+                    if Self::is_full_frame_reset_sequence(&sequence) {
+                        output.clear();
+                    }
+                }
+                continue;
+            }
+
+            if ch == '\r' {
+                if let Some(line_start) = output.rfind('\n') {
+                    output.truncate(line_start + 1);
+                } else {
+                    output.clear();
+                }
+                continue;
+            }
+
+            output.push(ch);
+        }
+
+        output
+    }
+
+    fn is_full_frame_reset_sequence(sequence: &str) -> bool {
+        matches!(sequence, "H" | "2J" | "H2J" | "2JH")
+    }
+
     fn map_adapter_error(&self, error: AdapterError, code: ErrorCode) -> DomainError {
         match error {
             AdapterError::ZjctlUnavailable => {
@@ -428,7 +500,11 @@ where
                 Self::suffix_after_baseline(&snapshot.content, previous_full.as_deref())
             }
             CaptureMode::Current => {
-                Self::suffix_after_baseline(&snapshot.content, boundary_full.as_deref())
+                if Self::is_repaint_heavy(&snapshot.content) {
+                    Self::normalize_current_frame(&snapshot.content)
+                } else {
+                    Self::suffix_after_baseline(&snapshot.content, boundary_full.as_deref())
+                }
             }
         };
         let baseline = match request.mode {
@@ -658,6 +734,7 @@ mod tests {
     struct MockAdapter {
         target: ResolvedTarget,
         captures: Vec<String>,
+        capture_index: Arc<Mutex<usize>>,
         sent_inputs: Arc<Mutex<Vec<(String, bool)>>>,
         resolve_missing_target: bool,
         send_missing_target: bool,
@@ -676,12 +753,24 @@ mod tests {
                     title: Some("editor".to_string()),
                 },
                 captures: vec![content.to_string()],
+                capture_index: Arc::new(Mutex::new(0)),
                 sent_inputs: Arc::new(Mutex::new(Vec::new())),
                 resolve_missing_target: false,
                 send_missing_target: false,
                 wait_missing_target: false,
                 capture_missing_target: false,
             }
+        }
+
+        fn capture_sequence(contents: &[&str]) -> Self {
+            let mut adapter = Self::single_capture(
+                contents
+                    .first()
+                    .copied()
+                    .expect("mock capture sequence should not be empty"),
+            );
+            adapter.captures = contents.iter().map(|item| (*item).to_string()).collect();
+            adapter
         }
     }
 
@@ -752,7 +841,15 @@ mod tests {
             }
             let content = self
                 .captures
-                .last()
+                .get({
+                    let mut index = self
+                        .capture_index
+                        .lock()
+                        .expect("capture index lock should succeed");
+                    let current = (*index).min(self.captures.len().saturating_sub(1));
+                    *index = index.saturating_add(1);
+                    current
+                })
                 .cloned()
                 .expect("mock capture content should exist");
             Ok(CaptureSnapshot {
@@ -839,6 +936,156 @@ mod tests {
             .expect("list should succeed");
 
         assert_eq!(listed.bindings.len(), 1);
+    }
+
+    #[test]
+    fn delta_mode_shell_append_only_still_returns_increment() {
+        let service = make_service(MockAdapter::capture_sequence(&[
+            "hello\n",
+            "hello\nworld\n",
+        ]));
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        let response = service
+            .capture(CaptureRequest {
+                handle: attach.handle,
+                mode: CaptureMode::Delta,
+            })
+            .expect("delta capture should succeed");
+
+        assert_eq!(response.capture.content, "world\n");
+    }
+
+    #[test]
+    fn full_mode_returns_entire_capture_unchanged() {
+        let service = make_service(MockAdapter::capture_sequence(&[
+            "hello\n",
+            "hello\nworld\n",
+        ]));
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        let response = service
+            .capture(CaptureRequest {
+                handle: attach.handle,
+                mode: CaptureMode::Full,
+            })
+            .expect("full capture should succeed");
+
+        assert_eq!(response.capture.content, "hello\nworld\n");
+    }
+
+    #[test]
+    fn detect_repaint_from_clear_or_home_sequences() {
+        assert!(TerminalService::<MockAdapter>::is_repaint_heavy(
+            "\u{1b}[2J\u{1b}[Htop\ncpu 12%\n"
+        ));
+        assert!(TerminalService::<MockAdapter>::is_repaint_heavy(
+            "\u{1b}[Htop\ncpu 12%\n"
+        ));
+        assert!(!TerminalService::<MockAdapter>::is_repaint_heavy(
+            "hello\nworld\n"
+        ));
+    }
+
+    #[test]
+    fn normalize_current_frame_applies_clear_home_cr() {
+        let content = "\u{1b}[2J\u{1b}[Htop\ncpu 10%\n\r\u{1b}[Htop\ncpu 12%\nmem 40%\n";
+
+        assert_eq!(
+            TerminalService::<MockAdapter>::normalize_current_frame(content),
+            "top\ncpu 12%\nmem 40%\n"
+        );
+    }
+
+    #[test]
+    fn current_mode_redraw_returns_latest_stable_screen() {
+        let service = make_service(MockAdapter::capture_sequence(&[
+            "\u{1b}[2J\u{1b}[Htop\ncpu 10%\nmem 40%\n",
+            "\u{1b}[Htop\ncpu 12%\nmem 40%\n",
+        ]));
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        let response = service
+            .capture(CaptureRequest {
+                handle: attach.handle,
+                mode: CaptureMode::Current,
+            })
+            .expect("current capture should succeed");
+
+        assert_eq!(response.capture.content, "top\ncpu 12%\nmem 40%\n");
+    }
+
+    #[test]
+    fn current_mode_without_repaint_keeps_command_boundary_suffix_behavior() {
+        let service = make_service(MockAdapter::capture_sequence(&[
+            "prompt> ",
+            "prompt> result\n",
+        ]));
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        let response = service
+            .capture(CaptureRequest {
+                handle: attach.handle,
+                mode: CaptureMode::Current,
+            })
+            .expect("current capture should succeed");
+
+        assert_eq!(response.capture.content, "result\n");
+    }
+
+    #[test]
+    fn detect_repaint_accepts_supported_clear_sequence_order() {
+        assert!(TerminalService::<MockAdapter>::is_repaint_heavy(
+            "\u{1b}[H\u{1b}[2Jtop\n"
+        ));
+    }
+
+    #[test]
+    fn normalize_current_frame_does_not_clear_on_cursor_positioning() {
+        let content = "prefix\n\u{1b}[10;20Hsuffix\n";
+
+        assert_eq!(
+            TerminalService::<MockAdapter>::normalize_current_frame(content),
+            "prefix\nsuffix\n"
+        );
+    }
+
+    #[test]
+    fn normalize_current_frame_does_not_clear_on_partial_erase() {
+        let content = "prefix\n\u{1b}[0Jsuffix\n";
+
+        assert_eq!(
+            TerminalService::<MockAdapter>::normalize_current_frame(content),
+            "prefix\nsuffix\n"
+        );
     }
 
     #[test]

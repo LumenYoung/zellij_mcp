@@ -118,7 +118,7 @@ Fields include:
 
 Returns the current content that can be captured from the pane. This is the most stable mode and the basis for the other capture modes.
 
-For full-screen TUIs, `full` is the only mode currently verified as reliable.
+For full-screen TUIs, `full` remains the most conservative mode, while `current` now also has live verification for repaint-heavy screens through its frame-normalization path.
 
 Live lifecycle testing also showed that `wait` works for a spawned `lazygit` pane, but `wait_ready=true` should not be treated as a universal readiness signal for redraw-heavy TUIs.
 
@@ -137,6 +137,8 @@ Returns the best-effort textual difference between the latest full capture and t
 This is a best-effort interaction boundary, not a true process stdout boundary.
 
 Live testing with `lazygit` showed that printable-key input sent through `zjctl pane send` can manipulate a TUI directly. That makes `send` useful beyond shell commands, but it also makes prefix-based `delta` and `current` extraction less trustworthy for redraw-heavy interfaces.
+
+The current implementation now special-cases repaint-heavy captures for `current`: when the pane content includes clear-screen, home-cursor, or carriage-return style redraws, the daemon normalizes the latest visible frame and returns that snapshot instead of trying raw prefix subtraction. `full` and `delta` remain unchanged so append-only shell flows keep their previous behavior.
 
 The daemon now also supports a small named-key layer for common control sequences such as arrows, escape, tab, enter, backspace, and ctrl-c by translating them to terminal byte sequences before dispatch.
 
@@ -201,3 +203,4 @@ Verified so far:
 3. a new managed pane can be spawned, waited on, and closed through the daemon, with closed status persisted in local state
 4. named `up` and `escape` key input have been verified through a real pane using the daemon's special-key send path
 5. `mcp2cli --mcp-stdio` can initialize the daemon, list tools, and call `zellij_list` against the stdio transport
+6. `current` capture against a live `btop` pane now returns a normalized readable screen snapshot after redraws instead of ANSI-heavy prefix noise
