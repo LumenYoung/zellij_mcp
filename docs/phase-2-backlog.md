@@ -19,7 +19,7 @@ The following features are intentionally deferred to phase 2 or later.
 
 ### Richer interactive input
 
-- explicit support for special keys such as escape, arrows, and function keys
+- expanded support for special keys beyond the current basic set, especially function keys and modified chords
 - a clearer tool contract for TUI-oriented input versus shell command submission
 - optional key-sequence encoding instead of plain text only
 

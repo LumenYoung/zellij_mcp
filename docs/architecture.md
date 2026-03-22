@@ -136,6 +136,8 @@ This is a best-effort interaction boundary, not a true process stdout boundary.
 
 Live testing with `lazygit` showed that printable-key input sent through `zjctl pane send` can manipulate a TUI directly. That makes `send` useful beyond shell commands, but it also makes prefix-based `delta` and `current` extraction less trustworthy for redraw-heavy interfaces.
 
+The daemon now also supports a small named-key layer for common control sequences such as arrows, escape, tab, enter, backspace, and ctrl-c by translating them to terminal byte sequences before dispatch.
+
 ## Persistence and Recovery
 
 Suggested storage files:
@@ -195,3 +197,4 @@ Verified so far:
 1. a fresh session can host the `zrpc` plugin after approval and pass `zjctl doctor`
 2. a `lazygit` pane can be attached, listed, captured, and controlled with printable-key input through the daemon
 3. a new managed pane can be spawned, waited on, and closed through the daemon, with closed status persisted in local state
+4. named `up` and `escape` key input have been verified through a real pane using the daemon's special-key send path

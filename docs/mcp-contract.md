@@ -89,6 +89,7 @@ Input:
 {
   "handle": "zh_...",
   "text": ":w",
+  "keys": ["escape", "up"],
   "submit": true
 }
 ```
@@ -96,8 +97,11 @@ Input:
 Notes:
 
 - `submit=true` indicates the daemon should treat this as the start of a new interaction boundary for `current` capture mode
+- `keys` is optional and supports named special inputs: `enter`, `tab`, `escape`/`esc`, `up`, `down`, `left`, `right`, `backspace`, and `ctrl_c`
+- `text` and `keys` can be combined in one request; special keys are translated to terminal byte sequences before dispatch
 - `submit=false` is suitable for raw printable input into an interactive TUI, for example sending `q` to quit `lazygit`
-- this is currently verified for printable character input, not for special keys such as arrows, escape, or function keys
+- printable input is verified in `lazygit`, and named `up`/`escape` key sequences have been verified live through a raw terminal pane
+- function keys and richer modified key combinations are still out of scope for phase 1
 
 ### `zellij_wait`
 
@@ -221,6 +225,7 @@ Input:
 - full capture is the primary source of truth
 - delta and current modes are derived from daemon snapshots
 - `send` can deliver printable text input to an attached interactive pane
+- `send` supports a basic named-key layer for common control sequences in addition to printable text
 - `spawn`, `wait`, and `close` are available through the daemon and have been verified against a real Zellij session
 - `spawn` preserves quoted command arguments using shell-aware parsing
 
