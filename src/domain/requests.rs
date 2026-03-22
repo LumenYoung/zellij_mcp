@@ -24,7 +24,10 @@ pub struct AttachRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SendRequest {
     pub handle: String,
+    #[serde(default)]
     pub text: String,
+    #[serde(default)]
+    pub keys: Vec<String>,
     pub submit: bool,
 }
 

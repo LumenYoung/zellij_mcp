@@ -161,6 +161,29 @@ where
         Ok(())
     }
 
+    fn build_send_payload(request: &SendRequest) -> Result<(String, bool), DomainError> {
+        let mut payload = request.text.clone();
+
+        for key in &request.keys {
+            payload.push_str(&map_key_sequence(key)?);
+        }
+
+        if payload.is_empty() {
+            return Err(DomainError::new(
+                ErrorCode::InvalidArgument,
+                "send requires non-empty text or at least one key".to_string(),
+                false,
+            ));
+        }
+
+        let submit = request.submit && request.keys.is_empty();
+        if request.submit && !request.keys.is_empty() {
+            payload.push('\n');
+        }
+
+        Ok((payload, submit))
+    }
+
     fn revalidate_binding(&self, binding: &TerminalBinding) -> Result<TerminalStatus, DomainError> {
         if matches!(binding.status, TerminalStatus::Closed) {
             return Ok(TerminalStatus::Closed);
@@ -440,16 +463,12 @@ where
         self.ensure_available()?;
 
         let binding = self.ensure_handle_revalidated(&request.handle)?;
+        let (payload, submit) = Self::build_send_payload(&request)?;
 
         Self::ensure_binding_active(&binding)?;
 
         self.adapter
-            .send_input(
-                &binding.session_name,
-                &binding.selector,
-                &request.text,
-                request.submit,
-            )
+            .send_input(&binding.session_name, &binding.selector, &payload, submit)
             .map_err(|error| {
                 if Self::is_missing_target_error(&error) {
                     let _ = self.mark_binding_stale(&request.handle);
@@ -604,8 +623,29 @@ where
     }
 }
 
+fn map_key_sequence(key: &str) -> Result<&'static str, DomainError> {
+    match key {
+        "enter" => Ok("\n"),
+        "tab" => Ok("\t"),
+        "escape" | "esc" => Ok("\u{1b}"),
+        "up" => Ok("\u{1b}[A"),
+        "down" => Ok("\u{1b}[B"),
+        "right" => Ok("\u{1b}[C"),
+        "left" => Ok("\u{1b}[D"),
+        "backspace" => Ok("\u{7f}"),
+        "ctrl_c" => Ok("\u{3}"),
+        other => Err(DomainError::new(
+            ErrorCode::InvalidArgument,
+            format!("unsupported special key `{other}`"),
+            false,
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use crate::adapters::zjctl::{CaptureSnapshot, ResolvedTarget, ZjctlAdapter};
     use crate::domain::requests::{
         AttachRequest, CloseRequest, ListRequest, SendRequest, SpawnRequest, WaitRequest,
@@ -618,6 +658,7 @@ mod tests {
     struct MockAdapter {
         target: ResolvedTarget,
         captures: Vec<String>,
+        sent_inputs: Arc<Mutex<Vec<(String, bool)>>>,
         resolve_missing_target: bool,
         send_missing_target: bool,
         wait_missing_target: bool,
@@ -635,6 +676,7 @@ mod tests {
                     title: Some("editor".to_string()),
                 },
                 captures: vec![content.to_string()],
+                sent_inputs: Arc::new(Mutex::new(Vec::new())),
                 resolve_missing_target: false,
                 send_missing_target: false,
                 wait_missing_target: false,
@@ -668,14 +710,18 @@ mod tests {
             &self,
             _session_name: &str,
             _handle: &str,
-            _text: &str,
-            _submit: bool,
+            text: &str,
+            submit: bool,
         ) -> Result<(), AdapterError> {
             if self.send_missing_target {
                 return Err(AdapterError::CommandFailed(
                     "RPC error: no panes match selector".to_string(),
                 ));
             }
+            self.sent_inputs
+                .lock()
+                .expect("sent inputs lock should succeed")
+                .push((text.to_string(), submit));
             Ok(())
         }
 
@@ -811,11 +857,64 @@ mod tests {
             .send(SendRequest {
                 handle: attach.handle,
                 text: "printf 'ok'".to_string(),
+                keys: vec![],
                 submit: true,
             })
             .expect("send should succeed");
 
         assert!(response.accepted);
+    }
+
+    #[test]
+    fn send_maps_special_keys_to_control_sequences() {
+        let adapter = MockAdapter::single_capture("baseline");
+        let sent_inputs = adapter.sent_inputs.clone();
+        let service = make_service(adapter);
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        service
+            .send(SendRequest {
+                handle: attach.handle,
+                text: String::new(),
+                keys: vec!["up".to_string(), "escape".to_string(), "tab".to_string()],
+                submit: false,
+            })
+            .expect("send should succeed");
+
+        let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
+        assert_eq!(sent[0].0, "\u{1b}[A\u{1b}\t");
+        assert!(!sent[0].1);
+    }
+
+    #[test]
+    fn send_rejects_unknown_special_key() {
+        let service = make_service(MockAdapter::single_capture("baseline"));
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        let error = service
+            .send(SendRequest {
+                handle: attach.handle,
+                text: String::new(),
+                keys: vec!["hyperjump".to_string()],
+                submit: false,
+            })
+            .expect_err("unknown key should fail");
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
     }
 
     #[test]
@@ -847,6 +946,7 @@ mod tests {
             .send(SendRequest {
                 handle: attach.handle.clone(),
                 text: "run".to_string(),
+                keys: vec![],
                 submit: true,
             })
             .expect("send should succeed");
@@ -953,6 +1053,7 @@ mod tests {
             .send(SendRequest {
                 handle: attach.handle,
                 text: "run".to_string(),
+                keys: vec![],
                 submit: false,
             })
             .expect_err("send should reject closed handle");
@@ -977,6 +1078,7 @@ mod tests {
             .send(SendRequest {
                 handle: attach.handle.clone(),
                 text: "run".to_string(),
+                keys: vec![],
                 submit: false,
             })
             .expect_err("send should fail on missing target");
