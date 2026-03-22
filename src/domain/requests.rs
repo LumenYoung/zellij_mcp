@@ -9,7 +9,8 @@ pub struct SpawnRequest {
     pub target: SpawnTarget,
     pub tab_name: Option<String>,
     pub cwd: Option<String>,
-    pub command: String,
+    pub command: Option<String>,
+    pub argv: Option<Vec<String>>,
     pub title: Option<String>,
     pub wait_ready: bool,
 }

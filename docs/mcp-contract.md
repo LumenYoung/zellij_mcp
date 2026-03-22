@@ -29,7 +29,22 @@ Input:
   "tab_name": "editor",
   "cwd": "/home/yang/Documents/git/project",
   "command": "nvim",
+  "argv": null,
   "title": "main-editor",
+  "wait_ready": true
+}
+```
+
+Explicit argv form:
+
+```json
+{
+  "session_name": "gpu",
+  "target": "existing_tab",
+  "tab_name": "editor",
+  "cwd": "/home/yang/Documents/git/project",
+  "argv": ["bash", "-lc", "printf 'hello from argv\\n'"],
+  "title": "argv-demo",
   "wait_ready": true
 }
 ```
@@ -39,8 +54,10 @@ Notes:
 - `target` supports `new_tab` and `existing_tab`
 - `existing_tab` means spawn a new dedicated pane inside the tab
 - phase 1 does not replace existing processes in an existing pane
+- use either `command` or `argv`, not both
 - `command` is parsed with shell-style quoting, so inputs like `bash -lc 'echo hello world'` preserve the intended argv shape
-- malformed shell quoting in `command` fails early as an argument parse error instead of spawning a mangled command
+- `argv` bypasses shell parsing and is passed to `zjctl` as-is
+- malformed shell quoting in `command`, blank `command`, empty `argv`, blank `argv[0]`, or mixed `command` + `argv` input fails early as an argument parse error instead of spawning a mangled command
 - `wait_ready=true` currently runs the same rendered-screen idle check as `zellij_wait`; it works for shell-like startup and was live-tested with `lazygit`, but redraw-heavy TUIs may still make it a noisy readiness proxy
 
 Response:

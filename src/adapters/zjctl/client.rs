@@ -164,37 +164,13 @@ impl ZjctlAdapter for ZjctlClient {
     }
 
     fn spawn(&self, _request: &SpawnRequest) -> Result<ResolvedTarget, AdapterError> {
-        match _request.target {
-            SpawnTarget::NewTab => {
-                let mut args = vec!["new-tab".to_string()];
-                if let Some(tab_name) = &_request.tab_name {
-                    args.push("--name".to_string());
-                    args.push(tab_name.clone());
-                }
-                if let Some(cwd) = &_request.cwd {
-                    args.push("--cwd".to_string());
-                    args.push(cwd.clone());
-                }
-                self.run_zellij_action(&_request.session_name, &args)?;
-            }
-            SpawnTarget::ExistingTab => {
-                if let Some(tab_name) = &_request.tab_name {
-                    self.run_zellij_action(
-                        &_request.session_name,
-                        &["go-to-tab-name".to_string(), tab_name.clone()],
-                    )?;
-                }
-            }
+        let prepared = prepare_spawn(_request)?;
+
+        if let Some(action_args) = prepared.action_args.as_ref() {
+            self.run_zellij_action(&_request.session_name, action_args)?;
         }
 
-        let stdout = self.run_command(
-            Some(&_request.session_name),
-            ZjctlCommand::Spawn {
-                cwd: _request.cwd.clone(),
-                title: _request.title.clone(),
-                command: parse_command(&_request.command)?,
-            },
-        )?;
+        let stdout = self.run_command(Some(&_request.session_name), prepared.command)?;
         let text = String::from_utf8_lossy(&stdout);
         let spawned = parse_spawn_output(
             &text,
@@ -340,6 +316,77 @@ fn parse_command(command: &str) -> Result<Vec<String>, AdapterError> {
         .map_err(|error| AdapterError::ParseError(format!("invalid spawn command: {error}")))
 }
 
+fn resolve_spawn_command(request: &SpawnRequest) -> Result<Vec<String>, AdapterError> {
+    match (request.command.as_deref(), request.argv.as_ref()) {
+        (Some(_), Some(_)) => Err(AdapterError::ParseError(
+            "spawn requires either `command` or `argv`, not both".to_string(),
+        )),
+        (None, None) => Err(AdapterError::ParseError(
+            "spawn requires either `command` or `argv`".to_string(),
+        )),
+        (Some(command), None) => {
+            if command.trim().is_empty() {
+                return Err(AdapterError::ParseError(
+                    "spawn `command` must not be blank".to_string(),
+                ));
+            }
+
+            let parsed = parse_command(command)?;
+            if parsed.is_empty() {
+                return Err(AdapterError::ParseError(
+                    "spawn `command` must produce at least one argv element".to_string(),
+                ));
+            }
+
+            Ok(parsed)
+        }
+        (None, Some(argv)) if argv.is_empty() => Err(AdapterError::ParseError(
+            "spawn `argv` must contain at least one element".to_string(),
+        )),
+        (None, Some(argv)) if argv[0].trim().is_empty() => Err(AdapterError::ParseError(
+            "spawn `argv[0]` must not be blank".to_string(),
+        )),
+        (None, Some(argv)) => Ok(argv.clone()),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedSpawn {
+    action_args: Option<Vec<String>>,
+    command: ZjctlCommand,
+}
+
+fn prepare_spawn(request: &SpawnRequest) -> Result<PreparedSpawn, AdapterError> {
+    let command = resolve_spawn_command(request)?;
+    let action_args = match request.target {
+        SpawnTarget::NewTab => {
+            let mut args = vec!["new-tab".to_string()];
+            if let Some(tab_name) = &request.tab_name {
+                args.push("--name".to_string());
+                args.push(tab_name.clone());
+            }
+            if let Some(cwd) = &request.cwd {
+                args.push("--cwd".to_string());
+                args.push(cwd.clone());
+            }
+            Some(args)
+        }
+        SpawnTarget::ExistingTab => request
+            .tab_name
+            .as_ref()
+            .map(|tab_name| vec!["go-to-tab-name".to_string(), tab_name.clone()]),
+    };
+
+    Ok(PreparedSpawn {
+        action_args,
+        command: ZjctlCommand::Spawn {
+            cwd: request.cwd.clone(),
+            title: request.title.clone(),
+            command,
+        },
+    })
+}
+
 fn format_seconds(milliseconds: u64) -> String {
     let duration = Duration::from_millis(milliseconds);
     format!("{:.1}", duration.as_secs_f64())
@@ -348,8 +395,15 @@ fn format_seconds(milliseconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use crate::adapters::zjctl::AdapterError;
+    use crate::adapters::zjctl::ZjctlCommand;
 
-    use super::{ResolvedTarget, format_seconds, matches_selector, parse_command};
+    use crate::domain::requests::SpawnRequest;
+    use crate::domain::status::SpawnTarget;
+
+    use super::{
+        PreparedSpawn, ResolvedTarget, format_seconds, matches_selector, parse_command,
+        prepare_spawn, resolve_spawn_command,
+    };
 
     #[test]
     fn matches_exact_id_selector() {
@@ -391,6 +445,195 @@ mod tests {
     fn rejects_invalid_quoted_spawn_command() {
         let error = parse_command("bash -lc 'echo hello").expect_err("command should fail");
         assert!(matches!(error, AdapterError::ParseError(_)));
+    }
+
+    #[test]
+    fn spawn_string_form_preserves_shell_parsing() {
+        let request = SpawnRequest {
+            session_name: "gpu".to_string(),
+            target: SpawnTarget::ExistingTab,
+            tab_name: Some("editor".to_string()),
+            cwd: None,
+            command: Some("bash -lc 'echo hello world'".to_string()),
+            argv: None,
+            title: None,
+            wait_ready: false,
+        };
+
+        assert_eq!(
+            resolve_spawn_command(&request).expect("command should resolve"),
+            vec!["bash", "-lc", "echo hello world"]
+        );
+    }
+
+    #[test]
+    fn spawn_argv_form_bypasses_shell_parsing() {
+        let request = SpawnRequest {
+            session_name: "gpu".to_string(),
+            target: SpawnTarget::ExistingTab,
+            tab_name: Some("editor".to_string()),
+            cwd: None,
+            command: None,
+            argv: Some(vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                "echo $HOME".to_string(),
+            ]),
+            title: None,
+            wait_ready: false,
+        };
+
+        assert_eq!(
+            resolve_spawn_command(&request).expect("argv should resolve"),
+            vec!["bash", "-lc", "echo $HOME"]
+        );
+    }
+
+    #[test]
+    fn spawn_rejects_command_and_argv_together() {
+        let request = SpawnRequest {
+            session_name: "gpu".to_string(),
+            target: SpawnTarget::ExistingTab,
+            tab_name: Some("editor".to_string()),
+            cwd: None,
+            command: Some("git status".to_string()),
+            argv: Some(vec!["git".to_string(), "status".to_string()]),
+            title: None,
+            wait_ready: false,
+        };
+
+        let error = resolve_spawn_command(&request).expect_err("mixed command forms should fail");
+        assert!(matches!(error, AdapterError::ParseError(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("either `command` or `argv`, not both")
+        );
+    }
+
+    #[test]
+    fn spawn_rejects_missing_command_and_argv() {
+        let request = SpawnRequest {
+            session_name: "gpu".to_string(),
+            target: SpawnTarget::ExistingTab,
+            tab_name: Some("editor".to_string()),
+            cwd: None,
+            command: None,
+            argv: None,
+            title: None,
+            wait_ready: false,
+        };
+
+        let error = resolve_spawn_command(&request).expect_err("missing command forms should fail");
+        assert!(matches!(error, AdapterError::ParseError(_)));
+        assert!(error.to_string().contains("either `command` or `argv`"));
+    }
+
+    #[test]
+    fn spawn_rejects_empty_argv() {
+        let request = SpawnRequest {
+            session_name: "gpu".to_string(),
+            target: SpawnTarget::ExistingTab,
+            tab_name: Some("editor".to_string()),
+            cwd: None,
+            command: None,
+            argv: Some(vec![]),
+            title: None,
+            wait_ready: false,
+        };
+
+        let error = resolve_spawn_command(&request).expect_err("empty argv should fail");
+        assert!(matches!(error, AdapterError::ParseError(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("must contain at least one element")
+        );
+    }
+
+    #[test]
+    fn spawn_rejects_blank_argv_zero() {
+        let request = SpawnRequest {
+            session_name: "gpu".to_string(),
+            target: SpawnTarget::ExistingTab,
+            tab_name: Some("editor".to_string()),
+            cwd: None,
+            command: None,
+            argv: Some(vec!["   ".to_string(), "status".to_string()]),
+            title: None,
+            wait_ready: false,
+        };
+
+        let error = resolve_spawn_command(&request).expect_err("blank argv[0] should fail");
+        assert!(matches!(error, AdapterError::ParseError(_)));
+        assert!(error.to_string().contains("`argv[0]` must not be blank"));
+    }
+
+    #[test]
+    fn spawn_rejects_blank_command() {
+        let request = SpawnRequest {
+            session_name: "gpu".to_string(),
+            target: SpawnTarget::NewTab,
+            tab_name: Some("editor".to_string()),
+            cwd: None,
+            command: Some("   ".to_string()),
+            argv: None,
+            title: None,
+            wait_ready: false,
+        };
+
+        let error = resolve_spawn_command(&request).expect_err("blank command should fail");
+        assert!(matches!(error, AdapterError::ParseError(_)));
+        assert!(error.to_string().contains("must not be blank"));
+    }
+
+    #[test]
+    fn invalid_spawn_input_fails_before_any_tab_action_plan() {
+        let request = SpawnRequest {
+            session_name: "gpu".to_string(),
+            target: SpawnTarget::NewTab,
+            tab_name: Some("editor".to_string()),
+            cwd: Some("/tmp".to_string()),
+            command: Some("git status".to_string()),
+            argv: Some(vec!["git".to_string(), "status".to_string()]),
+            title: None,
+            wait_ready: false,
+        };
+
+        let error = prepare_spawn(&request).expect_err("invalid spawn should fail before planning");
+        assert!(matches!(error, AdapterError::ParseError(_)));
+    }
+
+    #[test]
+    fn prepare_spawn_builds_tab_action_after_validation() {
+        let request = SpawnRequest {
+            session_name: "gpu".to_string(),
+            target: SpawnTarget::NewTab,
+            tab_name: Some("editor".to_string()),
+            cwd: Some("/tmp".to_string()),
+            command: Some("git status".to_string()),
+            argv: None,
+            title: Some("git-status".to_string()),
+            wait_ready: false,
+        };
+
+        assert_eq!(
+            prepare_spawn(&request).expect("spawn should prepare"),
+            PreparedSpawn {
+                action_args: Some(vec![
+                    "new-tab".to_string(),
+                    "--name".to_string(),
+                    "editor".to_string(),
+                    "--cwd".to_string(),
+                    "/tmp".to_string(),
+                ]),
+                command: ZjctlCommand::Spawn {
+                    cwd: Some("/tmp".to_string()),
+                    title: Some("git-status".to_string()),
+                    command: vec!["git".to_string(), "status".to_string()],
+                },
+            }
+        );
     }
 
     #[test]

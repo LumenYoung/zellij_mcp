@@ -177,6 +177,9 @@ where
             AdapterError::ZjctlUnavailable => {
                 DomainError::new(ErrorCode::ZjctlUnavailable, error.to_string(), true)
             }
+            AdapterError::ParseError(message) => {
+                DomainError::new(ErrorCode::InvalidArgument, message, false)
+            }
             AdapterError::Timeout => {
                 DomainError::new(ErrorCode::WaitTimeout, error.to_string(), true)
             }
@@ -254,6 +257,13 @@ where
         }
 
         Ok((payload, submit))
+    }
+
+    fn launch_command_summary(request: &SpawnRequest) -> Option<String> {
+        request
+            .command
+            .clone()
+            .or_else(|| request.argv.as_ref().map(|argv| argv.join(" ")))
     }
 
     fn revalidate_binding(&self, binding: &TerminalBinding) -> Result<TerminalStatus, DomainError> {
@@ -358,7 +368,7 @@ where
             selector: resolved.selector.clone(),
             pane_id: resolved.pane_id.clone(),
             cwd: request.cwd.clone(),
-            launch_command: Some(request.command.clone()),
+            launch_command: Self::launch_command_summary(&request),
             source: BindingSource::Spawned,
             status: TerminalStatus::Ready,
             created_at: now,
@@ -1218,7 +1228,8 @@ mod tests {
                 target: SpawnTarget::ExistingTab,
                 tab_name: Some("editor".to_string()),
                 cwd: Some("/tmp".to_string()),
-                command: "lazygit".to_string(),
+                command: Some("lazygit".to_string()),
+                argv: None,
                 title: Some("lg".to_string()),
                 wait_ready: false,
             })

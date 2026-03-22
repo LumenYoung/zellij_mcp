@@ -410,11 +410,34 @@ mod tests {
                     "tab_name": "editor",
                     "cwd": "/tmp",
                     "command": "lazygit",
+                    "argv": null,
                     "title": "lg",
                     "wait_ready": false
                 }),
             )
             .expect("spawn tool should succeed");
+
+        assert_eq!(response["status"], "ready");
+    }
+
+    #[test]
+    fn executes_spawn_tool_with_argv_form() {
+        let server = McpServer::new(Box::new(MockTerminalManager));
+
+        let response = server
+            .execute_tool(
+                "zellij_spawn",
+                json!({
+                    "session_name": "gpu",
+                    "target": SpawnTarget::ExistingTab,
+                    "tab_name": "editor",
+                    "cwd": "/tmp",
+                    "argv": ["git", "status"],
+                    "title": "git-status",
+                    "wait_ready": false
+                }),
+            )
+            .expect("spawn argv tool should succeed");
 
         assert_eq!(response["status"], "ready");
     }
