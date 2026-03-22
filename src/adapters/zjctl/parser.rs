@@ -29,6 +29,7 @@ pub fn parse_list_output(
             pane_id: Some(pane.id),
             session_name: session_name.unwrap_or_default().to_string(),
             tab_name: pane.tab_name,
+            title: pane.title,
         })
         .collect())
 }
@@ -37,15 +38,39 @@ pub fn parse_capture_output(output: &[u8]) -> String {
     String::from_utf8_lossy(output).into_owned()
 }
 
+pub fn parse_spawn_output(
+    output: &str,
+    session_name: &str,
+    tab_name: Option<&str>,
+    title: Option<&str>,
+) -> Result<ResolvedTarget, AdapterError> {
+    let selector = parse_single_selector(output)?;
+    let pane_id = selector
+        .strip_prefix("id:")
+        .unwrap_or(&selector)
+        .to_string();
+
+    Ok(ResolvedTarget {
+        selector,
+        pane_id: Some(pane_id),
+        session_name: session_name.to_string(),
+        tab_name: tab_name.map(ToOwned::to_owned),
+        title: title.map(ToOwned::to_owned),
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct PaneRecord {
     id: String,
     tab_name: Option<String>,
+    title: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_capture_output, parse_list_output, parse_single_selector};
+    use super::{
+        parse_capture_output, parse_list_output, parse_single_selector, parse_spawn_output,
+    };
 
     #[test]
     fn trims_selector_output() {
@@ -74,5 +99,17 @@ mod tests {
     fn decodes_capture_output_lossily() {
         let content = parse_capture_output(b"hello\nworld");
         assert_eq!(content, "hello\nworld");
+    }
+
+    #[test]
+    fn parses_spawn_output() {
+        let target = parse_spawn_output("id:terminal:9\n", "gpu", Some("editor"), Some("lg"))
+            .expect("spawn output should parse");
+
+        assert_eq!(target.selector, "id:terminal:9");
+        assert_eq!(target.pane_id.as_deref(), Some("terminal:9"));
+        assert_eq!(target.session_name, "gpu");
+        assert_eq!(target.tab_name.as_deref(), Some("editor"));
+        assert_eq!(target.title.as_deref(), Some("lg"));
     }
 }

@@ -15,6 +15,7 @@ The following features are intentionally deferred to phase 2 or later.
 - explicit completion marker files
 - wrapper scripts for long-running agents
 - process-aware completion hints beyond idle polling
+- stronger readiness semantics for redraw-heavy TUIs where `wait-idle` is useful but not a perfect startup signal
 
 ### Richer interactive input
 

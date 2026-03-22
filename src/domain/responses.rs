@@ -43,3 +43,9 @@ pub struct SendResponse {
     pub handle: String,
     pub accepted: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CloseResponse {
+    pub handle: String,
+    pub closed: bool,
+}

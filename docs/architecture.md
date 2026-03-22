@@ -21,8 +21,8 @@ Phase 1 implements:
 
 Current implementation status:
 
-- live `attach`, `send`, `capture`, and managed `list` are implemented and verified against a real Zellij session
-- `spawn`, `wait`, and `close` remain planned phase-1 tools but are not implemented yet
+- live `spawn`, `attach`, `send`, `wait`, `capture`, `close`, and managed `list` are implemented and verified against a real Zellij session
+- lifecycle state is persisted across `spawn`, `wait`, and `close`, including closed-handle registry updates
 
 Phase 1 does not implement automatic pane scheduling, pane replacement, layout management, or external message bridges.
 
@@ -116,6 +116,8 @@ Returns the current content that can be captured from the pane. This is the most
 
 For full-screen TUIs, `full` is the only mode currently verified as reliable.
 
+Live lifecycle testing also showed that `wait` works for a spawned `lazygit` pane, but `wait_ready=true` should not be treated as a universal readiness signal for redraw-heavy TUIs.
+
 ### delta
 
 Returns the textual difference between the latest full capture and the last successful capture for the same handle. This is snapshot-diff semantics rather than true scrollback cursor semantics.
@@ -190,3 +192,4 @@ Verified so far:
 
 1. a fresh session can host the `zrpc` plugin after approval and pass `zjctl doctor`
 2. a `lazygit` pane can be attached, listed, captured, and controlled with printable-key input through the daemon
+3. a new managed pane can be spawned, waited on, and closed through the daemon, with closed status persisted in local state

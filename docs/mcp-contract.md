@@ -32,6 +32,7 @@ Notes:
 - `target` supports `new_tab` and `existing_tab`
 - `existing_tab` means spawn a new dedicated pane inside the tab
 - phase 1 does not replace existing processes in an existing pane
+- `wait_ready=true` currently runs the same rendered-screen idle check as `zellij_wait`; it works for shell-like startup and was live-tested with `lazygit`, but redraw-heavy TUIs may still make it a noisy readiness proxy
 
 Response:
 
@@ -120,6 +121,11 @@ Response:
 }
 ```
 
+Notes:
+
+- `zellij_wait` uses `zjctl pane wait-idle`, so it observes rendered-screen stability rather than process completion
+- this has been verified live for a spawned `lazygit` pane, but should still be read as an idle heuristic rather than an exact app-ready guarantee
+
 ### `zellij_capture`
 
 Capture output from a managed pane.
@@ -170,6 +176,11 @@ Input:
 }
 ```
 
+Notes:
+
+- `force=true` is required when the target pane is focused and the backend would otherwise refuse to close it
+- close keeps the binding in the registry with `status="closed"` and removes the active observation snapshot
+
 ### `zellij_list`
 
 List known bindings.
@@ -208,6 +219,7 @@ Input:
 - full capture is the primary source of truth
 - delta and current modes are derived from daemon snapshots
 - `send` can deliver printable text input to an attached interactive pane
+- `spawn`, `wait`, and `close` are available through the daemon and have been verified against a real Zellij session
 
 ## Phase 1 Limitations
 

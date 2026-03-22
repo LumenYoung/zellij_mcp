@@ -1,7 +1,10 @@
 use serde_json::Value;
 
 use crate::domain::errors::{DomainError, ErrorCode};
-use crate::domain::requests::{AttachRequest, CaptureRequest, ListRequest, SendRequest};
+use crate::domain::requests::{
+    AttachRequest, CaptureRequest, CloseRequest, ListRequest, SendRequest, SpawnRequest,
+    WaitRequest,
+};
 use crate::domain::status::CaptureMode;
 use crate::services::TerminalManager;
 
@@ -63,6 +66,15 @@ impl McpServer {
 
     pub fn execute_tool(&self, name: &str, arguments: Value) -> Result<Value, DomainError> {
         match name {
+            "zellij_spawn" => {
+                let request: SpawnRequest = serde_json::from_value(arguments).map_err(|error| {
+                    DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
+                })?;
+                let response = self.terminal_manager.spawn(request)?;
+                serde_json::to_value(response).map_err(|error| {
+                    DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
+                })
+            }
             "zellij_attach" => {
                 let request: AttachRequest =
                     serde_json::from_value(arguments).map_err(|error| {
@@ -101,6 +113,24 @@ impl McpServer {
                     DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
                 })
             }
+            "zellij_wait" => {
+                let request: WaitRequest = serde_json::from_value(arguments).map_err(|error| {
+                    DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
+                })?;
+                let response = self.terminal_manager.wait(request)?;
+                serde_json::to_value(response).map_err(|error| {
+                    DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
+                })
+            }
+            "zellij_close" => {
+                let request: CloseRequest = serde_json::from_value(arguments).map_err(|error| {
+                    DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
+                })?;
+                let response = self.terminal_manager.close(request)?;
+                serde_json::to_value(response).map_err(|error| {
+                    DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
+                })
+            }
             _ => Err(DomainError::new(
                 ErrorCode::InvalidArgument,
                 format!("unsupported tool `{name}`"),
@@ -129,6 +159,17 @@ impl Default for McpServer {
 struct NoopTerminalManager;
 
 impl TerminalManager for NoopTerminalManager {
+    fn spawn(
+        &self,
+        _request: SpawnRequest,
+    ) -> Result<crate::domain::responses::SpawnResponse, DomainError> {
+        Err(DomainError::new(
+            ErrorCode::InvalidArgument,
+            "terminal manager is not configured",
+            false,
+        ))
+    }
+
     fn attach(
         &self,
         _request: AttachRequest,
@@ -172,6 +213,28 @@ impl TerminalManager for NoopTerminalManager {
             false,
         ))
     }
+
+    fn wait(
+        &self,
+        _request: WaitRequest,
+    ) -> Result<crate::domain::responses::WaitResponse, DomainError> {
+        Err(DomainError::new(
+            ErrorCode::InvalidArgument,
+            "terminal manager is not configured",
+            false,
+        ))
+    }
+
+    fn close(
+        &self,
+        _request: CloseRequest,
+    ) -> Result<crate::domain::responses::CloseResponse, DomainError> {
+        Err(DomainError::new(
+            ErrorCode::InvalidArgument,
+            "terminal manager is not configured",
+            false,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -181,9 +244,15 @@ mod tests {
     use crate::domain::binding::TerminalBinding;
     use crate::domain::errors::DomainError;
     use crate::domain::observation::CaptureResult;
-    use crate::domain::requests::{AttachRequest, CaptureRequest, ListRequest, SendRequest};
-    use crate::domain::responses::{AttachResponse, CaptureResponse, ListResponse, SendResponse};
-    use crate::domain::status::{BindingSource, TerminalStatus};
+    use crate::domain::requests::{
+        AttachRequest, CaptureRequest, CloseRequest, ListRequest, SendRequest, SpawnRequest,
+        WaitRequest,
+    };
+    use crate::domain::responses::{
+        AttachResponse, CaptureResponse, CloseResponse, ListResponse, SendResponse, SpawnResponse,
+        WaitResponse,
+    };
+    use crate::domain::status::{BindingSource, SpawnTarget, TerminalStatus};
     use crate::services::TerminalManager;
 
     use super::McpServer;
@@ -192,6 +261,16 @@ mod tests {
     struct MockTerminalManager;
 
     impl TerminalManager for MockTerminalManager {
+        fn spawn(&self, _request: SpawnRequest) -> Result<SpawnResponse, DomainError> {
+            Ok(SpawnResponse {
+                handle: "zh_test".to_string(),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                status: "ready".to_string(),
+            })
+        }
+
         fn attach(&self, _request: AttachRequest) -> Result<AttachResponse, DomainError> {
             Ok(AttachResponse {
                 handle: "zh_test".to_string(),
@@ -236,6 +315,21 @@ mod tests {
             Ok(SendResponse {
                 handle: "zh_test".to_string(),
                 accepted: true,
+            })
+        }
+
+        fn wait(&self, _request: WaitRequest) -> Result<WaitResponse, DomainError> {
+            Ok(WaitResponse {
+                handle: "zh_test".to_string(),
+                status: "idle".to_string(),
+                observed_at: chrono::Utc::now(),
+            })
+        }
+
+        fn close(&self, _request: CloseRequest) -> Result<CloseResponse, DomainError> {
+            Ok(CloseResponse {
+                handle: "zh_test".to_string(),
+                closed: true,
             })
         }
     }
@@ -299,5 +393,62 @@ mod tests {
             .expect("send tool should succeed");
 
         assert_eq!(response["accepted"], true);
+    }
+
+    #[test]
+    fn executes_spawn_tool() {
+        let server = McpServer::new(Box::new(MockTerminalManager));
+
+        let response = server
+            .execute_tool(
+                "zellij_spawn",
+                json!({
+                    "session_name": "gpu",
+                    "target": SpawnTarget::ExistingTab,
+                    "tab_name": "editor",
+                    "cwd": "/tmp",
+                    "command": "lazygit",
+                    "title": "lg",
+                    "wait_ready": false
+                }),
+            )
+            .expect("spawn tool should succeed");
+
+        assert_eq!(response["status"], "ready");
+    }
+
+    #[test]
+    fn executes_wait_tool() {
+        let server = McpServer::new(Box::new(MockTerminalManager));
+
+        let response = server
+            .execute_tool(
+                "zellij_wait",
+                json!({
+                    "handle": "zh_test",
+                    "idle_ms": 1200,
+                    "timeout_ms": 30000
+                }),
+            )
+            .expect("wait tool should succeed");
+
+        assert_eq!(response["status"], "idle");
+    }
+
+    #[test]
+    fn executes_close_tool() {
+        let server = McpServer::new(Box::new(MockTerminalManager));
+
+        let response = server
+            .execute_tool(
+                "zellij_close",
+                json!({
+                    "handle": "zh_test",
+                    "force": true
+                }),
+            )
+            .expect("close tool should succeed");
+
+        assert_eq!(response["closed"], true);
     }
 }
