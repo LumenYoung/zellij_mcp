@@ -149,6 +149,84 @@ where
 
         Ok(())
     }
+
+    fn set_binding_status(&self, handle: &str, status: TerminalStatus) -> Result<(), DomainError> {
+        let mut bindings = self.read_bindings()?;
+        if let Some(binding) = bindings.iter_mut().find(|binding| binding.handle == handle) {
+            binding.status = status;
+            binding.updated_at = Utc::now();
+            self.write_bindings(&bindings)?;
+        }
+
+        Ok(())
+    }
+
+    fn revalidate_binding(&self, binding: &TerminalBinding) -> Result<TerminalStatus, DomainError> {
+        if matches!(binding.status, TerminalStatus::Closed) {
+            return Ok(TerminalStatus::Closed);
+        }
+
+        let request = AttachRequest {
+            session_name: binding.session_name.clone(),
+            tab_name: binding.tab_name.clone(),
+            selector: binding.selector.clone(),
+            alias: None,
+        };
+
+        match self.adapter.resolve_selector(&request) {
+            Ok(_) => Ok(TerminalStatus::Ready),
+            Err(error) if Self::is_missing_target_error(&error) => Ok(TerminalStatus::Stale),
+            Err(error) => Err(self.map_adapter_error(error, ErrorCode::TargetNotFound)),
+        }
+    }
+
+    fn ensure_handle_revalidated(&self, handle: &str) -> Result<TerminalBinding, DomainError> {
+        let bindings = self.read_bindings()?;
+        let binding = bindings
+            .iter()
+            .find(|binding| binding.handle == handle)
+            .cloned()
+            .ok_or_else(|| {
+                DomainError::new(
+                    ErrorCode::HandleNotFound,
+                    format!("handle `{handle}` is not registered"),
+                    false,
+                )
+            })?;
+
+        let status = self.revalidate_binding(&binding)?;
+        if status != binding.status {
+            self.set_binding_status(handle, status)?;
+        }
+
+        let refreshed = self.read_bindings()?;
+        refreshed
+            .into_iter()
+            .find(|binding| binding.handle == handle)
+            .ok_or_else(|| {
+                DomainError::new(
+                    ErrorCode::HandleNotFound,
+                    format!("handle `{handle}` is not registered"),
+                    false,
+                )
+            })
+    }
+
+    pub fn revalidate_all(&self) -> Result<(), DomainError> {
+        if !self.adapter.is_available() {
+            return Ok(());
+        }
+
+        let bindings = self.read_bindings()?;
+        for binding in bindings {
+            let status = self.revalidate_binding(&binding)?;
+            if status != binding.status {
+                self.set_binding_status(&binding.handle, status)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl<A> TerminalManager for TerminalService<A>
@@ -265,6 +343,7 @@ where
     }
 
     fn list(&self, request: ListRequest) -> Result<ListResponse, DomainError> {
+        self.revalidate_all()?;
         let mut bindings = self.read_bindings()?;
         if let Some(session_name) = request.session_name {
             bindings.retain(|binding| binding.session_name == session_name);
@@ -277,6 +356,7 @@ where
         self.ensure_available()?;
 
         let mut bindings = self.read_bindings()?;
+        let active = self.ensure_handle_revalidated(&request.handle)?;
         let binding = bindings
             .iter_mut()
             .find(|binding| binding.handle == request.handle)
@@ -287,10 +367,10 @@ where
                     false,
                 )
             })?;
+        binding.status = active.status;
+        binding.updated_at = active.updated_at;
 
-        if binding.status == TerminalStatus::Stale || binding.status == TerminalStatus::Closed {
-            return Err(Self::inactive_binding_error(&request.handle));
-        }
+        Self::ensure_binding_active(&binding)?;
 
         let snapshot = self
             .adapter
@@ -359,19 +439,9 @@ where
     fn send(&self, request: SendRequest) -> Result<SendResponse, DomainError> {
         self.ensure_available()?;
 
-        let bindings = self.read_bindings()?;
-        let binding = bindings
-            .iter()
-            .find(|binding| binding.handle == request.handle)
-            .ok_or_else(|| {
-                DomainError::new(
-                    ErrorCode::HandleNotFound,
-                    format!("handle `{}` is not registered", request.handle),
-                    false,
-                )
-            })?;
+        let binding = self.ensure_handle_revalidated(&request.handle)?;
 
-        Self::ensure_binding_active(binding)?;
+        Self::ensure_binding_active(&binding)?;
 
         self.adapter
             .send_input(
@@ -415,6 +485,7 @@ where
         self.ensure_available()?;
 
         let mut bindings = self.read_bindings()?;
+        let active = self.ensure_handle_revalidated(&request.handle)?;
         let binding = bindings
             .iter_mut()
             .find(|binding| binding.handle == request.handle)
@@ -426,6 +497,8 @@ where
                 )
             })?;
 
+        binding.status = active.status;
+        binding.updated_at = active.updated_at;
         let session_name = binding.session_name.clone();
         let selector = binding.selector.clone();
         Self::ensure_binding_active(binding)?;
@@ -481,6 +554,7 @@ where
         self.ensure_available()?;
 
         let mut bindings = self.read_bindings()?;
+        let active = self.ensure_handle_revalidated(&request.handle)?;
         let index = bindings
             .iter()
             .position(|binding| binding.handle == request.handle)
@@ -492,6 +566,8 @@ where
                 )
             })?;
 
+        bindings[index].status = active.status;
+        bindings[index].updated_at = active.updated_at;
         let session_name = bindings[index].session_name.clone();
         let selector = bindings[index].selector.clone();
         if bindings[index].status == TerminalStatus::Closed {
@@ -542,6 +618,7 @@ mod tests {
     struct MockAdapter {
         target: ResolvedTarget,
         captures: Vec<String>,
+        resolve_missing_target: bool,
         send_missing_target: bool,
         wait_missing_target: bool,
         capture_missing_target: bool,
@@ -558,6 +635,7 @@ mod tests {
                     title: Some("editor".to_string()),
                 },
                 captures: vec![content.to_string()],
+                resolve_missing_target: false,
                 send_missing_target: false,
                 wait_missing_target: false,
                 capture_missing_target: false,
@@ -578,6 +656,11 @@ mod tests {
             &self,
             _request: &AttachRequest,
         ) -> Result<ResolvedTarget, AdapterError> {
+            if self.resolve_missing_target {
+                return Err(AdapterError::CommandFailed(
+                    "RPC error: no panes match selector".to_string(),
+                ));
+            }
             Ok(self.target.clone())
         }
 
@@ -649,6 +732,13 @@ mod tests {
 
     fn make_service(adapter: MockAdapter) -> TerminalService<MockAdapter> {
         let root = std::env::temp_dir().join(format!("zellij-mcp-test-{}", uuid::Uuid::new_v4()));
+        make_service_with_root(adapter, root)
+    }
+
+    fn make_service_with_root(
+        adapter: MockAdapter,
+        root: std::path::PathBuf,
+    ) -> TerminalService<MockAdapter> {
         TerminalService::new(
             adapter,
             RegistryStore::new(root.join("registry.json")),
@@ -921,5 +1011,53 @@ mod tests {
 
         let bindings = service.registry_store.load().expect("bindings should load");
         assert_eq!(bindings[0].status, TerminalStatus::Stale);
+    }
+
+    #[test]
+    fn revalidate_all_marks_missing_binding_stale() {
+        let root = std::env::temp_dir().join(format!("zellij-mcp-test-{}", uuid::Uuid::new_v4()));
+        let service = make_service_with_root(MockAdapter::single_capture("baseline"), root.clone());
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        let mut missing_adapter = MockAdapter::single_capture("baseline");
+        missing_adapter.resolve_missing_target = true;
+        let service = make_service_with_root(missing_adapter, root);
+        service.revalidate_all().expect("revalidate should succeed");
+
+        let bindings = service.registry_store.load().expect("bindings should load");
+        assert_eq!(bindings[0].handle, attach.handle);
+        assert_eq!(bindings[0].status, TerminalStatus::Stale);
+    }
+
+    #[test]
+    fn list_revalidates_before_returning_bindings() {
+        let root = std::env::temp_dir().join(format!("zellij-mcp-test-{}", uuid::Uuid::new_v4()));
+        let service = make_service_with_root(MockAdapter::single_capture("baseline"), root.clone());
+        let _ = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        let mut missing_adapter = MockAdapter::single_capture("baseline");
+        missing_adapter.resolve_missing_target = true;
+        let service = make_service_with_root(missing_adapter, root);
+        let listed = service
+            .list(ListRequest {
+                session_name: Some("gpu".to_string()),
+            })
+            .expect("list should succeed");
+
+        assert_eq!(listed.bindings[0].status, TerminalStatus::Stale);
     }
 }

@@ -12,6 +12,7 @@ fn main() {
         RegistryStore::new(format!("{state_dir}/registry.json")),
         ObservationStore::new(format!("{state_dir}/observations.json")),
     );
+    let _ = service.revalidate_all();
     let server = McpServer::new(Box::new(service));
 
     if args.len() == 3 {
