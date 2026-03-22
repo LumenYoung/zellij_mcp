@@ -1,8 +1,9 @@
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::status::{CaptureMode, SpawnTarget};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct SpawnRequest {
     pub session_name: String,
     pub target: SpawnTarget,
@@ -13,7 +14,7 @@ pub struct SpawnRequest {
     pub wait_ready: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct AttachRequest {
     pub session_name: String,
     pub tab_name: Option<String>,
@@ -21,7 +22,7 @@ pub struct AttachRequest {
     pub alias: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct SendRequest {
     pub handle: String,
     #[serde(default)]
@@ -31,26 +32,26 @@ pub struct SendRequest {
     pub submit: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct WaitRequest {
     pub handle: String,
     pub idle_ms: u64,
     pub timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct CaptureRequest {
     pub handle: String,
     pub mode: CaptureMode,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct CloseRequest {
     pub handle: String,
     pub force: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, schemars::JsonSchema)]
 pub struct ListRequest {
     pub session_name: Option<String>,
 }

@@ -42,6 +42,8 @@ agent
 
 The transport layer registers tools and translates daemon-native request and response types to an MCP-compatible shape.
 
+The current implementation now serves a real MCP stdio endpoint through `rmcp`, which is the path expected by local `mcp2cli`. The transport remains thin: each exposed MCP tool forwards into the existing synchronous `McpServer::execute_tool(...)` seam, and tool results are returned as JSON text payloads so `mcp2cli` can print them directly.
+
 ### Tool handlers
 
 Handlers validate input, resolve a handle or selector, call the appropriate domain service, and return structured output with stable error codes.
@@ -198,3 +200,4 @@ Verified so far:
 2. a `lazygit` pane can be attached, listed, captured, and controlled with printable-key input through the daemon
 3. a new managed pane can be spawned, waited on, and closed through the daemon, with closed status persisted in local state
 4. named `up` and `escape` key input have been verified through a real pane using the daemon's special-key send path
+5. `mcp2cli --mcp-stdio` can initialize the daemon, list tools, and call `zellij_list` against the stdio transport

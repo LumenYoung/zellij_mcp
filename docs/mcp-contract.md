@@ -7,6 +7,13 @@
 - keep phase 1 tool semantics small and explicit
 - document degraded behavior where the backend cannot provide exact semantics
 
+## Transport
+
+- the daemon is exposed as a real MCP stdio server through `rmcp`
+- `mcp2cli --mcp-stdio "cargo run --quiet --manifest-path /path/to/Cargo.toml" --list` is the intended local integration path
+- each MCP tool returns its structured result serialized as JSON text content, which keeps the transport layer thin while remaining readable to `mcp2cli`
+- MCP error responses preserve daemon error details in their `data` payload with stable fields: `code`, `message`, and `retryable`
+
 ## Tools
 
 ### `zellij_spawn`

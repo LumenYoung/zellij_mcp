@@ -14,6 +14,37 @@ pub struct ToolDefinition {
     pub description: &'static str,
 }
 
+pub const TOOL_DEFINITIONS: [ToolDefinition; 7] = [
+    ToolDefinition {
+        name: "zellij_spawn",
+        description: "Create a managed Zellij execution target.",
+    },
+    ToolDefinition {
+        name: "zellij_attach",
+        description: "Attach an existing Zellij pane to daemon management.",
+    },
+    ToolDefinition {
+        name: "zellij_send",
+        description: "Send input to a managed pane.",
+    },
+    ToolDefinition {
+        name: "zellij_wait",
+        description: "Wait for a managed pane to become idle.",
+    },
+    ToolDefinition {
+        name: "zellij_capture",
+        description: "Capture output from a managed pane.",
+    },
+    ToolDefinition {
+        name: "zellij_close",
+        description: "Close a managed pane.",
+    },
+    ToolDefinition {
+        name: "zellij_list",
+        description: "List known managed Zellij handles.",
+    },
+];
+
 pub struct McpServer {
     tools: Vec<ToolDefinition>,
     terminal_manager: Box<dyn TerminalManager>,
@@ -22,36 +53,7 @@ pub struct McpServer {
 impl McpServer {
     pub fn new(terminal_manager: Box<dyn TerminalManager>) -> Self {
         Self {
-            tools: vec![
-                ToolDefinition {
-                    name: "zellij_spawn",
-                    description: "Create a managed Zellij execution target.",
-                },
-                ToolDefinition {
-                    name: "zellij_attach",
-                    description: "Attach an existing Zellij pane to daemon management.",
-                },
-                ToolDefinition {
-                    name: "zellij_send",
-                    description: "Send input to a managed pane.",
-                },
-                ToolDefinition {
-                    name: "zellij_wait",
-                    description: "Wait for a managed pane to become idle.",
-                },
-                ToolDefinition {
-                    name: "zellij_capture",
-                    description: "Capture output from a managed pane.",
-                },
-                ToolDefinition {
-                    name: "zellij_close",
-                    description: "Close a managed pane.",
-                },
-                ToolDefinition {
-                    name: "zellij_list",
-                    description: "List known managed Zellij handles.",
-                },
-            ],
+            tools: TOOL_DEFINITIONS.to_vec(),
             terminal_manager,
         }
     }
