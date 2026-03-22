@@ -68,6 +68,8 @@ The adapter is the only layer allowed to spawn `zjctl` or parse its output. It p
 - closing targets
 - listing visible targets
 
+The spawn path now parses command strings with shell-aware quoting before building `zjctl` argv, so quoted arguments survive intact and malformed quoting fails before any pane is launched.
+
 Live verification showed one important runtime constraint: the `zrpc.wasm` plugin must be loaded in the target session and its first-run permission prompt must be approved before `zjctl` RPC calls will succeed.
 
 ### Persistence

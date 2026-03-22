@@ -32,6 +32,8 @@ Notes:
 - `target` supports `new_tab` and `existing_tab`
 - `existing_tab` means spawn a new dedicated pane inside the tab
 - phase 1 does not replace existing processes in an existing pane
+- `command` is parsed with shell-style quoting, so inputs like `bash -lc 'echo hello world'` preserve the intended argv shape
+- malformed shell quoting in `command` fails early as an argument parse error instead of spawning a mangled command
 - `wait_ready=true` currently runs the same rendered-screen idle check as `zellij_wait`; it works for shell-like startup and was live-tested with `lazygit`, but redraw-heavy TUIs may still make it a noisy readiness proxy
 
 Response:
@@ -220,6 +222,7 @@ Input:
 - delta and current modes are derived from daemon snapshots
 - `send` can deliver printable text input to an attached interactive pane
 - `spawn`, `wait`, and `close` are available through the daemon and have been verified against a real Zellij session
+- `spawn` preserves quoted command arguments using shell-aware parsing
 
 ## Phase 1 Limitations
 

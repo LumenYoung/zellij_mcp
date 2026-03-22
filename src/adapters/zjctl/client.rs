@@ -192,7 +192,7 @@ impl ZjctlAdapter for ZjctlClient {
             ZjctlCommand::Spawn {
                 cwd: _request.cwd.clone(),
                 title: _request.title.clone(),
-                command: split_command(&_request.command),
+                command: parse_command(&_request.command)?,
             },
         )?;
         let text = String::from_utf8_lossy(&stdout);
@@ -335,12 +335,9 @@ fn matches_selector(selector: &str, target: &ResolvedTarget) -> bool {
     false
 }
 
-fn split_command(command: &str) -> Vec<String> {
-    command
-        .split_whitespace()
-        .filter(|part| !part.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+fn parse_command(command: &str) -> Result<Vec<String>, AdapterError> {
+    shell_words::split(command)
+        .map_err(|error| AdapterError::ParseError(format!("invalid spawn command: {error}")))
 }
 
 fn format_seconds(milliseconds: u64) -> String {
@@ -350,7 +347,9 @@ fn format_seconds(milliseconds: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolvedTarget, format_seconds, matches_selector, split_command};
+    use crate::adapters::zjctl::AdapterError;
+
+    use super::{ResolvedTarget, format_seconds, matches_selector, parse_command};
 
     #[test]
     fn matches_exact_id_selector() {
@@ -381,8 +380,17 @@ mod tests {
     }
 
     #[test]
-    fn splits_command_on_whitespace() {
-        assert_eq!(split_command("lazygit --debug"), vec!["lazygit", "--debug"]);
+    fn parses_quoted_spawn_command() {
+        assert_eq!(
+            parse_command("bash -lc 'echo hello world'").expect("command should parse"),
+            vec!["bash", "-lc", "echo hello world"]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_quoted_spawn_command() {
+        let error = parse_command("bash -lc 'echo hello").expect_err("command should fail");
+        assert!(matches!(error, AdapterError::ParseError(_)));
     }
 
     #[test]
