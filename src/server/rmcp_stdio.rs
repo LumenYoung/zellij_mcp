@@ -11,8 +11,8 @@ use serde_json::json;
 
 use crate::domain::errors::{DomainError, ErrorCode};
 use crate::domain::requests::{
-    AttachRequest, CaptureRequest, CloseRequest, ListRequest, SendRequest, SpawnRequest,
-    WaitRequest,
+    AttachRequest, CaptureRequest, CloseRequest, DiscoverRequest, ListRequest, SendRequest,
+    SpawnRequest, WaitRequest,
 };
 use crate::server::McpServer;
 
@@ -45,6 +45,14 @@ impl RmcpServer {
         Parameters(request): Parameters<AttachRequest>,
     ) -> Result<String, ErrorData> {
         self.execute("zellij_attach", request)
+    }
+
+    #[tool(description = "Discover live Zellij panes before attaching.")]
+    fn zellij_discover(
+        &self,
+        Parameters(request): Parameters<DiscoverRequest>,
+    ) -> Result<String, ErrorData> {
+        self.execute("zellij_discover", request)
     }
 
     #[tool(description = "Send input to a managed pane.")]

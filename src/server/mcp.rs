@@ -2,8 +2,8 @@ use serde_json::Value;
 
 use crate::domain::errors::{DomainError, ErrorCode};
 use crate::domain::requests::{
-    AttachRequest, CaptureRequest, CloseRequest, ListRequest, SendRequest, SpawnRequest,
-    WaitRequest,
+    AttachRequest, CaptureRequest, CloseRequest, DiscoverRequest, ListRequest, SendRequest,
+    SpawnRequest, WaitRequest,
 };
 use crate::domain::status::CaptureMode;
 use crate::services::TerminalManager;
@@ -14,7 +14,7 @@ pub struct ToolDefinition {
     pub description: &'static str,
 }
 
-pub const TOOL_DEFINITIONS: [ToolDefinition; 7] = [
+pub const TOOL_DEFINITIONS: [ToolDefinition; 8] = [
     ToolDefinition {
         name: "zellij_spawn",
         description: "Create a managed Zellij execution target.",
@@ -22,6 +22,10 @@ pub const TOOL_DEFINITIONS: [ToolDefinition; 7] = [
     ToolDefinition {
         name: "zellij_attach",
         description: "Attach an existing Zellij pane to daemon management.",
+    },
+    ToolDefinition {
+        name: "zellij_discover",
+        description: "Discover live Zellij panes before attaching.",
     },
     ToolDefinition {
         name: "zellij_send",
@@ -83,6 +87,16 @@ impl McpServer {
                         DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
                     })?;
                 let response = self.terminal_manager.attach(request)?;
+                serde_json::to_value(response).map_err(|error| {
+                    DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
+                })
+            }
+            "zellij_discover" => {
+                let request: DiscoverRequest =
+                    serde_json::from_value(arguments).map_err(|error| {
+                        DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
+                    })?;
+                let response = self.terminal_manager.discover(request)?;
                 serde_json::to_value(response).map_err(|error| {
                     DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
                 })
@@ -183,6 +197,17 @@ impl TerminalManager for NoopTerminalManager {
         ))
     }
 
+    fn discover(
+        &self,
+        _request: DiscoverRequest,
+    ) -> Result<crate::domain::responses::DiscoverResponse, DomainError> {
+        Err(DomainError::new(
+            ErrorCode::InvalidArgument,
+            "terminal manager is not configured",
+            false,
+        ))
+    }
+
     fn list(
         &self,
         _request: ListRequest,
@@ -247,12 +272,12 @@ mod tests {
     use crate::domain::errors::DomainError;
     use crate::domain::observation::CaptureResult;
     use crate::domain::requests::{
-        AttachRequest, CaptureRequest, CloseRequest, ListRequest, SendRequest, SpawnRequest,
-        WaitRequest,
+        AttachRequest, CaptureRequest, CloseRequest, DiscoverRequest, ListRequest, SendRequest,
+        SpawnRequest, WaitRequest,
     };
     use crate::domain::responses::{
-        AttachResponse, CaptureResponse, CloseResponse, ListResponse, SendResponse, SpawnResponse,
-        WaitResponse,
+        AttachResponse, CaptureResponse, CloseResponse, DiscoverCandidate, DiscoverResponse,
+        ListResponse, SendResponse, SpawnResponse, WaitResponse,
     };
     use crate::domain::status::{BindingSource, SpawnTarget, TerminalStatus};
     use crate::services::TerminalManager;
@@ -281,6 +306,23 @@ mod tests {
             })
         }
 
+        fn discover(&self, _request: DiscoverRequest) -> Result<DiscoverResponse, DomainError> {
+            Ok(DiscoverResponse {
+                candidates: vec![DiscoverCandidate {
+                    selector: "id:terminal:7".to_string(),
+                    pane_id: Some("terminal:7".to_string()),
+                    session_name: "gpu".to_string(),
+                    tab_name: Some("editor".to_string()),
+                    title: Some("editor".to_string()),
+                    command: Some("fish".to_string()),
+                    focused: false,
+                    preview: Some("hello".to_string()),
+                    preview_basis: Some("recent_lines".to_string()),
+                    captured_at: Some(chrono::Utc::now()),
+                }],
+            })
+        }
+
         fn list(&self, _request: ListRequest) -> Result<ListResponse, DomainError> {
             Ok(ListResponse {
                 bindings: vec![TerminalBinding {
@@ -306,6 +348,8 @@ mod tests {
                     handle: "zh_test".to_string(),
                     mode: "full".to_string(),
                     content: "hello".to_string(),
+                    tail_lines: None,
+                    line_window_applied: false,
                     truncated: false,
                     captured_at: chrono::Utc::now(),
                     baseline: None,
@@ -350,6 +394,7 @@ mod tests {
             vec![
                 "zellij_spawn",
                 "zellij_attach",
+                "zellij_discover",
                 "zellij_send",
                 "zellij_wait",
                 "zellij_capture",
@@ -377,6 +422,26 @@ mod tests {
 
         assert_eq!(response["handle"], "zh_test");
         assert_eq!(response["attached"], true);
+    }
+
+    #[test]
+    fn executes_discover_tool() {
+        let server = McpServer::new(Box::new(MockTerminalManager));
+
+        let response = server
+            .execute_tool(
+                "zellij_discover",
+                json!({
+                    "session_name": "gpu",
+                    "tab_name": "editor",
+                    "include_preview": true,
+                    "preview_lines": 8
+                }),
+            )
+            .expect("discover tool should succeed");
+
+        assert_eq!(response["candidates"][0]["selector"], "id:terminal:7");
+        assert_eq!(response["candidates"][0]["command"], "fish");
     }
 
     #[test]
