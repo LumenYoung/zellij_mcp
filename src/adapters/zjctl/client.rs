@@ -15,6 +15,8 @@ pub struct ResolvedTarget {
     pub session_name: String,
     pub tab_name: Option<String>,
     pub title: Option<String>,
+    pub command: Option<String>,
+    pub focused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +30,10 @@ pub trait ZjctlAdapter {
     fn is_available(&self) -> bool;
     fn spawn(&self, request: &SpawnRequest) -> Result<ResolvedTarget, AdapterError>;
     fn resolve_selector(&self, request: &AttachRequest) -> Result<ResolvedTarget, AdapterError>;
+    fn list_targets_in_session(
+        &self,
+        session_name: &str,
+    ) -> Result<Vec<ResolvedTarget>, AdapterError>;
     fn send_input(
         &self,
         session_name: &str,
@@ -196,6 +202,13 @@ impl ZjctlAdapter for ZjctlClient {
     fn resolve_selector(&self, _request: &AttachRequest) -> Result<ResolvedTarget, AdapterError> {
         let candidates = self.list_targets_for_session(Some(&_request.session_name))?;
         self.resolve_from_candidates(_request, candidates)
+    }
+
+    fn list_targets_in_session(
+        &self,
+        session_name: &str,
+    ) -> Result<Vec<ResolvedTarget>, AdapterError> {
+        self.list_targets_for_session(Some(session_name))
     }
 
     fn send_input(
@@ -413,6 +426,8 @@ mod tests {
             session_name: "gpu".to_string(),
             tab_name: Some("editor".to_string()),
             title: Some("editor".to_string()),
+            command: None,
+            focused: false,
         };
 
         assert!(matches_selector("id:terminal:7", &target));
@@ -428,6 +443,8 @@ mod tests {
             session_name: "gpu".to_string(),
             tab_name: Some("editor-main".to_string()),
             title: Some("editor-main".to_string()),
+            command: None,
+            focused: false,
         };
 
         assert!(matches_selector("title:editor", &target));

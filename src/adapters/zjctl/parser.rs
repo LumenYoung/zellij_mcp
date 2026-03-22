@@ -1,7 +1,7 @@
 use serde::Deserialize;
 
-use crate::adapters::zjctl::AdapterError;
 use crate::adapters::zjctl::client::ResolvedTarget;
+use crate::adapters::zjctl::AdapterError;
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_single_selector(output: &str) -> Result<String, AdapterError> {
@@ -30,6 +30,8 @@ pub fn parse_list_output(
             session_name: session_name.unwrap_or_default().to_string(),
             tab_name: pane.tab_name,
             title: pane.title,
+            command: pane.command,
+            focused: pane.focused,
         })
         .collect())
 }
@@ -56,6 +58,8 @@ pub fn parse_spawn_output(
         session_name: session_name.to_string(),
         tab_name: tab_name.map(ToOwned::to_owned),
         title: title.map(ToOwned::to_owned),
+        command: None,
+        focused: false,
     })
 }
 
@@ -64,6 +68,8 @@ struct PaneRecord {
     id: String,
     tab_name: Option<String>,
     title: Option<String>,
+    command: Option<String>,
+    focused: bool,
 }
 
 #[cfg(test)]
@@ -82,8 +88,8 @@ mod tests {
     fn parses_list_output() {
         let targets = parse_list_output(
             r#"[
-                {"id":"terminal:3","tab_name":"editor"},
-                {"id":"terminal:4","tab_name":"logs"}
+                {"id":"terminal:3","tab_name":"editor","title":"shell","command":"fish","focused":false},
+                {"id":"terminal:4","tab_name":"logs","title":"logs","command":"tail -f app.log","focused":true}
             ]"#,
             Some("gpu"),
         )
@@ -92,6 +98,7 @@ mod tests {
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].selector, "id:terminal:3");
         assert_eq!(targets[0].session_name, "gpu");
+        assert!(!targets[0].focused);
         assert_eq!(targets[1].tab_name.as_deref(), Some("logs"));
     }
 
@@ -111,5 +118,6 @@ mod tests {
         assert_eq!(target.session_name, "gpu");
         assert_eq!(target.tab_name.as_deref(), Some("editor"));
         assert_eq!(target.title.as_deref(), Some("lg"));
+        assert_eq!(target.command, None);
     }
 }

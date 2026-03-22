@@ -21,6 +21,25 @@ pub struct AttachResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoverResponse {
+    pub candidates: Vec<DiscoverCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoverCandidate {
+    pub selector: String,
+    pub pane_id: Option<String>,
+    pub session_name: String,
+    pub tab_name: Option<String>,
+    pub title: Option<String>,
+    pub command: Option<String>,
+    pub focused: bool,
+    pub preview: Option<String>,
+    pub preview_basis: Option<String>,
+    pub captured_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WaitResponse {
     pub handle: String,
     pub status: String,

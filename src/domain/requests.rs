@@ -24,6 +24,16 @@ pub struct AttachRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct DiscoverRequest {
+    pub session_name: String,
+    pub tab_name: Option<String>,
+    pub selector: Option<String>,
+    #[serde(default = "default_true")]
+    pub include_preview: bool,
+    pub preview_lines: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct SendRequest {
     pub handle: String,
     #[serde(default)]
@@ -44,6 +54,7 @@ pub struct WaitRequest {
 pub struct CaptureRequest {
     pub handle: String,
     pub mode: CaptureMode,
+    pub tail_lines: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
@@ -55,4 +66,8 @@ pub struct CloseRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, schemars::JsonSchema)]
 pub struct ListRequest {
     pub session_name: Option<String>,
+}
+
+const fn default_true() -> bool {
+    true
 }

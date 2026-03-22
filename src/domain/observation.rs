@@ -17,6 +17,8 @@ pub struct CaptureResult {
     pub handle: String,
     pub mode: String,
     pub content: String,
+    pub tail_lines: Option<usize>,
+    pub line_window_applied: bool,
     pub truncated: bool,
     pub captured_at: DateTime<Utc>,
     pub baseline: Option<String>,
