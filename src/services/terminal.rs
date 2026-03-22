@@ -8,12 +8,12 @@ use crate::domain::observation::{CaptureResult, TerminalObservation};
 use chrono::Utc;
 
 use crate::domain::requests::{
-    AttachRequest, CaptureRequest, CloseRequest, ListRequest, SendRequest, SpawnRequest,
-    WaitRequest,
+    AttachRequest, CaptureRequest, CloseRequest, DiscoverRequest, ListRequest, SendRequest,
+    SpawnRequest, WaitRequest,
 };
 use crate::domain::responses::{
-    AttachResponse, CaptureResponse, CloseResponse, ListResponse, SendResponse, SpawnResponse,
-    WaitResponse,
+    AttachResponse, CaptureResponse, CloseResponse, DiscoverCandidate, DiscoverResponse,
+    ListResponse, SendResponse, SpawnResponse, WaitResponse,
 };
 use crate::domain::status::{BindingSource, CaptureMode, TerminalStatus};
 use crate::persistence::{ObservationStore, RegistryStore};
@@ -21,6 +21,7 @@ use crate::persistence::{ObservationStore, RegistryStore};
 pub trait TerminalManager: Send + Sync {
     fn spawn(&self, request: SpawnRequest) -> Result<SpawnResponse, DomainError>;
     fn attach(&self, request: AttachRequest) -> Result<AttachResponse, DomainError>;
+    fn discover(&self, request: DiscoverRequest) -> Result<DiscoverResponse, DomainError>;
     fn list(&self, request: ListRequest) -> Result<ListResponse, DomainError>;
     fn capture(&self, request: CaptureRequest) -> Result<CaptureResponse, DomainError>;
     fn send(&self, request: SendRequest) -> Result<SendResponse, DomainError>;
@@ -266,6 +267,72 @@ where
             .or_else(|| request.argv.as_ref().map(|argv| argv.join(" ")))
     }
 
+    fn validate_positive_lines(
+        value: Option<usize>,
+        field_name: &str,
+    ) -> Result<Option<usize>, DomainError> {
+        match value {
+            Some(0) => Err(DomainError::new(
+                ErrorCode::InvalidArgument,
+                format!("`{field_name}` must be greater than zero"),
+                false,
+            )),
+            other => Ok(other),
+        }
+    }
+
+    fn tail_lines(content: &str, count: usize) -> (String, bool) {
+        let trailing_newline = content.ends_with('\n');
+        let lines: Vec<&str> = content.lines().collect();
+        if lines.len() <= count {
+            return (content.to_string(), false);
+        }
+
+        let mut clipped = lines[lines.len() - count..].join("\n");
+        if trailing_newline {
+            clipped.push('\n');
+        }
+
+        (clipped, true)
+    }
+
+    fn preview_for_snapshot(content: &str, preview_lines: usize) -> (String, String) {
+        if Self::is_repaint_heavy(content) {
+            let normalized = Self::normalize_current_frame(content);
+            let (preview, _) = Self::tail_lines(&normalized, preview_lines);
+            (preview, "visible_frame".to_string())
+        } else {
+            let (preview, _) = Self::tail_lines(content, preview_lines);
+            (preview, "recent_lines".to_string())
+        }
+    }
+
+    fn discover_matches_selector(
+        selector: &str,
+        target: &crate::adapters::zjctl::ResolvedTarget,
+    ) -> bool {
+        if selector == target.selector {
+            return true;
+        }
+
+        if let Some(stripped) = selector.strip_prefix("id:") {
+            return target.pane_id.as_deref() == Some(stripped);
+        }
+
+        if selector.starts_with("terminal:") || selector.starts_with("plugin:") {
+            return target.pane_id.as_deref() == Some(selector);
+        }
+
+        if let Some(stripped) = selector.strip_prefix("title:") {
+            return target
+                .title
+                .as_deref()
+                .is_some_and(|title| title.contains(stripped));
+        }
+
+        false
+    }
+
     fn revalidate_binding(&self, binding: &TerminalBinding) -> Result<TerminalStatus, DomainError> {
         if matches!(binding.status, TerminalStatus::Closed) {
             return Ok(TerminalStatus::Closed);
@@ -447,6 +514,55 @@ where
         })
     }
 
+    fn discover(&self, request: DiscoverRequest) -> Result<DiscoverResponse, DomainError> {
+        self.ensure_available()?;
+        let preview_lines =
+            Self::validate_positive_lines(request.preview_lines, "preview_lines")?.unwrap_or(8);
+
+        let mut targets = self
+            .adapter
+            .list_targets_in_session(&request.session_name)
+            .map_err(|error| self.map_adapter_error(error, ErrorCode::AttachFailed))?;
+
+        if let Some(tab_name) = request.tab_name.as_ref() {
+            targets.retain(|target| target.tab_name.as_deref() == Some(tab_name.as_str()));
+        }
+
+        if let Some(selector) = request.selector.as_deref() {
+            let selector = selector.trim();
+            targets.retain(|target| Self::discover_matches_selector(selector, target));
+        }
+
+        let mut candidates = Vec::with_capacity(targets.len());
+        for target in targets {
+            let (preview, preview_basis, captured_at) = if request.include_preview {
+                let snapshot = self
+                    .adapter
+                    .capture_full(&target.session_name, &target.selector)
+                    .map_err(|error| self.map_adapter_error(error, ErrorCode::CaptureFailed))?;
+                let (preview, basis) = Self::preview_for_snapshot(&snapshot.content, preview_lines);
+                (Some(preview), Some(basis), Some(snapshot.captured_at))
+            } else {
+                (None, None, None)
+            };
+
+            candidates.push(DiscoverCandidate {
+                selector: target.selector,
+                pane_id: target.pane_id,
+                session_name: target.session_name,
+                tab_name: target.tab_name,
+                title: target.title,
+                command: target.command,
+                focused: target.focused,
+                preview,
+                preview_basis,
+                captured_at,
+            });
+        }
+
+        Ok(DiscoverResponse { candidates })
+    }
+
     fn list(&self, request: ListRequest) -> Result<ListResponse, DomainError> {
         self.revalidate_all()?;
         let mut bindings = self.read_bindings()?;
@@ -459,6 +575,7 @@ where
 
     fn capture(&self, request: CaptureRequest) -> Result<CaptureResponse, DomainError> {
         self.ensure_available()?;
+        let tail_lines = Self::validate_positive_lines(request.tail_lines, "tail_lines")?;
 
         let mut bindings = self.read_bindings()?;
         let active = self.ensure_handle_revalidated(&request.handle)?;
@@ -522,6 +639,10 @@ where
             CaptureMode::Delta => Some("last_capture".to_string()),
             CaptureMode::Current => Some("command_boundary".to_string()),
         };
+        let (content, line_window_applied) = match tail_lines {
+            Some(count) => Self::tail_lines(&content, count),
+            None => (content, false),
+        };
 
         let hash = Self::hash_content(&snapshot.content);
         observation.update_full_snapshot(snapshot.content, hash, snapshot.captured_at);
@@ -538,6 +659,8 @@ where
                     CaptureMode::Current => "current".to_string(),
                 },
                 content,
+                tail_lines,
+                line_window_applied,
                 truncated: snapshot.truncated,
                 captured_at: snapshot.captured_at,
                 baseline,
@@ -743,6 +866,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct MockAdapter {
         target: ResolvedTarget,
+        list_targets: Vec<ResolvedTarget>,
         captures: Vec<String>,
         capture_index: Arc<Mutex<usize>>,
         sent_inputs: Arc<Mutex<Vec<(String, bool)>>>,
@@ -761,7 +885,18 @@ mod tests {
                     session_name: "gpu".to_string(),
                     tab_name: Some("editor".to_string()),
                     title: Some("editor".to_string()),
+                    command: Some("fish".to_string()),
+                    focused: false,
                 },
+                list_targets: vec![ResolvedTarget {
+                    selector: "id:terminal:7".to_string(),
+                    pane_id: Some("terminal:7".to_string()),
+                    session_name: "gpu".to_string(),
+                    tab_name: Some("editor".to_string()),
+                    title: Some("editor".to_string()),
+                    command: Some("fish".to_string()),
+                    focused: false,
+                }],
                 captures: vec![content.to_string()],
                 capture_index: Arc::new(Mutex::new(0)),
                 sent_inputs: Arc::new(Mutex::new(Vec::new())),
@@ -780,6 +915,18 @@ mod tests {
                     .expect("mock capture sequence should not be empty"),
             );
             adapter.captures = contents.iter().map(|item| (*item).to_string()).collect();
+            adapter
+        }
+
+        fn with_targets_and_captures(targets: Vec<ResolvedTarget>, captures: Vec<&str>) -> Self {
+            let mut adapter = Self::single_capture(
+                captures
+                    .first()
+                    .copied()
+                    .expect("mock captures should not be empty"),
+            );
+            adapter.list_targets = targets;
+            adapter.captures = captures.into_iter().map(ToString::to_string).collect();
             adapter
         }
     }
@@ -803,6 +950,18 @@ mod tests {
                 ));
             }
             Ok(self.target.clone())
+        }
+
+        fn list_targets_in_session(
+            &self,
+            session_name: &str,
+        ) -> Result<Vec<ResolvedTarget>, AdapterError> {
+            Ok(self
+                .list_targets
+                .iter()
+                .filter(|target| target.session_name == session_name)
+                .cloned()
+                .collect())
         }
 
         fn send_input(
@@ -949,6 +1108,112 @@ mod tests {
     }
 
     #[test]
+    fn discover_returns_recent_lines_preview_for_shell_like_pane() {
+        let targets = vec![ResolvedTarget {
+            selector: "id:terminal:7".to_string(),
+            pane_id: Some("terminal:7".to_string()),
+            session_name: "gpu".to_string(),
+            tab_name: Some("editor".to_string()),
+            title: Some("shell-job".to_string()),
+            command: Some("cargo test".to_string()),
+            focused: false,
+        }];
+        let service = make_service(MockAdapter::with_targets_and_captures(
+            targets,
+            vec!["l1\nl2\nl3\nl4\n"],
+        ));
+
+        let response = service
+            .discover(DiscoverRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: None,
+                include_preview: true,
+                preview_lines: Some(2),
+            })
+            .expect("discover should succeed");
+
+        assert_eq!(response.candidates.len(), 1);
+        assert_eq!(
+            response.candidates[0].command.as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(
+            response.candidates[0].preview_basis.as_deref(),
+            Some("recent_lines")
+        );
+        assert_eq!(response.candidates[0].preview.as_deref(), Some("l3\nl4\n"));
+    }
+
+    #[test]
+    fn discover_returns_visible_frame_preview_for_repaint_heavy_pane() {
+        let targets = vec![ResolvedTarget {
+            selector: "id:terminal:7".to_string(),
+            pane_id: Some("terminal:7".to_string()),
+            session_name: "gpu".to_string(),
+            tab_name: Some("btop".to_string()),
+            title: Some("btop".to_string()),
+            command: Some("btop".to_string()),
+            focused: true,
+        }];
+        let service = make_service(MockAdapter::with_targets_and_captures(
+            targets,
+            vec!["\u{1b}[2J\u{1b}[Htop\ncpu 11%\nmem 30%\n"],
+        ));
+
+        let response = service
+            .discover(DiscoverRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("btop".to_string()),
+                selector: None,
+                include_preview: true,
+                preview_lines: Some(2),
+            })
+            .expect("discover should succeed");
+
+        assert_eq!(
+            response.candidates[0].preview_basis.as_deref(),
+            Some("visible_frame")
+        );
+        assert!(response.candidates[0].focused);
+        assert_eq!(
+            response.candidates[0].preview.as_deref(),
+            Some("cpu 11%\nmem 30%\n")
+        );
+    }
+
+    #[test]
+    fn discover_without_preview_avoids_capture_payload() {
+        let targets = vec![ResolvedTarget {
+            selector: "id:terminal:7".to_string(),
+            pane_id: Some("terminal:7".to_string()),
+            session_name: "gpu".to_string(),
+            tab_name: Some("editor".to_string()),
+            title: Some("shell-job".to_string()),
+            command: Some("cargo test".to_string()),
+            focused: false,
+        }];
+        let service = make_service(MockAdapter::with_targets_and_captures(
+            targets,
+            vec!["l1\nl2\nl3\n"],
+        ));
+
+        let response = service
+            .discover(DiscoverRequest {
+                session_name: "gpu".to_string(),
+                tab_name: None,
+                selector: None,
+                include_preview: false,
+                preview_lines: None,
+            })
+            .expect("discover should succeed");
+
+        assert_eq!(response.candidates[0].preview, None);
+        assert_eq!(response.candidates[0].preview_basis, None);
+        assert_eq!(response.candidates[0].captured_at, None);
+    }
+
+    #[test]
     fn delta_mode_shell_append_only_still_returns_increment() {
         let service = make_service(MockAdapter::capture_sequence(&[
             "hello\n",
@@ -967,6 +1232,7 @@ mod tests {
             .capture(CaptureRequest {
                 handle: attach.handle,
                 mode: CaptureMode::Delta,
+                tail_lines: None,
             })
             .expect("delta capture should succeed");
 
@@ -992,10 +1258,89 @@ mod tests {
             .capture(CaptureRequest {
                 handle: attach.handle,
                 mode: CaptureMode::Full,
+                tail_lines: None,
             })
             .expect("full capture should succeed");
 
         assert_eq!(response.capture.content, "hello\nworld\n");
+    }
+
+    #[test]
+    fn full_mode_tail_lines_clips_after_semantic_capture() {
+        let service = make_service(MockAdapter::capture_sequence(&[
+            "hello\n",
+            "hello\nworld\nagain\n",
+        ]));
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        let response = service
+            .capture(CaptureRequest {
+                handle: attach.handle,
+                mode: CaptureMode::Full,
+                tail_lines: Some(2),
+            })
+            .expect("full capture should succeed");
+
+        assert_eq!(response.capture.content, "world\nagain\n");
+        assert_eq!(response.capture.tail_lines, Some(2));
+        assert!(response.capture.line_window_applied);
+    }
+
+    #[test]
+    fn delta_mode_tail_lines_clips_after_delta_computation() {
+        let service = make_service(MockAdapter::capture_sequence(&[
+            "base\n",
+            "base\na\nb\nc\n",
+        ]));
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        let response = service
+            .capture(CaptureRequest {
+                handle: attach.handle,
+                mode: CaptureMode::Delta,
+                tail_lines: Some(2),
+            })
+            .expect("delta capture should succeed");
+
+        assert_eq!(response.capture.content, "b\nc\n");
+        assert!(response.capture.line_window_applied);
+    }
+
+    #[test]
+    fn capture_rejects_zero_tail_lines() {
+        let service = make_service(MockAdapter::single_capture("ready\n"));
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        let error = service
+            .capture(CaptureRequest {
+                handle: attach.handle,
+                mode: CaptureMode::Full,
+                tail_lines: Some(0),
+            })
+            .expect_err("tail_lines=0 should fail");
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
     }
 
     #[test]
@@ -1040,6 +1385,7 @@ mod tests {
             .capture(CaptureRequest {
                 handle: attach.handle,
                 mode: CaptureMode::Current,
+                tail_lines: None,
             })
             .expect("current capture should succeed");
 
@@ -1065,6 +1411,7 @@ mod tests {
             .capture(CaptureRequest {
                 handle: attach.handle,
                 mode: CaptureMode::Current,
+                tail_lines: None,
             })
             .expect("current capture should succeed");
 
