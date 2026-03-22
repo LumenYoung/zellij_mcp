@@ -46,11 +46,12 @@ pub fn parse_spawn_output(
     tab_name: Option<&str>,
     title: Option<&str>,
 ) -> Result<ResolvedTarget, AdapterError> {
-    let selector = parse_single_selector(output)?;
-    let pane_id = selector
+    let raw_selector = parse_single_selector(output)?;
+    let pane_id = raw_selector
         .strip_prefix("id:")
-        .unwrap_or(&selector)
+        .unwrap_or(&raw_selector)
         .to_string();
+    let selector = format!("id:{pane_id}");
 
     Ok(ResolvedTarget {
         selector,
@@ -119,5 +120,14 @@ mod tests {
         assert_eq!(target.tab_name.as_deref(), Some("editor"));
         assert_eq!(target.title.as_deref(), Some("lg"));
         assert_eq!(target.command, None);
+    }
+
+    #[test]
+    fn canonicalizes_raw_spawn_output_to_id_selector() {
+        let target = parse_spawn_output("terminal:9\n", "gpu", Some("editor"), Some("lg"))
+            .expect("spawn output should parse");
+
+        assert_eq!(target.selector, "id:terminal:9");
+        assert_eq!(target.pane_id.as_deref(), Some("terminal:9"));
     }
 }

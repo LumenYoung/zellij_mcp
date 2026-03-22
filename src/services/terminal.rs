@@ -1,5 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::time::{Duration, Instant};
 
 use crate::adapters::zjctl::{AdapterError, ZjctlAdapter};
 use crate::domain::binding::TerminalBinding;
@@ -226,17 +227,6 @@ where
         Ok(())
     }
 
-    fn set_binding_status(&self, handle: &str, status: TerminalStatus) -> Result<(), DomainError> {
-        let mut bindings = self.read_bindings()?;
-        if let Some(binding) = bindings.iter_mut().find(|binding| binding.handle == handle) {
-            binding.status = status;
-            binding.updated_at = Utc::now();
-            self.write_bindings(&bindings)?;
-        }
-
-        Ok(())
-    }
-
     fn build_send_payload(request: &SendRequest) -> Result<(String, bool), DomainError> {
         let mut payload = request.text.clone();
 
@@ -258,6 +248,198 @@ where
         }
 
         Ok((payload, submit))
+    }
+
+    fn build_revalidation_requests(binding: &TerminalBinding) -> Vec<AttachRequest> {
+        let mut requests = Vec::new();
+
+        if let Some(pane_id) = binding.pane_id.as_deref() {
+            requests.push(AttachRequest {
+                session_name: binding.session_name.clone(),
+                tab_name: binding.tab_name.clone(),
+                selector: format!("id:{pane_id}"),
+                alias: None,
+            });
+        }
+
+        if requests
+            .iter()
+            .all(|request| request.selector != binding.selector)
+        {
+            requests.push(AttachRequest {
+                session_name: binding.session_name.clone(),
+                tab_name: binding.tab_name.clone(),
+                selector: binding.selector.clone(),
+                alias: None,
+            });
+        }
+
+        requests
+    }
+
+    fn should_clear_attached_input(binding: &TerminalBinding, request: &SendRequest) -> bool {
+        binding.source == BindingSource::Attached
+            && request.submit
+            && request.keys.is_empty()
+            && !request.text.is_empty()
+    }
+
+    fn prepare_attached_send_boundary(
+        &self,
+        binding: &TerminalBinding,
+        handle: &str,
+    ) -> Result<(), DomainError> {
+        let snapshot = self
+            .adapter
+            .capture_full(&binding.session_name, &binding.selector)
+            .map_err(|error| {
+                if Self::is_missing_target_error(&error) {
+                    let _ = self.mark_binding_stale(handle);
+                    Self::inactive_binding_error(handle)
+                } else {
+                    self.map_adapter_error(error, ErrorCode::CaptureFailed)
+                }
+            })?;
+
+        let mut observations = self.read_observations()?;
+        let observation = observations
+            .iter_mut()
+            .find(|item| item.handle == handle)
+            .ok_or_else(|| {
+                DomainError::new(
+                    ErrorCode::HandleNotFound,
+                    format!("observation for `{handle}` is missing"),
+                    false,
+                )
+            })?;
+
+        let hash = Self::hash_content(&snapshot.content);
+        observation.update_full_snapshot(snapshot.content, hash, snapshot.captured_at);
+        observation.reset_command_boundary();
+        self.write_observations(&observations)?;
+
+        Ok(())
+    }
+
+    fn refresh_binding_target(&self, handle: &str) -> Result<TerminalBinding, DomainError> {
+        let mut bindings = self.read_bindings()?;
+        let index = bindings
+            .iter()
+            .position(|binding| binding.handle == handle)
+            .ok_or_else(|| {
+                DomainError::new(
+                    ErrorCode::HandleNotFound,
+                    format!("handle `{handle}` is not registered"),
+                    false,
+                )
+            })?;
+
+        if matches!(bindings[index].status, TerminalStatus::Closed) {
+            return Ok(bindings[index].clone());
+        }
+
+        for attempt in 0..3 {
+            for request in Self::build_revalidation_requests(&bindings[index]) {
+                match self.adapter.resolve_selector(&request) {
+                    Ok(resolved) => {
+                        bindings[index].selector = resolved.selector;
+                        bindings[index].pane_id = resolved.pane_id;
+                        bindings[index].tab_name = resolved.tab_name;
+                        bindings[index].status = TerminalStatus::Ready;
+                        bindings[index].updated_at = Utc::now();
+                        self.write_bindings(&bindings)?;
+                        return Ok(bindings[index].clone());
+                    }
+                    Err(error) if Self::is_missing_target_error(&error) => continue,
+                    Err(error) => {
+                        return Err(self.map_adapter_error(error, ErrorCode::TargetNotFound));
+                    }
+                }
+            }
+
+            if attempt < 2 {
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        }
+
+        bindings[index].status = TerminalStatus::Stale;
+        bindings[index].updated_at = Utc::now();
+        self.write_bindings(&bindings)?;
+        Ok(bindings[index].clone())
+    }
+
+    fn run_binding_operation_with_retry<T, F>(
+        &self,
+        handle: &str,
+        binding: &TerminalBinding,
+        error_code: ErrorCode,
+        operation: F,
+    ) -> Result<T, DomainError>
+    where
+        F: Fn(&TerminalBinding) -> Result<T, AdapterError>,
+    {
+        let mut current = binding.clone();
+        for attempt in 0..3 {
+            match operation(&current) {
+                Ok(result) => return Ok(result),
+                Err(error) if Self::is_missing_target_error(&error) => {
+                    current = self.refresh_binding_target(handle)?;
+                    Self::ensure_binding_active(&current)?;
+                    if attempt < 2 {
+                        std::thread::sleep(Duration::from_millis(150));
+                        continue;
+                    }
+                    let _ = self.mark_binding_stale(handle);
+                    return Err(Self::inactive_binding_error(handle));
+                }
+                Err(error) => return Err(self.map_adapter_error(error, error_code)),
+            }
+        }
+
+        unreachable!("retry loop should always return")
+    }
+
+    fn wait_via_capture_polling(
+        &self,
+        handle: &str,
+        binding: &TerminalBinding,
+        idle_ms: u64,
+        timeout_ms: u64,
+    ) -> Result<(), DomainError> {
+        let start = Instant::now();
+        let mut last_hash: Option<String> = None;
+        let mut last_change = Instant::now();
+        let poll_interval = Duration::from_millis(idle_ms.clamp(50, 250));
+
+        while start.elapsed() < Duration::from_millis(timeout_ms) {
+            let snapshot = self.run_binding_operation_with_retry(
+                handle,
+                binding,
+                ErrorCode::CaptureFailed,
+                |binding| {
+                    self.adapter
+                        .capture_full(&binding.session_name, &binding.selector)
+                },
+            )?;
+            let hash = Self::hash_content(&snapshot.content);
+
+            if last_hash.as_deref() == Some(hash.as_str()) {
+                if last_change.elapsed() >= Duration::from_millis(idle_ms) {
+                    return Ok(());
+                }
+            } else {
+                last_hash = Some(hash);
+                last_change = Instant::now();
+            }
+
+            std::thread::sleep(poll_interval);
+        }
+
+        Err(DomainError::new(
+            ErrorCode::WaitTimeout,
+            format!("pane `{handle}` did not become idle before timeout"),
+            true,
+        ))
     }
 
     fn launch_command_summary(request: &SpawnRequest) -> Option<String> {
@@ -333,55 +515,8 @@ where
         false
     }
 
-    fn revalidate_binding(&self, binding: &TerminalBinding) -> Result<TerminalStatus, DomainError> {
-        if matches!(binding.status, TerminalStatus::Closed) {
-            return Ok(TerminalStatus::Closed);
-        }
-
-        let request = AttachRequest {
-            session_name: binding.session_name.clone(),
-            tab_name: binding.tab_name.clone(),
-            selector: binding.selector.clone(),
-            alias: None,
-        };
-
-        match self.adapter.resolve_selector(&request) {
-            Ok(_) => Ok(TerminalStatus::Ready),
-            Err(error) if Self::is_missing_target_error(&error) => Ok(TerminalStatus::Stale),
-            Err(error) => Err(self.map_adapter_error(error, ErrorCode::TargetNotFound)),
-        }
-    }
-
     fn ensure_handle_revalidated(&self, handle: &str) -> Result<TerminalBinding, DomainError> {
-        let bindings = self.read_bindings()?;
-        let binding = bindings
-            .iter()
-            .find(|binding| binding.handle == handle)
-            .cloned()
-            .ok_or_else(|| {
-                DomainError::new(
-                    ErrorCode::HandleNotFound,
-                    format!("handle `{handle}` is not registered"),
-                    false,
-                )
-            })?;
-
-        let status = self.revalidate_binding(&binding)?;
-        if status != binding.status {
-            self.set_binding_status(handle, status)?;
-        }
-
-        let refreshed = self.read_bindings()?;
-        refreshed
-            .into_iter()
-            .find(|binding| binding.handle == handle)
-            .ok_or_else(|| {
-                DomainError::new(
-                    ErrorCode::HandleNotFound,
-                    format!("handle `{handle}` is not registered"),
-                    false,
-                )
-            })
+        self.refresh_binding_target(handle)
     }
 
     pub fn revalidate_all(&self) -> Result<(), DomainError> {
@@ -391,10 +526,7 @@ where
 
         let bindings = self.read_bindings()?;
         for binding in bindings {
-            let status = self.revalidate_binding(&binding)?;
-            if status != binding.status {
-                self.set_binding_status(&binding.handle, status)?;
-            }
+            let _ = self.refresh_binding_target(&binding.handle)?;
         }
 
         Ok(())
@@ -594,17 +726,15 @@ where
 
         Self::ensure_binding_active(&binding)?;
 
-        let snapshot = self
-            .adapter
-            .capture_full(&binding.session_name, &binding.selector)
-            .map_err(|error| {
-                if Self::is_missing_target_error(&error) {
-                    let _ = self.mark_binding_stale(&request.handle);
-                    Self::inactive_binding_error(&request.handle)
-                } else {
-                    self.map_adapter_error(error, ErrorCode::CaptureFailed)
-                }
-            })?;
+        let snapshot = self.run_binding_operation_with_retry(
+            &request.handle,
+            binding,
+            ErrorCode::CaptureFailed,
+            |binding| {
+                self.adapter
+                    .capture_full(&binding.session_name, &binding.selector)
+            },
+        )?;
 
         let mut observations = self.read_observations()?;
         let index = observations
@@ -672,22 +802,29 @@ where
         self.ensure_available()?;
 
         let binding = self.ensure_handle_revalidated(&request.handle)?;
-        let (payload, submit) = Self::build_send_payload(&request)?;
+        let clear_attached_input = Self::should_clear_attached_input(&binding, &request);
+        if clear_attached_input {
+            self.prepare_attached_send_boundary(&binding, &request.handle)?;
+        }
+
+        let (mut payload, submit) = Self::build_send_payload(&request)?;
+        if clear_attached_input {
+            payload.insert(0, '\u{15}');
+        }
 
         Self::ensure_binding_active(&binding)?;
 
-        self.adapter
-            .send_input(&binding.session_name, &binding.selector, &payload, submit)
-            .map_err(|error| {
-                if Self::is_missing_target_error(&error) {
-                    let _ = self.mark_binding_stale(&request.handle);
-                    Self::inactive_binding_error(&request.handle)
-                } else {
-                    self.map_adapter_error(error, ErrorCode::SendFailed)
-                }
-            })?;
+        self.run_binding_operation_with_retry(
+            &request.handle,
+            &binding,
+            ErrorCode::SendFailed,
+            |binding| {
+                self.adapter
+                    .send_input(&binding.session_name, &binding.selector, &payload, submit)
+            },
+        )?;
 
-        if request.submit {
+        if request.submit && !clear_attached_input {
             let mut observations = self.read_observations()?;
             let observation = observations
                 .iter_mut()
@@ -727,28 +864,36 @@ where
 
         binding.status = active.status;
         binding.updated_at = active.updated_at;
-        let session_name = binding.session_name.clone();
-        let selector = binding.selector.clone();
         Self::ensure_binding_active(binding)?;
         binding.status = TerminalStatus::Busy;
+        let busy_binding = binding.clone();
         self.write_bindings(&bindings)?;
 
-        let result = self
-            .adapter
-            .wait_idle(
-                &session_name,
-                &selector,
+        let result = self.run_binding_operation_with_retry(
+            &request.handle,
+            &busy_binding,
+            ErrorCode::WaitFailed,
+            |binding| {
+                self.adapter.wait_idle(
+                    &binding.session_name,
+                    &binding.selector,
+                    request.idle_ms,
+                    request.timeout_ms,
+                )
+            },
+        );
+        let result = match result {
+            Err(DomainError {
+                code: ErrorCode::TargetStale,
+                ..
+            }) => self.wait_via_capture_polling(
+                &request.handle,
+                &busy_binding,
                 request.idle_ms,
                 request.timeout_ms,
-            )
-            .map_err(|error| {
-                if Self::is_missing_target_error(&error) {
-                    let _ = self.mark_binding_stale(&request.handle);
-                    Self::inactive_binding_error(&request.handle)
-                } else {
-                    self.map_adapter_error(error, ErrorCode::WaitFailed)
-                }
-            });
+            ),
+            other => other,
+        };
 
         let observed_at = Utc::now();
         if !matches!(
@@ -796,8 +941,6 @@ where
 
         bindings[index].status = active.status;
         bindings[index].updated_at = active.updated_at;
-        let session_name = bindings[index].session_name.clone();
-        let selector = bindings[index].selector.clone();
         if bindings[index].status == TerminalStatus::Closed {
             return Ok(CloseResponse {
                 handle: request.handle,
@@ -806,16 +949,15 @@ where
         }
         Self::ensure_binding_active(&bindings[index])?;
 
-        self.adapter
-            .close(&session_name, &selector, request.force)
-            .map_err(|error| {
-                if Self::is_missing_target_error(&error) {
-                    let _ = self.mark_binding_stale(&request.handle);
-                    Self::inactive_binding_error(&request.handle)
-                } else {
-                    self.map_adapter_error(error, ErrorCode::CloseFailed)
-                }
-            })?;
+        self.run_binding_operation_with_retry(
+            &request.handle,
+            &bindings[index],
+            ErrorCode::CloseFailed,
+            |binding| {
+                self.adapter
+                    .close(&binding.session_name, &binding.selector, request.force)
+            },
+        )?;
 
         bindings[index].status = TerminalStatus::Closed;
         bindings[index].updated_at = Utc::now();
@@ -870,6 +1012,10 @@ mod tests {
         captures: Vec<String>,
         capture_index: Arc<Mutex<usize>>,
         sent_inputs: Arc<Mutex<Vec<(String, bool)>>>,
+        resolve_failures_remaining: Arc<Mutex<usize>>,
+        send_failures_remaining: Arc<Mutex<usize>>,
+        wait_failures_remaining: Arc<Mutex<usize>>,
+        capture_failures_remaining: Arc<Mutex<usize>>,
         resolve_missing_target: bool,
         send_missing_target: bool,
         wait_missing_target: bool,
@@ -900,6 +1046,10 @@ mod tests {
                 captures: vec![content.to_string()],
                 capture_index: Arc::new(Mutex::new(0)),
                 sent_inputs: Arc::new(Mutex::new(Vec::new())),
+                resolve_failures_remaining: Arc::new(Mutex::new(0)),
+                send_failures_remaining: Arc::new(Mutex::new(0)),
+                wait_failures_remaining: Arc::new(Mutex::new(0)),
+                capture_failures_remaining: Arc::new(Mutex::new(0)),
                 resolve_missing_target: false,
                 send_missing_target: false,
                 wait_missing_target: false,
@@ -942,14 +1092,38 @@ mod tests {
 
         fn resolve_selector(
             &self,
-            _request: &AttachRequest,
+            request: &AttachRequest,
         ) -> Result<ResolvedTarget, AdapterError> {
             if self.resolve_missing_target {
                 return Err(AdapterError::CommandFailed(
                     "RPC error: no panes match selector".to_string(),
                 ));
             }
-            Ok(self.target.clone())
+
+            let mut failures_remaining = self
+                .resolve_failures_remaining
+                .lock()
+                .expect("resolve failures lock should succeed");
+            if *failures_remaining > 0 {
+                *failures_remaining -= 1;
+                return Err(AdapterError::CommandFailed(
+                    "RPC error: no panes match selector".to_string(),
+                ));
+            }
+
+            self.list_targets
+                .iter()
+                .find(|target| {
+                    target.session_name == request.session_name
+                        && request.tab_name.as_ref().is_none_or(|tab_name| {
+                            target.tab_name.as_deref() == Some(tab_name.as_str())
+                        })
+                        && mock_matches_selector(&request.selector, target)
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    AdapterError::CommandFailed("RPC error: no panes match selector".to_string())
+                })
         }
 
         fn list_targets_in_session(
@@ -976,6 +1150,17 @@ mod tests {
                     "RPC error: no panes match selector".to_string(),
                 ));
             }
+
+            let mut failures_remaining = self
+                .send_failures_remaining
+                .lock()
+                .expect("send failures lock should succeed");
+            if *failures_remaining > 0 {
+                *failures_remaining -= 1;
+                return Err(AdapterError::CommandFailed(
+                    "RPC error: no panes match selector".to_string(),
+                ));
+            }
             self.sent_inputs
                 .lock()
                 .expect("sent inputs lock should succeed")
@@ -995,6 +1180,17 @@ mod tests {
                     "RPC error: no panes match selector".to_string(),
                 ));
             }
+
+            let mut failures_remaining = self
+                .wait_failures_remaining
+                .lock()
+                .expect("wait failures lock should succeed");
+            if *failures_remaining > 0 {
+                *failures_remaining -= 1;
+                return Err(AdapterError::CommandFailed(
+                    "RPC error: no panes match selector".to_string(),
+                ));
+            }
             Ok(())
         }
 
@@ -1004,6 +1200,17 @@ mod tests {
             _handle: &str,
         ) -> Result<CaptureSnapshot, AdapterError> {
             if self.capture_missing_target {
+                return Err(AdapterError::CommandFailed(
+                    "RPC error: no panes match selector".to_string(),
+                ));
+            }
+
+            let mut failures_remaining = self
+                .capture_failures_remaining
+                .lock()
+                .expect("capture failures lock should succeed");
+            if *failures_remaining > 0 {
+                *failures_remaining -= 1;
                 return Err(AdapterError::CommandFailed(
                     "RPC error: no panes match selector".to_string(),
                 ));
@@ -1056,6 +1263,29 @@ mod tests {
             RegistryStore::new(root.join("registry.json")),
             ObservationStore::new(root.join("observations.json")),
         )
+    }
+
+    fn mock_matches_selector(selector: &str, target: &ResolvedTarget) -> bool {
+        if selector == target.selector {
+            return true;
+        }
+
+        if let Some(stripped) = selector.strip_prefix("id:") {
+            return target.pane_id.as_deref() == Some(stripped);
+        }
+
+        if selector.starts_with("terminal:") || selector.starts_with("plugin:") {
+            return target.pane_id.as_deref() == Some(selector);
+        }
+
+        if let Some(stripped) = selector.strip_prefix("title:") {
+            return target
+                .title
+                .as_deref()
+                .is_some_and(|title| title.contains(stripped));
+        }
+
+        false
     }
 
     #[test]
@@ -1524,14 +1754,18 @@ mod tests {
     #[test]
     fn send_submit_resets_command_boundary() {
         let service = make_service(MockAdapter::single_capture("baseline"));
-        let attach = service
-            .attach(AttachRequest {
+        let spawn = service
+            .spawn(SpawnRequest {
                 session_name: "gpu".to_string(),
+                target: SpawnTarget::ExistingTab,
                 tab_name: Some("editor".to_string()),
-                selector: "id:terminal:7".to_string(),
-                alias: None,
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: None,
+                wait_ready: false,
             })
-            .expect("attach should succeed");
+            .expect("spawn should succeed");
 
         {
             let mut observations = service
@@ -1548,7 +1782,7 @@ mod tests {
 
         service
             .send(SendRequest {
-                handle: attach.handle.clone(),
+                handle: spawn.handle.clone(),
                 text: "run".to_string(),
                 keys: vec![],
                 submit: true,
@@ -1563,6 +1797,106 @@ mod tests {
             observations[0].command_boundary_content.as_deref(),
             Some("after-send")
         );
+    }
+
+    #[test]
+    fn attached_submit_text_clears_pending_input_before_send() {
+        let adapter = MockAdapter::capture_sequence(&["baseline", "prompt> npx"]);
+        let sent_inputs = adapter.sent_inputs.clone();
+        let service = make_service(adapter);
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        service
+            .send(SendRequest {
+                handle: attach.handle.clone(),
+                text: "echo hello".to_string(),
+                keys: vec![],
+                submit: true,
+            })
+            .expect("send should succeed");
+
+        let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "\u{15}echo hello");
+        assert!(sent[0].1);
+
+        let observations = service
+            .observation_store
+            .load()
+            .expect("observations should load");
+        assert_eq!(
+            observations[0].command_boundary_content.as_deref(),
+            Some("prompt> npx")
+        );
+    }
+
+    #[test]
+    fn spawned_submit_text_does_not_clear_pending_input_before_send() {
+        let adapter = MockAdapter::capture_sequence(&["ready"]);
+        let sent_inputs = adapter.sent_inputs.clone();
+        let service = make_service(adapter);
+        let spawn = service
+            .spawn(SpawnRequest {
+                session_name: "gpu".to_string(),
+                target: SpawnTarget::ExistingTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: None,
+                wait_ready: false,
+            })
+            .expect("spawn should succeed");
+
+        service
+            .send(SendRequest {
+                handle: spawn.handle,
+                text: "echo hello".to_string(),
+                keys: vec![],
+                submit: true,
+            })
+            .expect("send should succeed");
+
+        let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "echo hello");
+        assert!(sent[0].1);
+    }
+
+    #[test]
+    fn attached_keys_only_send_does_not_clear_pending_input_before_send() {
+        let adapter = MockAdapter::capture_sequence(&["baseline"]);
+        let sent_inputs = adapter.sent_inputs.clone();
+        let service = make_service(adapter);
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        service
+            .send(SendRequest {
+                handle: attach.handle,
+                text: String::new(),
+                keys: vec!["up".to_string()],
+                submit: false,
+            })
+            .expect("send should succeed");
+
+        let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "\u{1b}[A");
+        assert!(!sent[0].1);
     }
 
     #[test]
@@ -1587,6 +1921,43 @@ mod tests {
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].source, BindingSource::Spawned);
         assert_eq!(response.status, "ready");
+    }
+
+    #[test]
+    fn spawn_revalidation_prefers_stored_pane_id_when_selector_is_legacy_raw_form() {
+        let root = std::env::temp_dir().join(format!("zellij-mcp-test-{}", uuid::Uuid::new_v4()));
+        let service = make_service_with_root(MockAdapter::single_capture("ready"), root.clone());
+
+        let spawned = service
+            .spawn(SpawnRequest {
+                session_name: "gpu".to_string(),
+                target: SpawnTarget::ExistingTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: None,
+                wait_ready: false,
+            })
+            .expect("spawn should succeed");
+
+        let mut bindings = service.registry_store.load().expect("bindings should load");
+        bindings[0].selector = "terminal:7".to_string();
+        service
+            .registry_store
+            .save(&bindings)
+            .expect("bindings should save");
+
+        let follow_up = make_service_with_root(MockAdapter::single_capture("ready"), root);
+        let response = follow_up
+            .wait(WaitRequest {
+                handle: spawned.handle,
+                idle_ms: 1200,
+                timeout_ms: 30_000,
+            })
+            .expect("wait should revalidate through pane id");
+
+        assert_eq!(response.status, "idle");
     }
 
     #[test]
@@ -1694,9 +2065,47 @@ mod tests {
     }
 
     #[test]
+    fn send_retries_once_after_refresh_when_target_lookup_is_transient() {
+        let adapter = MockAdapter::single_capture("baseline");
+        let sent_inputs = adapter.sent_inputs.clone();
+        *adapter
+            .send_failures_remaining
+            .lock()
+            .expect("send failures lock should succeed") = 1;
+        let service = make_service(adapter);
+        let spawn = service
+            .spawn(SpawnRequest {
+                session_name: "gpu".to_string(),
+                target: SpawnTarget::ExistingTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: None,
+                wait_ready: false,
+            })
+            .expect("spawn should succeed");
+
+        let response = service
+            .send(SendRequest {
+                handle: spawn.handle.clone(),
+                text: "echo retry".to_string(),
+                keys: vec![],
+                submit: true,
+            })
+            .expect("send should retry and succeed");
+
+        assert!(response.accepted);
+        let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "echo retry");
+    }
+
+    #[test]
     fn wait_marks_binding_stale_when_target_disappears() {
         let mut adapter = MockAdapter::single_capture("baseline");
         adapter.wait_missing_target = true;
+        let capture_failures_remaining = adapter.capture_failures_remaining.clone();
         let service = make_service(adapter);
         let attach = service
             .attach(AttachRequest {
@@ -1706,6 +2115,10 @@ mod tests {
                 alias: None,
             })
             .expect("attach should succeed");
+
+        *capture_failures_remaining
+            .lock()
+            .expect("capture failures lock should succeed") = 3;
 
         let error = service
             .wait(WaitRequest {
@@ -1718,6 +2131,93 @@ mod tests {
 
         let bindings = service.registry_store.load().expect("bindings should load");
         assert_eq!(bindings[0].status, TerminalStatus::Stale);
+    }
+
+    #[test]
+    fn wait_falls_back_to_capture_polling_when_backend_wait_is_transiently_missing() {
+        let mut adapter = MockAdapter::capture_sequence(&["steady", "steady", "steady"]);
+        adapter.wait_missing_target = true;
+        let service = make_service(adapter);
+        let spawn = service
+            .spawn(SpawnRequest {
+                session_name: "gpu".to_string(),
+                target: SpawnTarget::ExistingTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: None,
+                wait_ready: false,
+            })
+            .expect("spawn should succeed");
+
+        let response = service
+            .wait(WaitRequest {
+                handle: spawn.handle,
+                idle_ms: 50,
+                timeout_ms: 500,
+            })
+            .expect("wait should fall back to capture polling");
+
+        assert_eq!(response.status, "idle");
+    }
+
+    #[test]
+    fn wait_capture_fallback_uses_wait_timeout_code_on_timeout() {
+        let mut adapter = MockAdapter::capture_sequence(&["a", "b", "c", "d"]);
+        adapter.wait_missing_target = true;
+        let service = make_service(adapter);
+        let spawn = service
+            .spawn(SpawnRequest {
+                session_name: "gpu".to_string(),
+                target: SpawnTarget::ExistingTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: None,
+                wait_ready: false,
+            })
+            .expect("spawn should succeed");
+
+        let error = service
+            .wait(WaitRequest {
+                handle: spawn.handle,
+                idle_ms: 200,
+                timeout_ms: 150,
+            })
+            .expect_err("wait should time out via capture fallback");
+
+        assert_eq!(error.code, ErrorCode::WaitTimeout);
+    }
+
+    #[test]
+    fn revalidate_all_retries_transient_selector_miss() {
+        let adapter = MockAdapter::single_capture("baseline");
+        let resolve_failures_remaining = adapter.resolve_failures_remaining.clone();
+        let root = std::env::temp_dir().join(format!("zellij-mcp-test-{}", uuid::Uuid::new_v4()));
+        let service = make_service_with_root(adapter, root.clone());
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        *resolve_failures_remaining
+            .lock()
+            .expect("resolve failures lock should succeed") = 1;
+
+        let service = make_service_with_root(MockAdapter::single_capture("baseline"), root);
+        service
+            .revalidate_all()
+            .expect("revalidate should recover after transient miss");
+
+        let bindings = service.registry_store.load().expect("bindings should load");
+        assert_eq!(bindings[0].handle, attach.handle);
+        assert_eq!(bindings[0].status, TerminalStatus::Ready);
     }
 
     #[test]
