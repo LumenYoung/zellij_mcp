@@ -19,6 +19,11 @@ Phase 1 implements:
 - `list` managed handles
 - lightweight persistence for bindings and observation metadata
 
+Current implementation status:
+
+- live `attach`, `send`, `capture`, and managed `list` are implemented and verified against a real Zellij session
+- `spawn`, `wait`, and `close` remain planned phase-1 tools but are not implemented yet
+
 Phase 1 does not implement automatic pane scheduling, pane replacement, layout management, or external message bridges.
 
 ## System Layers
@@ -62,6 +67,8 @@ The adapter is the only layer allowed to spawn `zjctl` or parse its output. It p
 - capturing pane content
 - closing targets
 - listing visible targets
+
+Live verification showed one important runtime constraint: the `zrpc.wasm` plugin must be loaded in the target session and its first-run permission prompt must be approved before `zjctl` RPC calls will succeed.
 
 ### Persistence
 
@@ -107,6 +114,8 @@ Fields include:
 
 Returns the current content that can be captured from the pane. This is the most stable mode and the basis for the other capture modes.
 
+For full-screen TUIs, `full` is the only mode currently verified as reliable.
+
 ### delta
 
 Returns the textual difference between the latest full capture and the last successful capture for the same handle. This is snapshot-diff semantics rather than true scrollback cursor semantics.
@@ -120,6 +129,8 @@ Returns the best-effort textual difference between the latest full capture and t
 - `send` is called with `submit=true`
 
 This is a best-effort interaction boundary, not a true process stdout boundary.
+
+Live testing with `lazygit` showed that printable-key input sent through `zjctl pane send` can manipulate a TUI directly. That makes `send` useful beyond shell commands, but it also makes prefix-based `delta` and `current` extraction less trustworthy for redraw-heavy interfaces.
 
 ## Persistence and Recovery
 
@@ -163,6 +174,8 @@ The daemon returns stable domain errors rather than backend-specific command out
 - `PLUGIN_NOT_READY`
 - `PERSISTENCE_ERROR`
 
+`PLUGIN_NOT_READY` should cover cases where `zjctl` is installed but the target session has not yet approved or loaded the plugin.
+
 ## Validation Plan
 
 Phase 1 should validate these scenarios:
@@ -172,3 +185,8 @@ Phase 1 should validate these scenarios:
 3. attach to an existing pane and use `current` across multiple submit cycles
 4. restart the daemon and verify that handles are either restored or marked stale
 5. run two handles in parallel without cross-handle interference
+
+Verified so far:
+
+1. a fresh session can host the `zrpc` plugin after approval and pass `zjctl doctor`
+2. a `lazygit` pane can be attached, listed, captured, and controlled with printable-key input through the daemon

@@ -16,6 +16,12 @@ The following features are intentionally deferred to phase 2 or later.
 - wrapper scripts for long-running agents
 - process-aware completion hints beyond idle polling
 
+### Richer interactive input
+
+- explicit support for special keys such as escape, arrows, and function keys
+- a clearer tool contract for TUI-oriented input versus shell command submission
+- optional key-sequence encoding instead of plain text only
+
 ### Pane replacement and takeover
 
 - replace a running pane process with a new command
@@ -38,6 +44,7 @@ The following features are intentionally deferred to phase 2 or later.
 - scrollback-aware delta extraction
 - larger output windows with chunking and resume cursors
 - ANSI-aware normalization controls
+- TUI-aware diffing that handles redraw-heavy screens more gracefully than simple prefix subtraction
 
 ## Why These Are Deferred
 

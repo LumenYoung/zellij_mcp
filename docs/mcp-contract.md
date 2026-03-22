@@ -93,6 +93,8 @@ Input:
 Notes:
 
 - `submit=true` indicates the daemon should treat this as the start of a new interaction boundary for `current` capture mode
+- `submit=false` is suitable for raw printable input into an interactive TUI, for example sending `q` to quit `lazygit`
+- this is currently verified for printable character input, not for special keys such as arrows, escape, or function keys
 
 ### `zellij_wait`
 
@@ -205,6 +207,7 @@ Input:
 - all managed terminals can be listed and revalidated after restart
 - full capture is the primary source of truth
 - delta and current modes are derived from daemon snapshots
+- `send` can deliver printable text input to an attached interactive pane
 
 ## Phase 1 Limitations
 
@@ -212,3 +215,5 @@ Input:
 - delta mode is snapshot-based, not scrollback-cursor-based
 - attach to an existing pane may include pre-existing output in the first current capture
 - no phase 1 tool manages layout or pane scheduling
+- the backend plugin must be loaded in the target session and its permission prompt approved before RPC-backed operations can succeed
+- full-screen TUIs may redraw large portions of the screen, so `delta` and `current` may over-report changes compared with shell-style output
