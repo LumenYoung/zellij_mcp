@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::binding::TerminalBinding;
+use crate::domain::observation::CaptureResult;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpawnResponse {
@@ -29,4 +30,16 @@ pub struct WaitResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ListResponse {
     pub bindings: Vec<TerminalBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureResponse {
+    #[serde(flatten)]
+    pub capture: CaptureResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SendResponse {
+    pub handle: String,
+    pub accepted: bool,
 }
