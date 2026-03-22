@@ -117,6 +117,38 @@ where
             other => DomainError::new(code, other.to_string(), false),
         }
     }
+
+    fn inactive_binding_error(handle: &str) -> DomainError {
+        DomainError::new(
+            ErrorCode::TargetStale,
+            format!("handle `{handle}` is not active"),
+            false,
+        )
+    }
+
+    fn ensure_binding_active(binding: &TerminalBinding) -> Result<(), DomainError> {
+        match binding.status {
+            TerminalStatus::Closed | TerminalStatus::Stale => {
+                Err(Self::inactive_binding_error(&binding.handle))
+            }
+            TerminalStatus::Ready | TerminalStatus::Busy => Ok(()),
+        }
+    }
+
+    fn is_missing_target_error(error: &AdapterError) -> bool {
+        matches!(error, AdapterError::CommandFailed(message) if message.contains("no pane matched") || message.contains("no panes match selector"))
+    }
+
+    fn mark_binding_stale(&self, handle: &str) -> Result<(), DomainError> {
+        let mut bindings = self.read_bindings()?;
+        if let Some(binding) = bindings.iter_mut().find(|binding| binding.handle == handle) {
+            binding.status = TerminalStatus::Stale;
+            binding.updated_at = Utc::now();
+            self.write_bindings(&bindings)?;
+        }
+
+        Ok(())
+    }
 }
 
 impl<A> TerminalManager for TerminalService<A>
@@ -257,17 +289,20 @@ where
             })?;
 
         if binding.status == TerminalStatus::Stale || binding.status == TerminalStatus::Closed {
-            return Err(DomainError::new(
-                ErrorCode::TargetStale,
-                format!("handle `{}` is not active", request.handle),
-                false,
-            ));
+            return Err(Self::inactive_binding_error(&request.handle));
         }
 
         let snapshot = self
             .adapter
             .capture_full(&binding.session_name, &binding.selector)
-            .map_err(|error| self.map_adapter_error(error, ErrorCode::CaptureFailed))?;
+            .map_err(|error| {
+                if Self::is_missing_target_error(&error) {
+                    let _ = self.mark_binding_stale(&request.handle);
+                    Self::inactive_binding_error(&request.handle)
+                } else {
+                    self.map_adapter_error(error, ErrorCode::CaptureFailed)
+                }
+            })?;
 
         let mut observations = self.read_observations()?;
         let index = observations
@@ -336,6 +371,8 @@ where
                 )
             })?;
 
+        Self::ensure_binding_active(binding)?;
+
         self.adapter
             .send_input(
                 &binding.session_name,
@@ -343,7 +380,30 @@ where
                 &request.text,
                 request.submit,
             )
-            .map_err(|error| self.map_adapter_error(error, ErrorCode::SendFailed))?;
+            .map_err(|error| {
+                if Self::is_missing_target_error(&error) {
+                    let _ = self.mark_binding_stale(&request.handle);
+                    Self::inactive_binding_error(&request.handle)
+                } else {
+                    self.map_adapter_error(error, ErrorCode::SendFailed)
+                }
+            })?;
+
+        if request.submit {
+            let mut observations = self.read_observations()?;
+            let observation = observations
+                .iter_mut()
+                .find(|item| item.handle == request.handle)
+                .ok_or_else(|| {
+                    DomainError::new(
+                        ErrorCode::HandleNotFound,
+                        format!("observation for `{}` is missing", request.handle),
+                        false,
+                    )
+                })?;
+            observation.reset_command_boundary();
+            self.write_observations(&observations)?;
+        }
 
         Ok(SendResponse {
             handle: request.handle,
@@ -368,6 +428,7 @@ where
 
         let session_name = binding.session_name.clone();
         let selector = binding.selector.clone();
+        Self::ensure_binding_active(binding)?;
         binding.status = TerminalStatus::Busy;
         self.write_bindings(&bindings)?;
 
@@ -379,18 +440,33 @@ where
                 request.idle_ms,
                 request.timeout_ms,
             )
-            .map_err(|error| self.map_adapter_error(error, ErrorCode::WaitFailed));
+            .map_err(|error| {
+                if Self::is_missing_target_error(&error) {
+                    let _ = self.mark_binding_stale(&request.handle);
+                    Self::inactive_binding_error(&request.handle)
+                } else {
+                    self.map_adapter_error(error, ErrorCode::WaitFailed)
+                }
+            });
 
         let observed_at = Utc::now();
-        let mut bindings = self.read_bindings()?;
-        if let Some(binding) = bindings
-            .iter_mut()
-            .find(|binding| binding.handle == request.handle)
-        {
-            binding.status = TerminalStatus::Ready;
-            binding.updated_at = observed_at;
+        if !matches!(
+            result,
+            Err(DomainError {
+                code: ErrorCode::TargetStale,
+                ..
+            })
+        ) {
+            let mut bindings = self.read_bindings()?;
+            if let Some(binding) = bindings
+                .iter_mut()
+                .find(|binding| binding.handle == request.handle)
+            {
+                binding.status = TerminalStatus::Ready;
+                binding.updated_at = observed_at;
+            }
+            self.write_bindings(&bindings)?;
         }
-        self.write_bindings(&bindings)?;
 
         result?;
 
@@ -418,10 +494,24 @@ where
 
         let session_name = bindings[index].session_name.clone();
         let selector = bindings[index].selector.clone();
+        if bindings[index].status == TerminalStatus::Closed {
+            return Ok(CloseResponse {
+                handle: request.handle,
+                closed: true,
+            });
+        }
+        Self::ensure_binding_active(&bindings[index])?;
 
         self.adapter
             .close(&session_name, &selector, request.force)
-            .map_err(|error| self.map_adapter_error(error, ErrorCode::CloseFailed))?;
+            .map_err(|error| {
+                if Self::is_missing_target_error(&error) {
+                    let _ = self.mark_binding_stale(&request.handle);
+                    Self::inactive_binding_error(&request.handle)
+                } else {
+                    self.map_adapter_error(error, ErrorCode::CloseFailed)
+                }
+            })?;
 
         bindings[index].status = TerminalStatus::Closed;
         bindings[index].updated_at = Utc::now();
@@ -452,6 +542,9 @@ mod tests {
     struct MockAdapter {
         target: ResolvedTarget,
         captures: Vec<String>,
+        send_missing_target: bool,
+        wait_missing_target: bool,
+        capture_missing_target: bool,
     }
 
     impl MockAdapter {
@@ -465,6 +558,9 @@ mod tests {
                     title: Some("editor".to_string()),
                 },
                 captures: vec![content.to_string()],
+                send_missing_target: false,
+                wait_missing_target: false,
+                capture_missing_target: false,
             }
         }
     }
@@ -492,6 +588,11 @@ mod tests {
             _text: &str,
             _submit: bool,
         ) -> Result<(), AdapterError> {
+            if self.send_missing_target {
+                return Err(AdapterError::CommandFailed(
+                    "RPC error: no panes match selector".to_string(),
+                ));
+            }
             Ok(())
         }
 
@@ -502,6 +603,11 @@ mod tests {
             _idle_ms: u64,
             _timeout_ms: u64,
         ) -> Result<(), AdapterError> {
+            if self.wait_missing_target {
+                return Err(AdapterError::CommandFailed(
+                    "RPC error: no panes match selector".to_string(),
+                ));
+            }
             Ok(())
         }
 
@@ -510,6 +616,11 @@ mod tests {
             _session_name: &str,
             _handle: &str,
         ) -> Result<CaptureSnapshot, AdapterError> {
+            if self.capture_missing_target {
+                return Err(AdapterError::CommandFailed(
+                    "RPC error: no panes match selector".to_string(),
+                ));
+            }
             let content = self
                 .captures
                 .last()
@@ -618,6 +729,49 @@ mod tests {
     }
 
     #[test]
+    fn send_submit_resets_command_boundary() {
+        let service = make_service(MockAdapter::single_capture("baseline"));
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        {
+            let mut observations = service
+                .observation_store
+                .load()
+                .expect("observations should load");
+            observations[0].last_full_content = Some("after-send".to_string());
+            observations[0].last_full_hash = Some("hash123".to_string());
+            service
+                .observation_store
+                .save(&observations)
+                .expect("observations should save");
+        }
+
+        service
+            .send(SendRequest {
+                handle: attach.handle.clone(),
+                text: "run".to_string(),
+                submit: true,
+            })
+            .expect("send should succeed");
+
+        let observations = service
+            .observation_store
+            .load()
+            .expect("observations should load");
+        assert_eq!(
+            observations[0].command_boundary_content.as_deref(),
+            Some("after-send")
+        );
+    }
+
+    #[test]
     fn spawn_persists_spawned_binding() {
         let service = make_service(MockAdapter::single_capture("ready"));
 
@@ -685,5 +839,87 @@ mod tests {
         let bindings = service.registry_store.load().expect("bindings should load");
         assert_eq!(response.handle, attach.handle);
         assert_eq!(bindings[0].status, TerminalStatus::Closed);
+    }
+
+    #[test]
+    fn send_rejects_closed_handle() {
+        let service = make_service(MockAdapter::single_capture("baseline"));
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+        service
+            .close(CloseRequest {
+                handle: attach.handle.clone(),
+                force: true,
+            })
+            .expect("close should succeed");
+
+        let error = service
+            .send(SendRequest {
+                handle: attach.handle,
+                text: "run".to_string(),
+                submit: false,
+            })
+            .expect_err("send should reject closed handle");
+        assert_eq!(error.code, ErrorCode::TargetStale);
+    }
+
+    #[test]
+    fn send_marks_binding_stale_when_target_disappears() {
+        let mut adapter = MockAdapter::single_capture("baseline");
+        adapter.send_missing_target = true;
+        let service = make_service(adapter);
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        let error = service
+            .send(SendRequest {
+                handle: attach.handle.clone(),
+                text: "run".to_string(),
+                submit: false,
+            })
+            .expect_err("send should fail on missing target");
+        assert_eq!(error.code, ErrorCode::TargetStale);
+
+        let bindings = service.registry_store.load().expect("bindings should load");
+        assert_eq!(bindings[0].status, TerminalStatus::Stale);
+    }
+
+    #[test]
+    fn wait_marks_binding_stale_when_target_disappears() {
+        let mut adapter = MockAdapter::single_capture("baseline");
+        adapter.wait_missing_target = true;
+        let service = make_service(adapter);
+        let attach = service
+            .attach(AttachRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        let error = service
+            .wait(WaitRequest {
+                handle: attach.handle.clone(),
+                idle_ms: 1200,
+                timeout_ms: 30_000,
+            })
+            .expect_err("wait should fail on missing target");
+        assert_eq!(error.code, ErrorCode::TargetStale);
+
+        let bindings = service.registry_store.load().expect("bindings should load");
+        assert_eq!(bindings[0].status, TerminalStatus::Stale);
     }
 }
