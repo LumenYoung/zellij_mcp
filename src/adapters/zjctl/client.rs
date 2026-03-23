@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use std::collections::HashSet;
 use std::process::Command;
 use std::time::Duration;
 
@@ -99,10 +100,20 @@ impl ZjctlClient {
     }
 
     fn run_zellij_action(&self, session_name: &str, args: &[String]) -> Result<(), AdapterError> {
+        self.run_zellij_command(session_name, "action", args)
+            .map(|_| ())
+    }
+
+    fn run_zellij_command(
+        &self,
+        session_name: &str,
+        subcommand: &str,
+        args: &[String],
+    ) -> Result<Vec<u8>, AdapterError> {
         let output = Command::new("zellij")
             .arg("--session")
             .arg(session_name)
-            .arg("action")
+            .arg(subcommand)
             .args(args)
             .output()
             .map_err(|_| AdapterError::ZjctlUnavailable)?;
@@ -117,7 +128,7 @@ impl ZjctlClient {
             return Err(AdapterError::CommandFailed(message));
         }
 
-        Ok(())
+        Ok(output.stdout)
     }
 
     fn list_targets_for_session(
@@ -171,9 +182,33 @@ impl ZjctlAdapter for ZjctlClient {
 
     fn spawn(&self, _request: &SpawnRequest) -> Result<ResolvedTarget, AdapterError> {
         let prepared = prepare_spawn(_request)?;
+        let spawn_command = match &prepared.command {
+            ZjctlCommand::Spawn { command, .. } => command.clone(),
+            _ => unreachable!("prepared spawn must produce a spawn command"),
+        };
+        let command_summary = spawn_command.join(" ");
 
         if let Some(action_args) = prepared.action_args.as_ref() {
             self.run_zellij_action(&_request.session_name, action_args)?;
+        }
+
+        if matches!(_request.target, SpawnTarget::NewTab) {
+            let before = self.list_targets_for_session(Some(&_request.session_name))?;
+            let mut run_args = Vec::new();
+            if let Some(cwd) = &_request.cwd {
+                run_args.push("--cwd".to_string());
+                run_args.push(cwd.clone());
+            }
+            if let Some(title) = &_request.title {
+                run_args.push("--name".to_string());
+                run_args.push(title.clone());
+            }
+            run_args.push("--".to_string());
+            run_args.extend(spawn_command);
+            self.run_zellij_command(&_request.session_name, "run", &run_args)?;
+
+            let after = self.list_targets_for_session(Some(&_request.session_name))?;
+            return resolve_new_tab_target(_request, before, after, &command_summary);
         }
 
         let stdout = self.run_command(Some(&_request.session_name), prepared.command)?;
@@ -324,6 +359,77 @@ fn matches_selector(selector: &str, target: &ResolvedTarget) -> bool {
     false
 }
 
+fn is_terminal_target(target: &ResolvedTarget) -> bool {
+    target
+        .pane_id
+        .as_deref()
+        .is_some_and(|pane_id| pane_id.starts_with("terminal:"))
+}
+
+fn resolve_new_tab_target(
+    request: &SpawnRequest,
+    before: Vec<ResolvedTarget>,
+    after: Vec<ResolvedTarget>,
+    command_summary: &str,
+) -> Result<ResolvedTarget, AdapterError> {
+    let before_ids: HashSet<&str> = before
+        .iter()
+        .filter_map(|target| target.pane_id.as_deref())
+        .collect();
+    let mut candidates: Vec<ResolvedTarget> = after
+        .into_iter()
+        .filter(is_terminal_target)
+        .filter(|target| {
+            target
+                .pane_id
+                .as_deref()
+                .is_some_and(|pane_id| !before_ids.contains(pane_id))
+        })
+        .collect();
+
+    if let Some(tab_name) = request.tab_name.as_ref() {
+        candidates.retain(|target| target.tab_name.as_deref() == Some(tab_name.as_str()));
+    }
+
+    if let Some(title) = request.title.as_ref() {
+        let title_matches: Vec<_> = candidates
+            .iter()
+            .filter(|target| target.title.as_deref() == Some(title.as_str()))
+            .cloned()
+            .collect();
+        match title_matches.as_slice() {
+            [target] => return Ok(target.clone()),
+            [] => {}
+            _ => {
+                return Err(AdapterError::CommandFailed(format!(
+                    "spawned pane title `{title}` matched multiple panes"
+                )));
+            }
+        }
+    }
+
+    let command_matches: Vec<_> = candidates
+        .iter()
+        .filter(|target| target.command.as_deref() == Some(command_summary))
+        .cloned()
+        .collect();
+    match command_matches.as_slice() {
+        [target] => Ok(target.clone()),
+        [] => match candidates.as_slice() {
+            [target] => Ok(target.clone()),
+            [] => Err(AdapterError::CommandFailed(
+                "no spawned pane could be resolved after creating a new tab".to_string(),
+            )),
+            _ => Err(AdapterError::CommandFailed(
+                "new tab spawn matched multiple candidate panes".to_string(),
+            )),
+        },
+        _ => Err(AdapterError::CommandFailed(
+            "spawn command matched multiple candidate panes".to_string(),
+        )),
+    }
+}
+
 fn parse_command(command: &str) -> Result<Vec<String>, AdapterError> {
     shell_words::split(command)
         .map_err(|error| AdapterError::ParseError(format!("invalid spawn command: {error}")))
@@ -414,8 +520,8 @@ mod tests {
     use crate::domain::status::SpawnTarget;
 
     use super::{
-        PreparedSpawn, ResolvedTarget, format_seconds, matches_selector, parse_command,
-        prepare_spawn, resolve_spawn_command,
+        format_seconds, matches_selector, parse_command, prepare_spawn, resolve_new_tab_target,
+        resolve_spawn_command, PreparedSpawn, ResolvedTarget,
     };
 
     #[test]
@@ -521,11 +627,9 @@ mod tests {
 
         let error = resolve_spawn_command(&request).expect_err("mixed command forms should fail");
         assert!(matches!(error, AdapterError::ParseError(_)));
-        assert!(
-            error
-                .to_string()
-                .contains("either `command` or `argv`, not both")
-        );
+        assert!(error
+            .to_string()
+            .contains("either `command` or `argv`, not both"));
     }
 
     #[test]
@@ -561,11 +665,9 @@ mod tests {
 
         let error = resolve_spawn_command(&request).expect_err("empty argv should fail");
         assert!(matches!(error, AdapterError::ParseError(_)));
-        assert!(
-            error
-                .to_string()
-                .contains("must contain at least one element")
-        );
+        assert!(error
+            .to_string()
+            .contains("must contain at least one element"));
     }
 
     #[test]
@@ -656,5 +758,99 @@ mod tests {
     #[test]
     fn formats_wait_durations_as_seconds() {
         assert_eq!(format_seconds(1200), "1.2");
+    }
+
+    #[test]
+    fn resolve_new_tab_target_prefers_exact_title_match() {
+        let request = SpawnRequest {
+            session_name: "gpu".to_string(),
+            target: SpawnTarget::NewTab,
+            tab_name: Some("logs".to_string()),
+            cwd: None,
+            command: Some("bash -lc 'while true; do echo tick; sleep 0.2; done'".to_string()),
+            argv: None,
+            title: Some("repro-busy".to_string()),
+            wait_ready: true,
+        };
+        let before = vec![ResolvedTarget {
+            selector: "id:terminal:7".to_string(),
+            pane_id: Some("terminal:7".to_string()),
+            session_name: "gpu".to_string(),
+            tab_name: Some("editor".to_string()),
+            title: Some("shell".to_string()),
+            command: Some("fish".to_string()),
+            focused: false,
+        }];
+        let after = vec![
+            before[0].clone(),
+            ResolvedTarget {
+                selector: "id:terminal:10".to_string(),
+                pane_id: Some("terminal:10".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("logs".to_string()),
+                title: Some("shell".to_string()),
+                command: None,
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:terminal:11".to_string(),
+                pane_id: Some("terminal:11".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("logs".to_string()),
+                title: Some("repro-busy".to_string()),
+                command: Some("bash -lc while true; do echo tick; sleep 0.2; done".to_string()),
+                focused: true,
+            },
+        ];
+
+        let resolved = resolve_new_tab_target(
+            &request,
+            before,
+            after,
+            "bash -lc while true; do echo tick; sleep 0.2; done",
+        )
+        .expect("new tab target should resolve");
+
+        assert_eq!(resolved.pane_id.as_deref(), Some("terminal:11"));
+    }
+
+    #[test]
+    fn resolve_new_tab_target_falls_back_to_command_match_without_title() {
+        let request = SpawnRequest {
+            session_name: "gpu".to_string(),
+            target: SpawnTarget::NewTab,
+            tab_name: Some("logs".to_string()),
+            cwd: None,
+            command: Some("lazygit".to_string()),
+            argv: None,
+            title: None,
+            wait_ready: false,
+        };
+        let before = vec![];
+        let after = vec![
+            ResolvedTarget {
+                selector: "id:terminal:12".to_string(),
+                pane_id: Some("terminal:12".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("logs".to_string()),
+                title: Some("Pane #1".to_string()),
+                command: None,
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:terminal:13".to_string(),
+                pane_id: Some("terminal:13".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("logs".to_string()),
+                title: Some("Pane #2".to_string()),
+                command: Some("lazygit".to_string()),
+                focused: true,
+            },
+        ];
+
+        let resolved = resolve_new_tab_target(&request, before, after, "lazygit")
+            .expect("new tab target should resolve from command");
+
+        assert_eq!(resolved.pane_id.as_deref(), Some("terminal:13"));
     }
 }

@@ -256,7 +256,7 @@ where
         if let Some(pane_id) = binding.pane_id.as_deref() {
             requests.push(AttachRequest {
                 session_name: binding.session_name.clone(),
-                tab_name: binding.tab_name.clone(),
+                tab_name: None,
                 selector: format!("id:{pane_id}"),
                 alias: None,
             });
@@ -519,6 +519,78 @@ where
         self.refresh_binding_target(handle)
     }
 
+    fn persist_spawn_state(
+        &self,
+        binding: TerminalBinding,
+        observation: TerminalObservation,
+    ) -> Result<(), DomainError> {
+        let mut bindings = self.read_bindings()?;
+        bindings.retain(|item| item.handle != binding.handle);
+        bindings.push(binding);
+        self.write_bindings(&bindings)?;
+
+        let mut observations = self.read_observations()?;
+        observations.retain(|item| item.handle != observation.handle);
+        observations.push(observation);
+        self.write_observations(&observations)
+    }
+
+    fn remove_persisted_handle(&self, handle: &str) -> Result<(), DomainError> {
+        let mut bindings = self.read_bindings()?;
+        bindings.retain(|item| item.handle != handle);
+        self.write_bindings(&bindings)?;
+
+        let mut observations = self.read_observations()?;
+        observations.retain(|item| item.handle != handle);
+        self.write_observations(&observations)
+    }
+
+    fn update_spawn_status(
+        &self,
+        handle: &str,
+        status: TerminalStatus,
+        updated_at: chrono::DateTime<Utc>,
+    ) -> Result<TerminalBinding, DomainError> {
+        let mut bindings = self.read_bindings()?;
+        let binding = bindings
+            .iter_mut()
+            .find(|binding| binding.handle == handle)
+            .ok_or_else(|| {
+                DomainError::new(
+                    ErrorCode::HandleNotFound,
+                    format!("handle `{handle}` is not registered"),
+                    false,
+                )
+            })?;
+        binding.status = status;
+        binding.updated_at = updated_at;
+        let binding = binding.clone();
+        self.write_bindings(&bindings)?;
+        Ok(binding)
+    }
+
+    fn update_spawn_observation(
+        &self,
+        handle: &str,
+        snapshot: crate::adapters::zjctl::CaptureSnapshot,
+    ) -> Result<(), DomainError> {
+        let hash = Self::hash_content(&snapshot.content);
+        let mut observations = self.read_observations()?;
+        let observation = observations
+            .iter_mut()
+            .find(|item| item.handle == handle)
+            .ok_or_else(|| {
+                DomainError::new(
+                    ErrorCode::HandleNotFound,
+                    format!("observation for `{handle}` is missing"),
+                    false,
+                )
+            })?;
+        observation.update_full_snapshot(snapshot.content, hash, snapshot.captured_at);
+        observation.reset_command_boundary();
+        self.write_observations(&observations)
+    }
+
     pub fn revalidate_all(&self) -> Result<(), DomainError> {
         if !self.adapter.is_available() {
             return Ok(());
@@ -545,21 +617,9 @@ where
             .spawn(&request)
             .map_err(|error| self.map_adapter_error(error, ErrorCode::SpawnFailed))?;
 
-        if request.wait_ready {
-            self.adapter
-                .wait_idle(&resolved.session_name, &resolved.selector, 1200, 30_000)
-                .map_err(|error| self.map_adapter_error(error, ErrorCode::WaitFailed))?;
-        }
-
-        let snapshot = self
-            .adapter
-            .capture_full(&resolved.session_name, &resolved.selector)
-            .map_err(|error| self.map_adapter_error(error, ErrorCode::CaptureFailed))?;
-
         let handle = Self::next_handle();
-        let now = snapshot.captured_at;
-        let mut bindings = self.read_bindings()?;
-        bindings.push(TerminalBinding {
+        let now = Utc::now();
+        let binding = TerminalBinding {
             handle: handle.clone(),
             alias: request.title.clone(),
             session_name: resolved.session_name.clone(),
@@ -569,23 +629,83 @@ where
             cwd: request.cwd.clone(),
             launch_command: Self::launch_command_summary(&request),
             source: BindingSource::Spawned,
-            status: TerminalStatus::Ready,
+            status: TerminalStatus::Busy,
             created_at: now,
             updated_at: now,
-        });
-        self.write_bindings(&bindings)?;
-
-        let hash = Self::hash_content(&snapshot.content);
-        let mut observations = self.read_observations()?;
-        let mut observation = TerminalObservation {
+        };
+        let observation = TerminalObservation {
             handle: handle.clone(),
             ..TerminalObservation::default()
         };
-        observation.update_full_snapshot(snapshot.content, hash, now);
-        observation.reset_command_boundary();
-        observations.retain(|item| item.handle != handle);
-        observations.push(observation);
-        self.write_observations(&observations)?;
+        self.persist_spawn_state(binding.clone(), observation)?;
+
+        if request.wait_ready {
+            let wait_result = self.run_binding_operation_with_retry(
+                &handle,
+                &binding,
+                ErrorCode::WaitFailed,
+                |binding| {
+                    self.adapter
+                        .wait_idle(&binding.session_name, &binding.selector, 1200, 30_000)
+                },
+            );
+            let wait_result = match wait_result {
+                Err(DomainError {
+                    code: ErrorCode::TargetStale,
+                    ..
+                }) => self.wait_via_capture_polling(&handle, &binding, 1200, 30_000),
+                other => other,
+            };
+
+            if let Err(error) = wait_result {
+                if error.code == ErrorCode::WaitTimeout {
+                    return Ok(SpawnResponse {
+                        handle,
+                        session_name: resolved.session_name,
+                        tab_name: resolved.tab_name,
+                        selector: resolved.selector,
+                        status: "busy".to_string(),
+                    });
+                }
+                self.remove_persisted_handle(&handle)?;
+                return Err(error);
+            }
+        }
+
+        let capture_binding = match self.ensure_handle_revalidated(&handle) {
+            Ok(binding) => binding,
+            Err(error) => {
+                self.remove_persisted_handle(&handle)?;
+                return Err(error);
+            }
+        };
+        let snapshot = match self.run_binding_operation_with_retry(
+            &handle,
+            &capture_binding,
+            ErrorCode::CaptureFailed,
+            |binding| {
+                self.adapter
+                    .capture_full(&binding.session_name, &binding.selector)
+            },
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if error.code == ErrorCode::CaptureFailed {
+                    self.update_spawn_status(&handle, TerminalStatus::Busy, Utc::now())?;
+                    return Ok(SpawnResponse {
+                        handle,
+                        session_name: resolved.session_name,
+                        tab_name: resolved.tab_name,
+                        selector: resolved.selector,
+                        status: "busy".to_string(),
+                    });
+                }
+                self.remove_persisted_handle(&handle)?;
+                return Err(error);
+            }
+        };
+        self.update_spawn_observation(&handle, snapshot.clone())?;
+        self.update_spawn_status(&handle, TerminalStatus::Ready, snapshot.captured_at)?;
 
         Ok(SpawnResponse {
             handle,
@@ -1013,13 +1133,17 @@ mod tests {
         capture_index: Arc<Mutex<usize>>,
         sent_inputs: Arc<Mutex<Vec<(String, bool)>>>,
         resolve_failures_remaining: Arc<Mutex<usize>>,
+        resolve_fails: bool,
         send_failures_remaining: Arc<Mutex<usize>>,
         wait_failures_remaining: Arc<Mutex<usize>>,
         capture_failures_remaining: Arc<Mutex<usize>>,
         resolve_missing_target: bool,
         send_missing_target: bool,
         wait_missing_target: bool,
+        wait_times_out: bool,
+        wait_fails: bool,
         capture_missing_target: bool,
+        capture_fails: bool,
     }
 
     impl MockAdapter {
@@ -1047,13 +1171,17 @@ mod tests {
                 capture_index: Arc::new(Mutex::new(0)),
                 sent_inputs: Arc::new(Mutex::new(Vec::new())),
                 resolve_failures_remaining: Arc::new(Mutex::new(0)),
+                resolve_fails: false,
                 send_failures_remaining: Arc::new(Mutex::new(0)),
                 wait_failures_remaining: Arc::new(Mutex::new(0)),
                 capture_failures_remaining: Arc::new(Mutex::new(0)),
                 resolve_missing_target: false,
                 send_missing_target: false,
                 wait_missing_target: false,
+                wait_times_out: false,
+                wait_fails: false,
                 capture_missing_target: false,
+                capture_fails: false,
             }
         }
 
@@ -1097,6 +1225,12 @@ mod tests {
             if self.resolve_missing_target {
                 return Err(AdapterError::CommandFailed(
                     "RPC error: no panes match selector".to_string(),
+                ));
+            }
+
+            if self.resolve_fails {
+                return Err(AdapterError::CommandFailed(
+                    "resolve backend failed".to_string(),
                 ));
             }
 
@@ -1181,6 +1315,16 @@ mod tests {
                 ));
             }
 
+            if self.wait_times_out {
+                return Err(AdapterError::Timeout);
+            }
+
+            if self.wait_fails {
+                return Err(AdapterError::CommandFailed(
+                    "wait backend failed".to_string(),
+                ));
+            }
+
             let mut failures_remaining = self
                 .wait_failures_remaining
                 .lock()
@@ -1202,6 +1346,12 @@ mod tests {
             if self.capture_missing_target {
                 return Err(AdapterError::CommandFailed(
                     "RPC error: no panes match selector".to_string(),
+                ));
+            }
+
+            if self.capture_fails {
+                return Err(AdapterError::CommandFailed(
+                    "capture backend failed".to_string(),
                 ));
             }
 
@@ -1924,6 +2074,171 @@ mod tests {
     }
 
     #[test]
+    fn spawn_wait_ready_timeout_returns_busy_handle_and_persists_state() {
+        let mut adapter = MockAdapter::single_capture("ready");
+        adapter.wait_times_out = true;
+        let service = make_service(adapter);
+
+        let response = service
+            .spawn(SpawnRequest {
+                session_name: "gpu".to_string(),
+                target: SpawnTarget::NewTab,
+                tab_name: Some("editor".to_string()),
+                cwd: Some("/tmp".to_string()),
+                command: Some("lazygit".to_string()),
+                argv: None,
+                title: Some("lg".to_string()),
+                wait_ready: true,
+            })
+            .expect("spawn should return a busy handle after wait timeout");
+
+        let bindings = service.registry_store.load().expect("bindings should load");
+        let observations = service
+            .observation_store
+            .load()
+            .expect("observations should load");
+
+        assert_eq!(response.status, "busy");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].handle, response.handle);
+        assert_eq!(bindings[0].status, TerminalStatus::Busy);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].handle, response.handle);
+        assert_eq!(observations[0].last_full_content, None);
+    }
+
+    #[test]
+    fn spawn_capture_failure_returns_busy_handle_and_persists_state() {
+        let mut adapter = MockAdapter::single_capture("ready");
+        adapter.capture_fails = true;
+        let service = make_service(adapter);
+
+        let response = service
+            .spawn(SpawnRequest {
+                session_name: "gpu".to_string(),
+                target: SpawnTarget::ExistingTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: None,
+                wait_ready: false,
+            })
+            .expect("spawn should keep a recoverable busy handle after capture failure");
+
+        let bindings = service.registry_store.load().expect("bindings should load");
+        let observations = service
+            .observation_store
+            .load()
+            .expect("observations should load");
+
+        assert_eq!(response.status, "busy");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].handle, response.handle);
+        assert_eq!(bindings[0].status, TerminalStatus::Busy);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].handle, response.handle);
+        assert_eq!(observations[0].last_full_content, None);
+    }
+
+    #[test]
+    fn spawn_fatal_wait_error_cleans_up_persisted_state() {
+        let mut adapter = MockAdapter::single_capture("ready");
+        adapter.wait_fails = true;
+        let service = make_service(adapter);
+
+        let error = service
+            .spawn(SpawnRequest {
+                session_name: "gpu".to_string(),
+                target: SpawnTarget::NewTab,
+                tab_name: Some("editor".to_string()),
+                cwd: Some("/tmp".to_string()),
+                command: Some("lazygit".to_string()),
+                argv: None,
+                title: Some("lg".to_string()),
+                wait_ready: true,
+            })
+            .expect_err("spawn should fail on fatal wait error");
+
+        assert_eq!(error.code, ErrorCode::WaitFailed);
+        assert!(service
+            .registry_store
+            .load()
+            .expect("bindings should load")
+            .is_empty());
+        assert!(service
+            .observation_store
+            .load()
+            .expect("observations should load")
+            .is_empty());
+    }
+
+    #[test]
+    fn spawn_fatal_post_launch_target_loss_cleans_up_persisted_state() {
+        let mut adapter = MockAdapter::single_capture("ready");
+        adapter.resolve_missing_target = true;
+        adapter.capture_missing_target = true;
+        let service = make_service(adapter);
+
+        let error = service
+            .spawn(SpawnRequest {
+                session_name: "gpu".to_string(),
+                target: SpawnTarget::ExistingTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: None,
+                wait_ready: false,
+            })
+            .expect_err("spawn should fail on fatal post-launch target loss");
+
+        assert_eq!(error.code, ErrorCode::TargetStale);
+        assert!(service
+            .registry_store
+            .load()
+            .expect("bindings should load")
+            .is_empty());
+        assert!(service
+            .observation_store
+            .load()
+            .expect("observations should load")
+            .is_empty());
+    }
+
+    #[test]
+    fn spawn_fatal_revalidation_error_cleans_up_persisted_state() {
+        let mut adapter = MockAdapter::single_capture("ready");
+        adapter.resolve_fails = true;
+        let service = make_service(adapter);
+
+        let error = service
+            .spawn(SpawnRequest {
+                session_name: "gpu".to_string(),
+                target: SpawnTarget::ExistingTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: None,
+                wait_ready: false,
+            })
+            .expect_err("spawn should fail on fatal revalidation error");
+
+        assert_eq!(error.code, ErrorCode::TargetNotFound);
+        assert!(service
+            .registry_store
+            .load()
+            .expect("bindings should load")
+            .is_empty());
+        assert!(service
+            .observation_store
+            .load()
+            .expect("observations should load")
+            .is_empty());
+    }
+
+    #[test]
     fn spawn_revalidation_prefers_stored_pane_id_when_selector_is_legacy_raw_form() {
         let root = std::env::temp_dir().join(format!("zellij-mcp-test-{}", uuid::Uuid::new_v4()));
         let service = make_service_with_root(MockAdapter::single_capture("ready"), root.clone());
@@ -1956,6 +2271,43 @@ mod tests {
                 timeout_ms: 30_000,
             })
             .expect("wait should revalidate through pane id");
+
+        assert_eq!(response.status, "idle");
+    }
+
+    #[test]
+    fn spawn_revalidation_ignores_stale_tab_name_when_pane_id_exists() {
+        let root = std::env::temp_dir().join(format!("zellij-mcp-test-{}", uuid::Uuid::new_v4()));
+        let service = make_service_with_root(MockAdapter::single_capture("ready"), root.clone());
+
+        let spawned = service
+            .spawn(SpawnRequest {
+                session_name: "gpu".to_string(),
+                target: SpawnTarget::ExistingTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: None,
+                wait_ready: false,
+            })
+            .expect("spawn should succeed");
+
+        let mut bindings = service.registry_store.load().expect("bindings should load");
+        bindings[0].tab_name = Some("renamed-tab".to_string());
+        service
+            .registry_store
+            .save(&bindings)
+            .expect("bindings should save");
+
+        let follow_up = make_service_with_root(MockAdapter::single_capture("ready"), root);
+        let response = follow_up
+            .wait(WaitRequest {
+                handle: spawned.handle,
+                idle_ms: 1200,
+                timeout_ms: 30_000,
+            })
+            .expect("wait should revalidate through pane id without tab name");
 
         assert_eq!(response.status, "idle");
     }
