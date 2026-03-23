@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: zellij-mcp-ssh <ssh-alias> [options] [-- extra-daemon-args...]
+
+Launch the zellij_mcp daemon on a remote host over SSH while preserving MCP stdio.
+
+Options:
+  --remote-bin PATH         Remote zellij_mcp binary path (default: zellij_mcp)
+  --remote-zjctl-bin PATH   Remote zjctl binary path to export as ZJCTL_BIN
+  --remote-state-dir PATH   Remote state dir to export as ZELLIJ_MCP_STATE_DIR
+  --remote-env KEY=VALUE    Additional remote env assignment (repeatable)
+  --ssh-option ARG          Extra ssh argument token (repeatable)
+  -h, --help                Show this help text
+
+Notes:
+  - The SSH alias must already be configured and work non-interactively.
+  - The wrapper keeps stdout clean and execs ssh directly for MCP stdio.
+  - The SSH connection stays open for the lifetime of the MCP server process.
+EOF
+}
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 64
+}
+
+quote_posix_sh() {
+  local value=${1-}
+  value=${value//\'/\'"\'"\'}
+  printf "'%s'" "$value"
+}
+
+host=""
+remote_bin="zellij_mcp"
+remote_zjctl_bin=""
+remote_state_dir=""
+declare -a remote_envs=()
+declare -a ssh_options=()
+declare -a daemon_args=()
+
+while (($#)); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --remote-bin)
+      (($# >= 2)) || die "missing value for --remote-bin"
+      remote_bin=$2
+      shift 2
+      ;;
+    --remote-zjctl-bin)
+      (($# >= 2)) || die "missing value for --remote-zjctl-bin"
+      remote_zjctl_bin=$2
+      shift 2
+      ;;
+    --remote-state-dir)
+      (($# >= 2)) || die "missing value for --remote-state-dir"
+      remote_state_dir=$2
+      shift 2
+      ;;
+    --remote-env)
+      (($# >= 2)) || die "missing value for --remote-env"
+      [[ $2 == *=* ]] || die "--remote-env expects KEY=VALUE"
+      remote_envs+=("$2")
+      shift 2
+      ;;
+    --ssh-option)
+      (($# >= 2)) || die "missing value for --ssh-option"
+      ssh_options+=("$2")
+      shift 2
+      ;;
+    --)
+      shift
+      daemon_args=("$@")
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      if [[ -z $host ]]; then
+        host=$1
+        shift
+      else
+        die "unexpected positional argument: $1"
+      fi
+      ;;
+  esac
+done
+
+[[ -n $host ]] || die "missing required <ssh-alias>"
+
+declare -a env_assignments=()
+if [[ -n $remote_zjctl_bin ]]; then
+  env_assignments+=("ZJCTL_BIN=$remote_zjctl_bin")
+fi
+if [[ -n $remote_state_dir ]]; then
+  env_assignments+=("ZELLIJ_MCP_STATE_DIR=$remote_state_dir")
+fi
+env_assignments+=("${remote_envs[@]}")
+
+remote_command="exec env"
+for assignment in "${env_assignments[@]}"; do
+  remote_command+=" $(quote_posix_sh "$assignment")"
+done
+remote_command+=" $(quote_posix_sh "$remote_bin")"
+for arg in "${daemon_args[@]}"; do
+  remote_command+=" $(quote_posix_sh "$arg")"
+done
+
+exec ssh -T -oBatchMode=yes "${ssh_options[@]}" "$host" "$remote_command"

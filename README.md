@@ -77,6 +77,63 @@ Important consequence:
 - OpenCode starts it when the MCP tools are needed
 - `mcp2cli` is only for manual testing, not required for OpenCode agent use
 
+## Remote over SSH
+
+For a remote Zellij host, OpenCode can still use the same MCP daemon without a manually attached SSH shell.
+
+- use `scripts/zellij-mcp-ssh` as the local MCP launcher
+- the wrapper starts `zellij_mcp` remotely over `ssh <alias> ...` and preserves stdio end-to-end
+- OpenCode sees a normal stdio MCP server; the SSH connection only lives for the lifetime of that MCP process
+- `mcp2cli` is not required in the runtime path
+
+Phase-1 assumptions:
+
+- the remote host already has `zellij_mcp` available
+- the remote host already has `zjctl` available
+- SSH credentials and the alias are already configured
+- the remote Zellij session/plugin approval is already in place
+
+Example wrapper usage:
+
+```bash
+./scripts/zellij-mcp-ssh gpu \
+  --remote-bin /home/yang/bin/zellij_mcp \
+  --remote-zjctl-bin /home/yang/bin/zjctl \
+  --remote-state-dir /home/yang/.local/state/zellij-mcp-gpu
+```
+
+Representative OpenCode MCP shape:
+
+```json
+{
+  "mcp": {
+    "zellij-gpu": {
+      "type": "local",
+      "command": ["/home/yang/Documents/git/zellij-skill/scripts/zellij-mcp-ssh"],
+      "args": [
+        "gpu",
+        "--remote-bin",
+        "/home/yang/bin/zellij_mcp",
+        "--remote-zjctl-bin",
+        "/home/yang/bin/zjctl",
+        "--remote-state-dir",
+        "/home/yang/.local/state/zellij-mcp-gpu"
+      ]
+    }
+  }
+}
+```
+
+Path note:
+
+- prefer absolute remote paths or plain executable names that already resolve on the remote non-interactive `PATH`
+- do not rely on `~` expansion in wrapper arguments; the wrapper intentionally quotes remote tokens before handing them to SSH
+
+Important constraint:
+
+- this does not create a detached network daemon on the remote host; it launches the daemon on demand over SSH for the duration of the MCP session
+- if you later want the remote daemon to stay reachable without any SSH transport, that becomes a separate transport feature, not a wrapper-only change
+
 Configured runtime values:
 
 - `ZJCTL_BIN=/home/yang/Documents/git/zjctl/target/release/zjctl`
@@ -109,3 +166,4 @@ Notes:
 
 - `docs/architecture.md`
 - `docs/mcp-contract.md`
+- `docs/ssh-remote-design.md`

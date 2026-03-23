@@ -2,7 +2,7 @@
 
 ## Goal
 
-Build a Rust MCP daemon that exposes a small, stable Zellij control surface to agents through `mcp2cli`.
+Build a Rust MCP daemon that exposes a small, stable Zellij control surface to agents over MCP stdio.
 
 The daemon owns agent-facing handles, persistence, and capture semantics. It does not expose raw `zellij action` primitives. The daemon delegates terminal targeting and low-level interaction to `zjctl`.
 
@@ -37,7 +37,7 @@ Phase 1 does not implement automatic pane scheduling, pane replacement, layout m
 
 ```text
 agent
-  -> mcp2cli
+  -> local launcher or client
     -> zellij MCP daemon
       -> tool handlers
         -> domain services
@@ -50,6 +50,8 @@ agent
 The transport layer registers tools and translates daemon-native request and response types to an MCP-compatible shape.
 
 The current implementation now serves a real MCP stdio endpoint through `rmcp`, which is the path expected by local `mcp2cli`. The transport remains thin: each exposed MCP tool forwards into the existing synchronous `McpServer::execute_tool(...)` seam, and tool results are returned as JSON text payloads so `mcp2cli` can print them directly.
+
+That same stdio transport also supports a remote-over-SSH launch model. In that setup, a local wrapper starts `ssh <alias> ... zellij_mcp`, and SSH carries the daemon's stdin/stdout back to the local MCP client. The daemon process still runs on the same machine as the target Zellij session, which keeps the adapter and tool semantics unchanged.
 
 ### Tool handlers
 
@@ -88,6 +90,8 @@ For `target="existing_tab"`, the adapter still uses the normal `zjctl` spawn pat
 
 Live verification showed one important runtime constraint: the `zrpc.wasm` plugin must be loaded in the target session and its first-run permission prompt must be approved before `zjctl` RPC calls will succeed.
 
+For SSH-backed deployment, the important boundary is still the same: the daemon must run on the same host as the Zellij session it manages. Phase 1 therefore uses a launcher wrapper rather than an SSH-aware adapter implementation. OpenCode starts the wrapper locally, the wrapper execs `ssh`, and the remote host runs the existing stdio daemon with host-local `zjctl` and state paths.
+
 ### Persistence
 
 Persistence stores lightweight daemon state in JSON files under a local state directory. The daemon persists bindings and capture metadata, then revalidates them against live Zellij state on startup.
@@ -101,6 +105,12 @@ Spawn lifecycle detail:
 5. upgrade the binding to `ready` once revalidation and capture succeed
 
 If the pane is real but bounded idle detection or baseline capture does not settle cleanly, the daemon returns the handle as `busy` so later `wait`, `capture`, `list`, or `close` can continue from that state. Fatal post-launch errors clean up the provisional state instead of leaving a lost handle behind.
+
+Remote launcher note:
+
+- phase 1 remote support does not change daemon persistence semantics; it only changes how the daemon process is started
+- the remote host should use its own `ZELLIJ_MCP_STATE_DIR`, ideally scoped per host or environment
+- a truly detached remote daemon reachable without SSH would require a new transport and supervisor story, which is intentionally out of scope for this wrapper-based step
 
 ## Primary Objects
 
@@ -238,3 +248,4 @@ Verified so far:
 8. attach already supports taking over an existing pane by selector and converting it into a managed daemon handle
 9. `zellij_discover` has been verified live in a non-`gpu` session and returns command, focus state, and bounded preview text for candidate panes
 10. timeout-prone `new_tab` spawn now returns a usable busy handle instead of hanging externally, and the resulting handle can be revalidated, captured, and closed in a later step
+11. the daemon can also be launched remotely over SSH stdio through a local wrapper without changing the MCP tool contract

@@ -13,6 +13,8 @@
 - `mcp2cli --mcp-stdio "cargo run --quiet --manifest-path /path/to/Cargo.toml" --list` is a convenient local smoke/debug path; OpenCode on this machine uses the daemon directly as a local MCP server
 - each MCP tool returns its structured result serialized as JSON text content, which keeps the transport layer thin while remaining readable to `mcp2cli`
 - MCP error responses preserve daemon error details in their `data` payload with stable fields: `code`, `message`, and `retryable`
+- remote-over-SSH launch keeps the exact same MCP contract: a local wrapper can run `ssh <alias> ... zellij_mcp`, and SSH simply carries the daemon's stdio stream back to the MCP client
+- this phase-1 remote model does not require `mcp2cli` in the runtime path and does not change any tool request or response schema
 
 ## Tools
 
