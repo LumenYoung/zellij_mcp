@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: zellij-mcp-bootstrap-ssh <ssh-alias> [options]
 
-Bootstrap a remote host for wrapper-based zellij_mcp usage entirely in user space.
+Bootstrap a remote host for SSH-backed Zellij control entirely in user space.
 
 Options:
   --remote-home PATH         Remote home directory (default: query over ssh)
@@ -25,6 +25,7 @@ What it does:
   - installs binaries into remote ~/.local/bin
   - optionally installs zrpc.wasm and starts a detached tmux helper client
   - runs zjctl doctor against the target session at the end
+  - prepares the host for the current single-MCP daemon flow or helper-script fallback usage
 EOF
 }
 

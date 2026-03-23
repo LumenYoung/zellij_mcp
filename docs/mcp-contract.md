@@ -13,8 +13,8 @@
 - `mcp2cli --mcp-stdio "cargo run --quiet --manifest-path /path/to/Cargo.toml" --list` is a convenient local smoke/debug path; OpenCode on this machine uses the daemon directly as a local MCP server
 - each MCP tool returns its structured result serialized as JSON text content, which keeps the transport layer thin while remaining readable to `mcp2cli`
 - MCP error responses preserve daemon error details in their `data` payload with stable fields: `code`, `message`, and `retryable`
-- remote-over-SSH launch keeps the exact same MCP contract: a local wrapper can run `ssh <alias> ... zellij_mcp`, and SSH simply carries the daemon's stdio stream back to the MCP client
-- this phase-1 remote model does not require `mcp2cli` in the runtime path and does not change any tool request or response schema
+- remote-over-SSH keeps the exact same MCP contract through one local daemon: selection tools may include an optional `target` alias, and the daemon executes the matching backend over SSH
+- this phase-1 remote model does not require `mcp2cli` in the runtime path; only backend selection changes for the relevant tools
 
 ## Tools
 
@@ -26,8 +26,9 @@ Input:
 
 ```json
 {
+  "target": "a100",
   "session_name": "gpu",
-  "target": "new_tab",
+  "spawn_target": "new_tab",
   "tab_name": "editor",
   "cwd": "/home/yang/Documents/git/project",
   "command": "nvim",
@@ -41,8 +42,9 @@ Explicit argv form:
 
 ```json
 {
+  "target": "a100",
   "session_name": "gpu",
-  "target": "existing_tab",
+  "spawn_target": "existing_tab",
   "tab_name": "editor",
   "cwd": "/home/yang/Documents/git/project",
   "argv": ["bash", "-lc", "printf 'hello from argv\\n'"],
@@ -53,7 +55,8 @@ Explicit argv form:
 
 Notes:
 
-- `target` supports `new_tab` and `existing_tab`
+- `target` is optional backend selection; omit it for local, set it to a configured SSH alias such as `a100`, or use the canonical form `ssh:a100`
+- `spawn_target` supports `new_tab` and `existing_tab`
 - `existing_tab` means spawn a new dedicated pane inside the tab
 - phase 1 does not replace existing processes in an existing pane
 - use either `command` or `argv`, not both
@@ -62,7 +65,7 @@ Notes:
 - malformed shell quoting in `command`, blank `command`, empty `argv`, blank `argv[0]`, or mixed `command` + `argv` input fails early as an argument parse error instead of spawning a mangled command
 - `wait_ready=true` runs the same rendered-screen idle check as `zellij_wait`; it works for shell-like startup and was live-tested with `lazygit`, but redraw-heavy TUIs may still make it a noisy readiness proxy
 - when that bounded idle check times out after the pane is already real, `zellij_spawn` returns the new handle with `status="busy"` instead of failing the whole launch
-- `target="new_tab"` now creates the tab, launches the command with `zellij run`, then resolves the spawned pane from post-launch session state; this avoids the earlier fresh-tab RPC handoff stall where the pane could exist before the request returned
+- `spawn_target="new_tab"` now creates the tab, launches the command with `zellij run`, then resolves the spawned pane from post-launch session state; this avoids the earlier fresh-tab RPC handoff stall where the pane could exist before the request returned
 - fatal post-launch errors that happen after early persistence now clean up the provisional binding instead of leaving an orphaned busy handle behind
 
 Response:
@@ -70,6 +73,7 @@ Response:
 ```json
 {
   "handle": "zh_...",
+  "target_id": "ssh:a100",
   "session_name": "gpu",
   "tab_name": "editor",
   "selector": "id:terminal:7",
@@ -82,6 +86,7 @@ Degraded but successful response:
 ```json
 {
   "handle": "zh_...",
+  "target_id": "ssh:a100",
   "session_name": "gpu",
   "tab_name": "editor",
   "selector": "id:terminal:7",
@@ -99,6 +104,7 @@ Input:
 
 ```json
 {
+  "target": "a100",
   "session_name": "gpu",
   "tab_name": "editor",
   "selector": "title:main-editor",
@@ -109,6 +115,8 @@ Input:
 Notes:
 
 - the selector must resolve to exactly one target
+- `target` is optional backend selection; omit it for local, or set it to a configured SSH alias
+- responses return canonical `target_id` values such as `local` or `ssh:a100`; callers may keep using alias form on later selection requests, and the router also accepts canonical `ssh:<alias>` input
 - attach establishes a baseline observation immediately
 - attached panes are considered interactive and may already contain user state
 - after attach returns, the pane behaves like any other managed handle: the agent can `send`, `wait`, `capture`, `close`, and `list` against it
@@ -123,6 +131,7 @@ Input:
 
 ```json
 {
+  "target": "a100",
   "session_name": "zellij-lazygit-demo",
   "tab_name": "Tab 4",
   "selector": "id:terminal:7",
@@ -134,6 +143,7 @@ Input:
 Notes:
 
 - `zellij_discover` is read-only and does not create handles or persistence state
+- `target` is optional backend selection; omit it for local, set it to a configured SSH alias, or use the canonical form `ssh:a100`
 - `tab_name` and `selector` are optional narrowing filters
 - `include_preview=false` returns metadata only
 - `preview_lines` must be greater than zero when provided
@@ -148,6 +158,7 @@ Response:
 {
   "candidates": [
     {
+      "target_id": "ssh:a100",
       "selector": "id:terminal:7",
       "pane_id": "terminal:7",
       "session_name": "zellij-lazygit-demo",
@@ -289,6 +300,7 @@ Input:
 
 ```json
 {
+  "target": "a100",
   "session_name": "gpu"
 }
 ```
@@ -324,7 +336,7 @@ Input:
 - `spawn` preserves quoted command arguments using shell-aware parsing
 - `spawn` also supports explicit `argv` input without shell parsing
 - `spawn(wait_ready=true)` can degrade to `status="busy"` while still returning a usable handle when the launch succeeded but idle detection did not settle in time
-- `spawn(target="new_tab")` avoids the earlier fresh-tab RPC stall by resolving the pane after `zellij run` from live session state
+- `spawn(spawn_target="new_tab")` avoids the earlier fresh-tab RPC stall by resolving the pane after `zellij run` from live session state
 - `attach` can convert an existing live pane into a managed daemon handle for takeover-style agent workflows
 - `discover` can inspect unmanaged panes before attach and returns attach-ready selectors with bounded preview text
 - `capture` can clip returned output with `tail_lines` while keeping `full` / `delta` / `current` semantics stable

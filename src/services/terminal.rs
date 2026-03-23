@@ -32,6 +32,7 @@ pub trait TerminalManager: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct TerminalService<A> {
+    target_id: String,
     adapter: A,
     registry_store: RegistryStore,
     observation_store: ObservationStore,
@@ -39,11 +40,13 @@ pub struct TerminalService<A> {
 
 impl<A> TerminalService<A> {
     pub fn new(
+        target_id: impl Into<String>,
         adapter: A,
         registry_store: RegistryStore,
         observation_store: ObservationStore,
     ) -> Self {
         Self {
+            target_id: target_id.into(),
             adapter,
             registry_store,
             observation_store,
@@ -57,6 +60,10 @@ where
 {
     fn next_handle() -> String {
         format!("zh_{}", uuid::Uuid::new_v4().simple())
+    }
+
+    fn binding_belongs_to_target(&self, binding: &TerminalBinding) -> bool {
+        binding.target_id == self.target_id
     }
 
     fn read_bindings(&self) -> Result<Vec<TerminalBinding>, DomainError> {
@@ -255,6 +262,7 @@ where
 
         if let Some(pane_id) = binding.pane_id.as_deref() {
             requests.push(AttachRequest {
+                target: None,
                 session_name: binding.session_name.clone(),
                 tab_name: None,
                 selector: format!("id:{pane_id}"),
@@ -267,6 +275,7 @@ where
             .all(|request| request.selector != binding.selector)
         {
             requests.push(AttachRequest {
+                target: None,
                 session_name: binding.session_name.clone(),
                 tab_name: binding.tab_name.clone(),
                 selector: binding.selector.clone(),
@@ -598,6 +607,9 @@ where
 
         let bindings = self.read_bindings()?;
         for binding in bindings {
+            if !self.binding_belongs_to_target(&binding) {
+                continue;
+            }
             let _ = self.refresh_binding_target(&binding.handle)?;
         }
 
@@ -621,6 +633,7 @@ where
         let now = Utc::now();
         let binding = TerminalBinding {
             handle: handle.clone(),
+            target_id: self.target_id.clone(),
             alias: request.title.clone(),
             session_name: resolved.session_name.clone(),
             tab_name: resolved.tab_name.clone(),
@@ -661,6 +674,7 @@ where
                 if error.code == ErrorCode::WaitTimeout {
                     return Ok(SpawnResponse {
                         handle,
+                        target_id: self.target_id.clone(),
                         session_name: resolved.session_name,
                         tab_name: resolved.tab_name,
                         selector: resolved.selector,
@@ -694,6 +708,7 @@ where
                     self.update_spawn_status(&handle, TerminalStatus::Busy, Utc::now())?;
                     return Ok(SpawnResponse {
                         handle,
+                        target_id: self.target_id.clone(),
                         session_name: resolved.session_name,
                         tab_name: resolved.tab_name,
                         selector: resolved.selector,
@@ -709,6 +724,7 @@ where
 
         Ok(SpawnResponse {
             handle,
+            target_id: self.target_id.clone(),
             session_name: resolved.session_name,
             tab_name: resolved.tab_name,
             selector: resolved.selector,
@@ -733,6 +749,7 @@ where
         let mut bindings = self.read_bindings()?;
         bindings.push(TerminalBinding {
             handle: handle.clone(),
+            target_id: self.target_id.clone(),
             alias: request.alias,
             session_name: resolved.session_name,
             tab_name: resolved.tab_name,
@@ -761,6 +778,7 @@ where
 
         Ok(AttachResponse {
             handle,
+            target_id: self.target_id.clone(),
             attached: true,
             baseline_established: true,
         })
@@ -804,6 +822,7 @@ where
             };
 
             candidates.push(DiscoverCandidate {
+                target_id: self.target_id.clone(),
                 selector: target.selector,
                 pane_id: target.pane_id,
                 session_name: target.session_name,
@@ -823,6 +842,7 @@ where
     fn list(&self, request: ListRequest) -> Result<ListResponse, DomainError> {
         self.revalidate_all()?;
         let mut bindings = self.read_bindings()?;
+        bindings.retain(|binding| self.binding_belongs_to_target(binding));
         if let Some(session_name) = request.session_name {
             bindings.retain(|binding| binding.session_name == session_name);
         }
@@ -1414,6 +1434,7 @@ mod tests {
         root: std::path::PathBuf,
     ) -> TerminalService<MockAdapter> {
         TerminalService::new(
+            "local",
             adapter,
             RegistryStore::new(root.join("registry.json")),
             ObservationStore::new(root.join("observations.json")),
@@ -1449,6 +1470,7 @@ mod tests {
 
         let response = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -1476,6 +1498,7 @@ mod tests {
         let service = make_service(MockAdapter::single_capture("baseline"));
         let _ = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -1485,6 +1508,7 @@ mod tests {
 
         let listed = service
             .list(ListRequest {
+                target: None,
                 session_name: Some("gpu".to_string()),
             })
             .expect("list should succeed");
@@ -1510,6 +1534,7 @@ mod tests {
 
         let response = service
             .discover(DiscoverRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: None,
@@ -1548,6 +1573,7 @@ mod tests {
 
         let response = service
             .discover(DiscoverRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("btop".to_string()),
                 selector: None,
@@ -1585,6 +1611,7 @@ mod tests {
 
         let response = service
             .discover(DiscoverRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: None,
                 selector: None,
@@ -1630,6 +1657,7 @@ mod tests {
 
         let response = service
             .discover(DiscoverRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: None,
@@ -1689,6 +1717,7 @@ mod tests {
 
         let response = service
             .discover(DiscoverRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: None,
@@ -1714,6 +1743,7 @@ mod tests {
         ]));
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -1740,6 +1770,7 @@ mod tests {
         ]));
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -1766,6 +1797,7 @@ mod tests {
         ]));
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -1794,6 +1826,7 @@ mod tests {
         ]));
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -1818,6 +1851,7 @@ mod tests {
         let service = make_service(MockAdapter::single_capture("ready\n"));
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -1867,6 +1901,7 @@ mod tests {
         ]));
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -1893,6 +1928,7 @@ mod tests {
         ]));
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -1943,6 +1979,7 @@ mod tests {
         let service = make_service(MockAdapter::single_capture("baseline"));
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -1969,6 +2006,7 @@ mod tests {
         let service = make_service(adapter);
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -1995,6 +2033,7 @@ mod tests {
         let service = make_service(MockAdapter::single_capture("baseline"));
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -2019,8 +2058,9 @@ mod tests {
         let service = make_service(MockAdapter::single_capture("baseline"));
         let spawn = service
             .spawn(SpawnRequest {
+                target: None,
                 session_name: "gpu".to_string(),
-                target: SpawnTarget::ExistingTab,
+                spawn_target: SpawnTarget::ExistingTab,
                 tab_name: Some("editor".to_string()),
                 cwd: None,
                 command: Some("fish".to_string()),
@@ -2069,6 +2109,7 @@ mod tests {
         let service = make_service(adapter);
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -2107,8 +2148,9 @@ mod tests {
         let service = make_service(adapter);
         let spawn = service
             .spawn(SpawnRequest {
+                target: None,
                 session_name: "gpu".to_string(),
-                target: SpawnTarget::ExistingTab,
+                spawn_target: SpawnTarget::ExistingTab,
                 tab_name: Some("editor".to_string()),
                 cwd: None,
                 command: Some("fish".to_string()),
@@ -2140,6 +2182,7 @@ mod tests {
         let service = make_service(adapter);
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -2168,8 +2211,9 @@ mod tests {
 
         let response = service
             .spawn(SpawnRequest {
+                target: None,
                 session_name: "gpu".to_string(),
-                target: SpawnTarget::ExistingTab,
+                spawn_target: SpawnTarget::ExistingTab,
                 tab_name: Some("editor".to_string()),
                 cwd: Some("/tmp".to_string()),
                 command: Some("lazygit".to_string()),
@@ -2194,8 +2238,9 @@ mod tests {
 
         let response = service
             .spawn(SpawnRequest {
+                target: None,
                 session_name: "gpu".to_string(),
-                target: SpawnTarget::NewTab,
+                spawn_target: SpawnTarget::NewTab,
                 tab_name: Some("editor".to_string()),
                 cwd: Some("/tmp".to_string()),
                 command: Some("lazygit".to_string()),
@@ -2228,8 +2273,9 @@ mod tests {
 
         let response = service
             .spawn(SpawnRequest {
+                target: None,
                 session_name: "gpu".to_string(),
-                target: SpawnTarget::ExistingTab,
+                spawn_target: SpawnTarget::ExistingTab,
                 tab_name: Some("editor".to_string()),
                 cwd: None,
                 command: Some("fish".to_string()),
@@ -2262,8 +2308,9 @@ mod tests {
 
         let error = service
             .spawn(SpawnRequest {
+                target: None,
                 session_name: "gpu".to_string(),
-                target: SpawnTarget::NewTab,
+                spawn_target: SpawnTarget::NewTab,
                 tab_name: Some("editor".to_string()),
                 cwd: Some("/tmp".to_string()),
                 command: Some("lazygit".to_string()),
@@ -2295,8 +2342,9 @@ mod tests {
 
         let error = service
             .spawn(SpawnRequest {
+                target: None,
                 session_name: "gpu".to_string(),
-                target: SpawnTarget::ExistingTab,
+                spawn_target: SpawnTarget::ExistingTab,
                 tab_name: Some("editor".to_string()),
                 cwd: None,
                 command: Some("fish".to_string()),
@@ -2327,8 +2375,9 @@ mod tests {
 
         let error = service
             .spawn(SpawnRequest {
+                target: None,
                 session_name: "gpu".to_string(),
-                target: SpawnTarget::ExistingTab,
+                spawn_target: SpawnTarget::ExistingTab,
                 tab_name: Some("editor".to_string()),
                 cwd: None,
                 command: Some("fish".to_string()),
@@ -2358,8 +2407,9 @@ mod tests {
 
         let spawned = service
             .spawn(SpawnRequest {
+                target: None,
                 session_name: "gpu".to_string(),
-                target: SpawnTarget::ExistingTab,
+                spawn_target: SpawnTarget::ExistingTab,
                 tab_name: Some("editor".to_string()),
                 cwd: None,
                 command: Some("fish".to_string()),
@@ -2395,8 +2445,9 @@ mod tests {
 
         let spawned = service
             .spawn(SpawnRequest {
+                target: None,
                 session_name: "gpu".to_string(),
-                target: SpawnTarget::ExistingTab,
+                spawn_target: SpawnTarget::ExistingTab,
                 tab_name: Some("editor".to_string()),
                 cwd: None,
                 command: Some("fish".to_string()),
@@ -2430,6 +2481,7 @@ mod tests {
         let service = make_service(MockAdapter::single_capture("baseline"));
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -2453,6 +2505,7 @@ mod tests {
         let service = make_service(MockAdapter::single_capture("baseline"));
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -2477,6 +2530,7 @@ mod tests {
         let service = make_service(MockAdapter::single_capture("baseline"));
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -2508,6 +2562,7 @@ mod tests {
         let service = make_service(adapter);
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -2540,8 +2595,9 @@ mod tests {
         let service = make_service(adapter);
         let spawn = service
             .spawn(SpawnRequest {
+                target: None,
                 session_name: "gpu".to_string(),
-                target: SpawnTarget::ExistingTab,
+                spawn_target: SpawnTarget::ExistingTab,
                 tab_name: Some("editor".to_string()),
                 cwd: None,
                 command: Some("fish".to_string()),
@@ -2574,6 +2630,7 @@ mod tests {
         let service = make_service(adapter);
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -2605,8 +2662,9 @@ mod tests {
         let service = make_service(adapter);
         let spawn = service
             .spawn(SpawnRequest {
+                target: None,
                 session_name: "gpu".to_string(),
-                target: SpawnTarget::ExistingTab,
+                spawn_target: SpawnTarget::ExistingTab,
                 tab_name: Some("editor".to_string()),
                 cwd: None,
                 command: Some("fish".to_string()),
@@ -2634,8 +2692,9 @@ mod tests {
         let service = make_service(adapter);
         let spawn = service
             .spawn(SpawnRequest {
+                target: None,
                 session_name: "gpu".to_string(),
-                target: SpawnTarget::ExistingTab,
+                spawn_target: SpawnTarget::ExistingTab,
                 tab_name: Some("editor".to_string()),
                 cwd: None,
                 command: Some("fish".to_string()),
@@ -2664,6 +2723,7 @@ mod tests {
         let service = make_service_with_root(adapter, root.clone());
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -2691,6 +2751,7 @@ mod tests {
         let service = make_service_with_root(MockAdapter::single_capture("baseline"), root.clone());
         let attach = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -2714,6 +2775,7 @@ mod tests {
         let service = make_service_with_root(MockAdapter::single_capture("baseline"), root.clone());
         let _ = service
             .attach(AttachRequest {
+                target: None,
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -2726,6 +2788,7 @@ mod tests {
         let service = make_service_with_root(missing_adapter, root);
         let listed = service
             .list(ListRequest {
+                target: None,
                 session_name: Some("gpu".to_string()),
             })
             .expect("list should succeed");

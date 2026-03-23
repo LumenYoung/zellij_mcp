@@ -79,17 +79,26 @@ Important consequence:
 
 ## Remote over SSH
 
-For a remote Zellij host, OpenCode can still use the same MCP daemon without a manually attached SSH shell.
+The current model keeps a single local MCP daemon and lets selection tools opt into a remote target.
 
-- use `scripts/zellij-mcp-ssh` as the local MCP launcher
-- the wrapper starts `zellij_mcp` remotely over `ssh <alias> ...` and preserves stdio end-to-end
-- OpenCode sees a normal stdio MCP server; the SSH connection only lives for the lifetime of that MCP process
-- `mcp2cli` is not required in the runtime path
+- omit `target` to use the local backend
+- set `target` on `zellij_spawn`, `zellij_attach`, `zellij_discover`, or `zellij_list` to select a configured SSH target alias
+- follow-up tools such as `zellij_send`, `zellij_wait`, `zellij_capture`, and `zellij_close` do not need `target`; the daemon routes them by the persisted handle binding
+- remote `zjctl` and `zellij` commands are executed over SSH by the local daemon
+
+Runtime configuration is daemon-side through `ZELLIJ_MCP_TARGETS`.
+
+Example:
+
+```bash
+ZELLIJ_MCP_TARGETS='{"a100":{"host":"a100","remote_zjctl_bin":"/home/yang/bin/zjctl","remote_zellij_bin":"zellij","remote_env":{"ZELLIJ_SESSION_NAME":"a100"},"ssh_options":[]}}' \
+./target/release/zellij_mcp
+```
 
 Phase-1 assumptions:
 
-- the remote host already has `zellij_mcp` available
 - the remote host already has `zjctl` available
+- the remote host already has `zellij` available
 - SSH credentials and the alias are already configured
 - the remote Zellij session/plugin approval is already in place
 
@@ -104,48 +113,22 @@ Bootstrap helper:
 ./scripts/zellij-mcp-bootstrap-ssh a100 --session a100
 ```
 
-The bootstrap helper stays entirely in user space. It installs Rust if needed, syncs this repo, clones or updates `zjctl`, builds both binaries natively on the remote host, installs the plugin, starts a detached helper client, and finishes by running `zjctl doctor`.
+The bootstrap helper stays entirely in user space. It installs Rust if needed, syncs this repo, clones or updates `zjctl`, builds the required binaries natively on the remote host, installs the plugin, starts a detached helper client, and finishes by running `zjctl doctor`.
 
-Example wrapper usage:
+Operational helper note:
 
-```bash
-./scripts/zellij-mcp-ssh gpu \
-  --remote-bin /home/yang/bin/zellij_mcp \
-  --remote-zjctl-bin /home/yang/bin/zjctl \
-  --remote-state-dir /home/yang/.local/state/zellij-mcp-gpu
-```
-
-Representative OpenCode MCP shape:
-
-```json
-{
-  "mcp": {
-    "zellij-gpu": {
-      "type": "local",
-      "command": ["/home/yang/Documents/git/zellij-skill/scripts/zellij-mcp-ssh"],
-      "args": [
-        "gpu",
-        "--remote-bin",
-        "/home/yang/bin/zellij_mcp",
-        "--remote-zjctl-bin",
-        "/home/yang/bin/zjctl",
-        "--remote-state-dir",
-        "/home/yang/.local/state/zellij-mcp-gpu"
-      ]
-    }
-  }
-}
-```
+- `scripts/zellij-mcp-ssh` remains useful for smoke testing or fallback operations
+- it is no longer the primary remote architecture or the recommended OpenCode MCP shape
 
 Path note:
 
 - prefer absolute remote paths or plain executable names that already resolve on the remote non-interactive `PATH`
-- do not rely on `~` expansion in wrapper arguments; the wrapper intentionally quotes remote tokens before handing them to SSH
+- do not rely on `~` expansion in helper-script arguments; the wrapper intentionally quotes remote tokens before handing them to SSH
 
 Important constraint:
 
-- this does not create a detached network daemon on the remote host; it launches the daemon on demand over SSH for the duration of the MCP session
-- if you later want the remote daemon to stay reachable without any SSH transport, that becomes a separate transport feature, not a wrapper-only change
+- this does not create a detached network daemon on the remote host; the local daemon still initiates remote operations over SSH on demand
+- if you later want the remote daemon to stay reachable without any SSH transport, that becomes a separate transport feature
 - this also does not remove Zellij's own requirement for a connected client when the remote plugin RPC path is in use
 - `zellij_discover` now degrades preview failures to metadata-only candidates instead of failing the whole call, but metadata-only discovery can still be the cleaner choice on very busy live panes
 

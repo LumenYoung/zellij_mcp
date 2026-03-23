@@ -7,6 +7,7 @@ use crate::domain::observation::CaptureResult;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpawnResponse {
     pub handle: String,
+    pub target_id: String,
     pub session_name: String,
     pub tab_name: Option<String>,
     pub selector: String,
@@ -16,6 +17,7 @@ pub struct SpawnResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachResponse {
     pub handle: String,
+    pub target_id: String,
     pub attached: bool,
     pub baseline_established: bool,
 }
@@ -27,6 +29,7 @@ pub struct DiscoverResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoverCandidate {
+    pub target_id: String,
     pub selector: String,
     pub pane_id: Option<String>,
     pub session_name: String,

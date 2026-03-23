@@ -291,6 +291,7 @@ mod tests {
         fn spawn(&self, _request: SpawnRequest) -> Result<SpawnResponse, DomainError> {
             Ok(SpawnResponse {
                 handle: "zh_test".to_string(),
+                target_id: "local".to_string(),
                 session_name: "gpu".to_string(),
                 tab_name: Some("editor".to_string()),
                 selector: "id:terminal:7".to_string(),
@@ -301,6 +302,7 @@ mod tests {
         fn attach(&self, _request: AttachRequest) -> Result<AttachResponse, DomainError> {
             Ok(AttachResponse {
                 handle: "zh_test".to_string(),
+                target_id: "local".to_string(),
                 attached: true,
                 baseline_established: true,
             })
@@ -309,6 +311,7 @@ mod tests {
         fn discover(&self, _request: DiscoverRequest) -> Result<DiscoverResponse, DomainError> {
             Ok(DiscoverResponse {
                 candidates: vec![DiscoverCandidate {
+                    target_id: "local".to_string(),
                     selector: "id:terminal:7".to_string(),
                     pane_id: Some("terminal:7".to_string()),
                     session_name: "gpu".to_string(),
@@ -327,6 +330,7 @@ mod tests {
             Ok(ListResponse {
                 bindings: vec![TerminalBinding {
                     handle: "zh_test".to_string(),
+                    target_id: "local".to_string(),
                     alias: Some("editor".to_string()),
                     session_name: "gpu".to_string(),
                     tab_name: Some("editor".to_string()),
@@ -471,7 +475,7 @@ mod tests {
                 "zellij_spawn",
                 json!({
                     "session_name": "gpu",
-                    "target": SpawnTarget::ExistingTab,
+                    "spawn_target": SpawnTarget::ExistingTab,
                     "tab_name": "editor",
                     "cwd": "/tmp",
                     "command": "lazygit",
@@ -494,7 +498,7 @@ mod tests {
                 "zellij_spawn",
                 json!({
                     "session_name": "gpu",
-                    "target": SpawnTarget::ExistingTab,
+                    "spawn_target": SpawnTarget::ExistingTab,
                     "tab_name": "editor",
                     "cwd": "/tmp",
                     "argv": ["git", "status"],

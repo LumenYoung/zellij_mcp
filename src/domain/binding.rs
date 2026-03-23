@@ -3,9 +3,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::status::{BindingSource, TerminalStatus};
 
+fn default_target_id() -> String {
+    "local".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TerminalBinding {
     pub handle: String,
+    #[serde(default = "default_target_id")]
+    pub target_id: String,
     pub alias: Option<String>,
     pub session_name: String,
     pub tab_name: Option<String>,

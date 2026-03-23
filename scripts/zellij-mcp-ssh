@@ -6,6 +6,7 @@ usage() {
 Usage: zellij-mcp-ssh <ssh-alias> [options] [-- extra-daemon-args...]
 
 Launch the zellij_mcp daemon on a remote host over SSH while preserving MCP stdio.
+This is an operational helper for fallback or smoke comparison workflows, not the primary single-MCP architecture.
 
 Options:
   --remote-bin PATH         Remote zellij_mcp binary path (default: zellij_mcp)
@@ -19,6 +20,7 @@ Notes:
   - The SSH alias must already be configured and work non-interactively.
   - The wrapper keeps stdout clean and execs ssh directly for MCP stdio.
   - The SSH connection stays open for the lifetime of the MCP server process.
+  - Normal single-MCP usage now prefers one local daemon with `ZELLIJ_MCP_TARGETS`.
 EOF
 }
 

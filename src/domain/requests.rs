@@ -5,8 +5,10 @@ use crate::domain::status::{CaptureMode, SpawnTarget};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct SpawnRequest {
+    #[serde(default)]
+    pub target: Option<String>,
     pub session_name: String,
-    pub target: SpawnTarget,
+    pub spawn_target: SpawnTarget,
     pub tab_name: Option<String>,
     pub cwd: Option<String>,
     pub command: Option<String>,
@@ -17,6 +19,8 @@ pub struct SpawnRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct AttachRequest {
+    #[serde(default)]
+    pub target: Option<String>,
     pub session_name: String,
     pub tab_name: Option<String>,
     pub selector: String,
@@ -25,6 +29,8 @@ pub struct AttachRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct DiscoverRequest {
+    #[serde(default)]
+    pub target: Option<String>,
     pub session_name: String,
     pub tab_name: Option<String>,
     pub selector: Option<String>,
@@ -65,6 +71,8 @@ pub struct CloseRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, schemars::JsonSchema)]
 pub struct ListRequest {
+    #[serde(default)]
+    pub target: Option<String>,
     pub session_name: Option<String>,
 }
 
