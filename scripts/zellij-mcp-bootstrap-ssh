@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: zellij-mcp-bootstrap-ssh <ssh-alias> [options]
+
+Bootstrap a remote host for wrapper-based zellij_mcp usage entirely in user space.
+
+Options:
+  --remote-home PATH         Remote home directory (default: query over ssh)
+  --session NAME             Zellij session to prepare for RPC (default: same as ssh alias)
+  --helper-session NAME      tmux session name for detached helper client
+  --local-zjctl-repo PATH    Local zjctl repo path (default: /home/yang/Documents/git/zjctl)
+  --ssh-option ARG           Extra ssh argument token (repeatable)
+  --skip-helper-client       Skip detached tmux helper client setup
+  --skip-plugin-install      Skip zjctl plugin install step
+  -h, --help                 Show this help text
+
+What it does:
+  - ensures remote ~/.local/bin, state dir, and repo dirs exist
+  - installs rustup in remote user space if needed
+  - syncs this repo to the remote host and clones or updates zjctl
+  - builds zellij_mcp and zjctl natively on the remote host
+  - installs binaries into remote ~/.local/bin
+  - optionally installs zrpc.wasm and starts a detached tmux helper client
+  - runs zjctl doctor against the target session at the end
+EOF
+}
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 64
+}
+
+quote_posix_sh() {
+  local value=${1-}
+  value=${value//\'/\'"\'"\'}
+  printf "'%s'" "$value"
+}
+
+host=""
+remote_home=""
+session_name=""
+helper_session=""
+local_zjctl_repo="/home/yang/Documents/git/zjctl"
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd "$script_dir/.." && pwd)
+skip_helper_client=0
+skip_plugin_install=0
+declare -a ssh_options=()
+
+while (($#)); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --remote-home)
+      (($# >= 2)) || die "missing value for --remote-home"
+      remote_home=$2
+      shift 2
+      ;;
+    --session)
+      (($# >= 2)) || die "missing value for --session"
+      session_name=$2
+      shift 2
+      ;;
+    --helper-session)
+      (($# >= 2)) || die "missing value for --helper-session"
+      helper_session=$2
+      shift 2
+      ;;
+    --local-zjctl-repo)
+      (($# >= 2)) || die "missing value for --local-zjctl-repo"
+      local_zjctl_repo=$2
+      shift 2
+      ;;
+    --ssh-option)
+      (($# >= 2)) || die "missing value for --ssh-option"
+      ssh_options+=("$2")
+      shift 2
+      ;;
+    --skip-helper-client)
+      skip_helper_client=1
+      shift
+      ;;
+    --skip-plugin-install)
+      skip_plugin_install=1
+      shift
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      if [[ -z $host ]]; then
+        host=$1
+        shift
+      else
+        die "unexpected positional argument: $1"
+      fi
+      ;;
+  esac
+done
+
+[[ -n $host ]] || die "missing required <ssh-alias>"
+[[ -d $local_zjctl_repo ]] || die "local zjctl repo not found: $local_zjctl_repo"
+
+ssh_base=(ssh -oBatchMode=yes -oConnectTimeout=20 "${ssh_options[@]}" "$host")
+
+run_ssh() {
+  "${ssh_base[@]}" "$@"
+}
+
+join_quoted_args() {
+  local result=""
+  local arg
+  for arg in "$@"; do
+    result+=" $(quote_posix_sh "$arg")"
+  done
+  printf '%s' "$result"
+}
+
+if [[ -z $remote_home ]]; then
+  remote_home=$(run_ssh 'printf %s "$HOME"')
+fi
+
+[[ -n $remote_home ]] || die "failed to determine remote home"
+
+if [[ -z $session_name ]]; then
+  session_name=$host
+fi
+if [[ -z $helper_session ]]; then
+  helper_session="zellij-mcp-client-$session_name"
+fi
+
+remote_bin_dir="$remote_home/.local/bin"
+remote_state_dir="$remote_home/.local/state/zellij-mcp-$host"
+remote_git_root="$remote_home/Documents/git"
+remote_skill_repo="$remote_git_root/zellij-skill"
+remote_zjctl_repo="$remote_git_root/zjctl"
+remote_path="$remote_home/.cargo/bin:$remote_bin_dir:/usr/local/bin:/usr/bin:/bin"
+quoted_remote_bin_dir=$(quote_posix_sh "$remote_bin_dir")
+quoted_remote_state_dir=$(quote_posix_sh "$remote_state_dir")
+quoted_remote_git_root=$(quote_posix_sh "$remote_git_root")
+quoted_remote_home=$(quote_posix_sh "$remote_home")
+quoted_remote_skill_repo=$(quote_posix_sh "$remote_skill_repo")
+quoted_remote_zjctl_repo=$(quote_posix_sh "$remote_zjctl_repo")
+quoted_remote_path=$(quote_posix_sh "$remote_path")
+quoted_session_name=$(quote_posix_sh "$session_name")
+quoted_helper_session=$(quote_posix_sh "$helper_session")
+attach_command="env PATH=$(quote_posix_sh "$remote_path") zellij attach $(quote_posix_sh "$session_name")"
+quoted_attach_command=$(quote_posix_sh "$attach_command")
+
+printf 'Bootstrapping %s in user space\n' "$host" >&2
+
+run_ssh "mkdir -p$({ join_quoted_args "$remote_bin_dir" "$remote_state_dir" "$remote_git_root"; })"
+
+run_ssh "if [ ! -x ${quoted_remote_home}/.cargo/bin/cargo ]; then curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal; fi"
+
+tar --exclude='target' --exclude='.git' -czf - -C "$repo_root" . | \
+  "${ssh_base[@]}" "rm -rf ${quoted_remote_skill_repo} && mkdir -p ${quoted_remote_skill_repo} && tar -xzf - -C ${quoted_remote_skill_repo}"
+
+run_ssh "if [ -d ${quoted_remote_zjctl_repo}/.git ]; then git -C ${quoted_remote_zjctl_repo} fetch --depth 1 origin && git -C ${quoted_remote_zjctl_repo} reset --hard origin/HEAD; else git clone --depth 1 https://github.com/mrshu/zjctl.git ${quoted_remote_zjctl_repo}; fi"
+
+run_ssh "export PATH=${quoted_remote_path}; cargo build --release --manifest-path ${quoted_remote_zjctl_repo}/Cargo.toml; cargo build --release --manifest-path ${quoted_remote_skill_repo}/Cargo.toml; install -m 755 ${quoted_remote_zjctl_repo}/target/release/zjctl ${quoted_remote_bin_dir}/zjctl; install -m 755 ${quoted_remote_skill_repo}/target/release/zellij_mcp ${quoted_remote_bin_dir}/zellij_mcp"
+
+if (( skip_plugin_install == 0 )); then
+  run_ssh "export PATH=${quoted_remote_path}; ${quoted_remote_bin_dir}/zjctl install"
+fi
+
+if (( skip_helper_client == 0 )); then
+  run_ssh "export PATH=${quoted_remote_path}; tmux kill-session -t ${quoted_helper_session} >/dev/null 2>&1 || true; tmux new-session -d -s ${quoted_helper_session} ${quoted_attach_command}; sleep 2; if tmux capture-pane -pt ${quoted_helper_session} 2>/dev/null | grep -F 'Allow? (y/n)' >/dev/null; then tmux send-keys -t ${quoted_helper_session} y Enter; sleep 2; fi"
+fi
+
+run_ssh "export PATH=${quoted_remote_path}; export ZELLIJ_SESSION_NAME=${quoted_session_name}; ${quoted_remote_bin_dir}/zjctl doctor"
+
+printf 'Remote bootstrap complete for %s\n' "$host" >&2
+printf 'remote_bin=%s\n' "$remote_bin_dir/zellij_mcp"
+printf 'remote_zjctl=%s\n' "$remote_bin_dir/zjctl"
+printf 'remote_state_dir=%s\n' "$remote_state_dir"
+printf 'session_name=%s\n' "$session_name"
+printf 'helper_session=%s\n' "$helper_session"

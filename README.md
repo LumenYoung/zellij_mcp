@@ -93,6 +93,19 @@ Phase-1 assumptions:
 - SSH credentials and the alias are already configured
 - the remote Zellij session/plugin approval is already in place
 
+Practical setup note:
+
+- if a locally copied Linux binary fails on the remote host with a glibc version error, build it natively on the remote host in user space and install it into the remote `~/.local/bin`
+- `zjctl` RPC currently needs an attached Zellij client; on a headless remote host, that may require a user-space helper such as a detached `tmux` session running `zellij attach <session>`
+
+Bootstrap helper:
+
+```bash
+./scripts/zellij-mcp-bootstrap-ssh a100 --session a100
+```
+
+The bootstrap helper stays entirely in user space. It installs Rust if needed, syncs this repo, clones or updates `zjctl`, builds both binaries natively on the remote host, installs the plugin, starts a detached helper client, and finishes by running `zjctl doctor`.
+
 Example wrapper usage:
 
 ```bash
@@ -133,6 +146,8 @@ Important constraint:
 
 - this does not create a detached network daemon on the remote host; it launches the daemon on demand over SSH for the duration of the MCP session
 - if you later want the remote daemon to stay reachable without any SSH transport, that becomes a separate transport feature, not a wrapper-only change
+- this also does not remove Zellij's own requirement for a connected client when the remote plugin RPC path is in use
+- `zellij_discover` now degrades preview failures to metadata-only candidates instead of failing the whole call, but metadata-only discovery can still be the cleaner choice on very busy live panes
 
 Configured runtime values:
 

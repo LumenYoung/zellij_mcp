@@ -139,6 +139,7 @@ Notes:
 - `preview_lines` must be greater than zero when provided
 - shell-like panes return `preview_basis="recent_lines"`
 - repaint-heavy panes return `preview_basis="visible_frame"`
+- if preview capture fails for a specific pane, `zellij_discover` still returns that candidate with `preview=null`, `preview_basis=null`, and `captured_at=null` instead of failing the whole tool
 - the returned `selector` is attach-ready and should be reused directly for `zellij_attach`
 
 Response:

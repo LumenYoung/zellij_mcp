@@ -788,12 +788,17 @@ where
         let mut candidates = Vec::with_capacity(targets.len());
         for target in targets {
             let (preview, preview_basis, captured_at) = if request.include_preview {
-                let snapshot = self
+                match self
                     .adapter
                     .capture_full(&target.session_name, &target.selector)
-                    .map_err(|error| self.map_adapter_error(error, ErrorCode::CaptureFailed))?;
-                let (preview, basis) = Self::preview_for_snapshot(&snapshot.content, preview_lines);
-                (Some(preview), Some(basis), Some(snapshot.captured_at))
+                {
+                    Ok(snapshot) => {
+                        let (preview, basis) =
+                            Self::preview_for_snapshot(&snapshot.content, preview_lines);
+                        (Some(preview), Some(basis), Some(snapshot.captured_at))
+                    }
+                    Err(_) => (None, None, None),
+                }
             } else {
                 (None, None, None)
             };
@@ -1591,6 +1596,114 @@ mod tests {
         assert_eq!(response.candidates[0].preview, None);
         assert_eq!(response.candidates[0].preview_basis, None);
         assert_eq!(response.candidates[0].captured_at, None);
+    }
+
+    #[test]
+    fn discover_preserves_metadata_when_one_preview_capture_fails() {
+        let targets = vec![
+            ResolvedTarget {
+                selector: "id:terminal:7".to_string(),
+                pane_id: Some("terminal:7".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("shell-job".to_string()),
+                command: Some("cargo test".to_string()),
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:terminal:8".to_string(),
+                pane_id: Some("terminal:8".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("second-job".to_string()),
+                command: Some("htop".to_string()),
+                focused: true,
+            },
+        ];
+        let adapter =
+            MockAdapter::with_targets_and_captures(targets, vec!["line1\nline2\nline3\n"]);
+        *adapter
+            .capture_failures_remaining
+            .lock()
+            .expect("capture failures lock should succeed") = 1;
+        let service = make_service(adapter);
+
+        let response = service
+            .discover(DiscoverRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: None,
+                include_preview: true,
+                preview_lines: Some(2),
+            })
+            .expect("discover should degrade failed previews to metadata-only candidates");
+
+        assert_eq!(response.candidates.len(), 2);
+        assert_eq!(response.candidates[0].selector, "id:terminal:7");
+        assert_eq!(response.candidates[0].title.as_deref(), Some("shell-job"));
+        assert_eq!(response.candidates[0].preview, None);
+        assert_eq!(response.candidates[0].preview_basis, None);
+        assert_eq!(response.candidates[0].captured_at, None);
+
+        assert_eq!(response.candidates[1].selector, "id:terminal:8");
+        assert_eq!(response.candidates[1].title.as_deref(), Some("second-job"));
+        assert_eq!(
+            response.candidates[1].preview.as_deref(),
+            Some("line2\nline3\n")
+        );
+        assert_eq!(
+            response.candidates[1].preview_basis.as_deref(),
+            Some("recent_lines")
+        );
+        assert!(response.candidates[1].captured_at.is_some());
+    }
+
+    #[test]
+    fn discover_succeeds_when_all_preview_captures_fail() {
+        let targets = vec![
+            ResolvedTarget {
+                selector: "id:terminal:7".to_string(),
+                pane_id: Some("terminal:7".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("shell-job".to_string()),
+                command: Some("cargo test".to_string()),
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:terminal:8".to_string(),
+                pane_id: Some("terminal:8".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("second-job".to_string()),
+                command: Some("htop".to_string()),
+                focused: true,
+            },
+        ];
+        let adapter = MockAdapter::with_targets_and_captures(targets, vec!["unused\n"]);
+        *adapter
+            .capture_failures_remaining
+            .lock()
+            .expect("capture failures lock should succeed") = 10;
+        let service = make_service(adapter);
+
+        let response = service
+            .discover(DiscoverRequest {
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: None,
+                include_preview: true,
+                preview_lines: Some(2),
+            })
+            .expect("discover should still succeed when all previews fail");
+
+        assert_eq!(response.candidates.len(), 2);
+        for candidate in response.candidates {
+            assert!(candidate.preview.is_none());
+            assert!(candidate.preview_basis.is_none());
+            assert!(candidate.captured_at.is_none());
+            assert!(candidate.title.is_some());
+        }
     }
 
     #[test]

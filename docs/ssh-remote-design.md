@@ -19,13 +19,17 @@ Observed facts:
 - `ssh a100` works in non-interactive batch mode
 - the wrapper can successfully execute a harmless remote binary through SSH and preserve env injection
 - remote `zellij` exists at `/home/jiaye.yang/.local/bin/zellij`
-- `zellij_mcp` and `zjctl` are not currently available on the remote non-interactive `PATH`
-- because of that, a full end-to-end MCP smoke against `a100` is blocked until the daemon binary and `zjctl` are installed there or their absolute paths are known
+- `zellij_mcp` and `zjctl` were not initially available on the remote non-interactive `PATH`
+- copying locally built binaries to `a100` failed because the remote host did not provide the newer glibc those binaries were linked against
+- installing Rust in user space on `a100` and building both `zellij_mcp` and `zjctl` natively under `/home/jiaye.yang/Documents/git` produced compatible remote binaries
+- after installing `zrpc.wasm`, `zjctl` still required a connected Zellij client; RPC only became healthy after starting a detached user-space `tmux` session that ran `zellij attach a100` and approving the plugin prompt once
+- after that setup, the SSH wrapper successfully exposed MCP tools, a real remote metadata-only `zellij-discover --session-name a100` call succeeded, and wrapper-backed MCP access became repeatable through a bootstrap helper
 
 Practical conclusion:
 
 - the SSH launcher design itself works against the real host
-- the remaining blocker on `a100` is remote binary placement, not the launcher model
+- user-space self-provisioning on `a100` is feasible without sudo
+- the main operational constraints are binary compatibility, Zellij's requirement for a connected client, and the fact that preview capture on very busy panes can still fail even when metadata-only discovery is healthy
 
 ## Requirements
 
@@ -71,6 +75,7 @@ Trade-offs:
 - if the network drops, the MCP session drops too
 - remote shell noise on stdout can corrupt the MCP stream
 - the remote host still needs `zellij_mcp`, `zjctl`, and plugin approval in place
+- a remote Zellij session may still need a connected client for plugin RPC; in practice this can require a detached user-space helper client on headless hosts
 
 Recommendation:
 
@@ -173,23 +178,23 @@ Recommended path:
 Included now:
 
 - local wrapper `scripts/zellij-mcp-ssh`
+- remote bootstrap helper `scripts/zellij-mcp-bootstrap-ssh`
 - docs describing remote-over-SSH launch
-- tests for wrapper quoting, env passing, and quiet stdio behavior
+- tests for wrapper shell contracts plus basic bootstrap helper CLI coverage
 
 Explicitly not included now:
 
-- remote binary installation
-- remote health-check automation
 - detached remote daemon lifecycle management
 - new MCP transport implementations
+- stronger helper-client supervision than a best-effort detached `tmux` session
 
 ## Future Work
 
-### Phase 2 — Remote bootstrap helpers
+### Phase 2 — Remote setup hardening
 
-- copy or sync `zellij_mcp` and `zjctl` to the remote host
-- verify remote binary paths
-- verify plugin readiness and quiet non-interactive shell startup
+- detect whether copied binaries are ABI-incompatible before spending time on a native rebuild
+- add explicit health checks for preview-enabled `zellij_discover` and identify pane classes that should default to metadata-only discovery
+- make the detached helper-client supervision more robust than a best-effort `tmux` session
 - generate ready-to-paste OpenCode MCP config snippets per host alias
 
 ### Phase 3 — Detached remote daemon decision
