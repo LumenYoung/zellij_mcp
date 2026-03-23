@@ -10,7 +10,7 @@
 ## Transport
 
 - the daemon is exposed as a real MCP stdio server through `rmcp`
-- `mcp2cli --mcp-stdio "cargo run --quiet --manifest-path /path/to/Cargo.toml" --list` is the intended local integration path
+- `mcp2cli --mcp-stdio "cargo run --quiet --manifest-path /path/to/Cargo.toml" --list` is a convenient local smoke/debug path; OpenCode on this machine uses the daemon directly as a local MCP server
 - each MCP tool returns its structured result serialized as JSON text content, which keeps the transport layer thin while remaining readable to `mcp2cli`
 - MCP error responses preserve daemon error details in their `data` payload with stable fields: `code`, `message`, and `retryable`
 
@@ -58,7 +58,10 @@ Notes:
 - `command` is parsed with shell-style quoting, so inputs like `bash -lc 'echo hello world'` preserve the intended argv shape
 - `argv` bypasses shell parsing and is passed to `zjctl` as-is
 - malformed shell quoting in `command`, blank `command`, empty `argv`, blank `argv[0]`, or mixed `command` + `argv` input fails early as an argument parse error instead of spawning a mangled command
-- `wait_ready=true` currently runs the same rendered-screen idle check as `zellij_wait`; it works for shell-like startup and was live-tested with `lazygit`, but redraw-heavy TUIs may still make it a noisy readiness proxy
+- `wait_ready=true` runs the same rendered-screen idle check as `zellij_wait`; it works for shell-like startup and was live-tested with `lazygit`, but redraw-heavy TUIs may still make it a noisy readiness proxy
+- when that bounded idle check times out after the pane is already real, `zellij_spawn` returns the new handle with `status="busy"` instead of failing the whole launch
+- `target="new_tab"` now creates the tab, launches the command with `zellij run`, then resolves the spawned pane from post-launch session state; this avoids the earlier fresh-tab RPC handoff stall where the pane could exist before the request returned
+- fatal post-launch errors that happen after early persistence now clean up the provisional binding instead of leaving an orphaned busy handle behind
 
 Response:
 
@@ -69,6 +72,18 @@ Response:
   "tab_name": "editor",
   "selector": "id:terminal:7",
   "status": "ready"
+}
+```
+
+Degraded but successful response:
+
+```json
+{
+  "handle": "zh_...",
+  "session_name": "gpu",
+  "tab_name": "editor",
+  "selector": "id:terminal:7",
+  "status": "busy"
 }
 ```
 
@@ -199,6 +214,7 @@ Notes:
 - `zellij_wait` uses `zjctl pane wait-idle`, so it observes rendered-screen stability rather than process completion
 - if the backend temporarily fails to resolve a freshly managed pane, the daemon retries and can fall back to capture-based stability polling before declaring the handle stale
 - this has been verified live for a spawned `lazygit` pane, but should still be read as an idle heuristic rather than an exact app-ready guarantee
+- a handle becoming `ready` after `zellij_list` or another later operation means the daemon revalidated the pane and established a baseline capture; it is not a stronger readiness promise than `zellij_wait`
 
 ### `zellij_capture`
 
@@ -304,6 +320,8 @@ Input:
 - `spawn`, `wait`, and `close` are available through the daemon and have been verified against a real Zellij session
 - `spawn` preserves quoted command arguments using shell-aware parsing
 - `spawn` also supports explicit `argv` input without shell parsing
+- `spawn(wait_ready=true)` can degrade to `status="busy"` while still returning a usable handle when the launch succeeded but idle detection did not settle in time
+- `spawn(target="new_tab")` avoids the earlier fresh-tab RPC stall by resolving the pane after `zellij run` from live session state
 - `attach` can convert an existing live pane into a managed daemon handle for takeover-style agent workflows
 - `discover` can inspect unmanaged panes before attach and returns attach-ready selectors with bounded preview text
 - `capture` can clip returned output with `tail_lines` while keeping `full` / `delta` / `current` semantics stable
@@ -316,3 +334,4 @@ Input:
 - no phase 1 tool manages layout or pane scheduling
 - the backend plugin must be loaded in the target session and its permission prompt approved before RPC-backed operations can succeed
 - full-screen TUIs may redraw large portions of the screen, so `delta` and `current` may over-report changes compared with shell-style output
+- spawn persistence still writes registry and observation state in separate files, so a crash or storage failure between those writes can leave partial local state even though normal runtime cleanup now covers the post-launch failure paths

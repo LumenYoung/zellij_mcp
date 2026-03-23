@@ -29,6 +29,7 @@ Current implementation status:
 - named special-key input is implemented for common controls such as arrows, escape, tab, enter, backspace, and ctrl-c
 - `current` capture is repaint-aware for redraw-heavy TUIs, while `full` and `delta` keep snapshot semantics
 - spawn now supports either shell-style `command` or explicit `argv`
+- spawn now persists a provisional handle before post-launch readiness/capture work so a real pane is not lost when follow-up probing degrades
 
 Phase 1 does not implement automatic pane scheduling, pane replacement, layout management, or external message bridges.
 
@@ -83,11 +84,23 @@ The adapter is the only layer allowed to spawn `zjctl` or parse its output. It p
 
 The spawn path now accepts either a shell-style `command` string or an explicit `argv` vector before building `zjctl` argv. String commands still use shell-aware quoting so quoted arguments survive intact, while explicit `argv` bypasses shell parsing completely. Mixed `command` + `argv`, missing both, blank `command`, empty `argv`, and blank `argv[0]` all fail before any pane is launched.
 
+For `target="existing_tab"`, the adapter still uses the normal `zjctl` spawn path. For `target="new_tab"`, the adapter now creates the tab, launches the command via direct `zellij run`, then resolves the spawned pane from the before/after session listing. This avoids the earlier case where a fresh tab could contain the real pane while the older RPC-backed selector handoff was still stalled.
+
 Live verification showed one important runtime constraint: the `zrpc.wasm` plugin must be loaded in the target session and its first-run permission prompt must be approved before `zjctl` RPC calls will succeed.
 
 ### Persistence
 
 Persistence stores lightweight daemon state in JSON files under a local state directory. The daemon persists bindings and capture metadata, then revalidates them against live Zellij state on startup.
+
+Spawn lifecycle detail:
+
+1. create the pane through the adapter
+2. persist a provisional spawned binding and empty observation as `busy`
+3. optionally run bounded idle detection when `wait_ready=true`
+4. establish a baseline capture when possible
+5. upgrade the binding to `ready` once revalidation and capture succeed
+
+If the pane is real but bounded idle detection or baseline capture does not settle cleanly, the daemon returns the handle as `busy` so later `wait`, `capture`, `list`, or `close` can continue from that state. Fatal post-launch errors clean up the provisional state instead of leaving a lost handle behind.
 
 ## Primary Objects
 
@@ -133,7 +146,7 @@ Returns the current content that can be captured from the pane. This is the most
 
 For full-screen TUIs, `full` remains the most conservative mode, while `current` now also has live verification for repaint-heavy screens through its frame-normalization path.
 
-Live lifecycle testing also showed that `wait` works for a spawned `lazygit` pane, but `wait_ready=true` should not be treated as a universal readiness signal for redraw-heavy TUIs.
+Live lifecycle testing also showed that `wait` works for a spawned `lazygit` pane, but `wait_ready=true` should not be treated as a universal readiness signal for redraw-heavy TUIs. The current spawn contract treats it as a bounded best-effort idle probe, not as the definition of whether the spawn itself succeeded.
 
 ### delta
 
@@ -224,3 +237,4 @@ Verified so far:
 7. both string-command and explicit-argv spawn forms are validated and covered by tests, with invalid input rejected before any Zellij tab action runs
 8. attach already supports taking over an existing pane by selector and converting it into a managed daemon handle
 9. `zellij_discover` has been verified live in a non-`gpu` session and returns command, focus state, and bounded preview text for candidate panes
+10. timeout-prone `new_tab` spawn now returns a usable busy handle instead of hanging externally, and the resulting handle can be revalidated, captured, and closed in a later step
