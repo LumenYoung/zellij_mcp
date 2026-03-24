@@ -1,31 +1,39 @@
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use crate::domain::errors::{DomainError, ErrorCode};
 use crate::domain::requests::{
-    AttachRequest, CaptureRequest, CloseRequest, DiscoverRequest, ListRequest, SendRequest,
-    SpawnRequest, WaitRequest,
+    AttachRequest, CaptureRequest, CleanupRequest, CloseRequest, DiscoverRequest, LayoutRequest,
+    ListRequest, ReplaceRequest, SendRequest, SpawnRequest, TakeoverRequest, WaitRequest,
 };
 use crate::domain::responses::{
-    AttachResponse, CaptureResponse, CloseResponse, DiscoverResponse, ListResponse, SendResponse,
-    SpawnResponse, WaitResponse,
+    AttachResponse, CaptureResponse, CleanupResponse, CloseResponse, DiscoverResponse,
+    LayoutResponse, ListResponse, ReplaceResponse, SendResponse, SpawnResponse, TakeoverResponse,
+    WaitResponse,
 };
 use crate::persistence::RegistryStore;
 
 use super::TerminalManager;
 
+type BackendFactory =
+    dyn Fn(&str) -> Result<Option<Arc<dyn TerminalManager>>, DomainError> + Send + Sync;
+
 pub struct TargetRouter {
     registry_store: RegistryStore,
-    backends: HashMap<String, Box<dyn TerminalManager>>,
+    backends: RwLock<HashMap<String, Arc<dyn TerminalManager>>>,
+    remote_backend_factory: Option<Box<BackendFactory>>,
 }
 
 impl TargetRouter {
     pub fn new(
         registry_store: RegistryStore,
-        backends: HashMap<String, Box<dyn TerminalManager>>,
+        backends: HashMap<String, Arc<dyn TerminalManager>>,
+        remote_backend_factory: Option<Box<BackendFactory>>,
     ) -> Self {
         Self {
             registry_store,
-            backends,
+            backends: RwLock::new(backends),
+            remote_backend_factory,
         }
     }
 
@@ -46,21 +54,46 @@ impl TargetRouter {
     fn backend_for_target(
         &self,
         target: Option<&str>,
-    ) -> Result<&dyn TerminalManager, DomainError> {
+    ) -> Result<Arc<dyn TerminalManager>, DomainError> {
         let target_id = Self::resolve_target_id(target);
-        self.backends
-            .get(&target_id)
-            .map(|backend| backend.as_ref())
-            .ok_or_else(|| {
-                DomainError::new(
-                    ErrorCode::TargetNotFound,
-                    format!("target `{target_id}` is not configured"),
-                    false,
-                )
-            })
+        self.backend_for_target_id(&target_id)
     }
 
-    fn backend_for_handle(&self, handle: &str) -> Result<&dyn TerminalManager, DomainError> {
+    fn backend_for_target_id(
+        &self,
+        target_id: &str,
+    ) -> Result<Arc<dyn TerminalManager>, DomainError> {
+        if let Some(backend) = self
+            .backends
+            .read()
+            .expect("router backend read lock should succeed")
+            .get(target_id)
+            .cloned()
+        {
+            return Ok(backend);
+        }
+
+        if let Some(factory) = &self.remote_backend_factory {
+            if let Some(backend) = factory(target_id)? {
+                let mut backends = self
+                    .backends
+                    .write()
+                    .expect("router backend write lock should succeed");
+                return Ok(backends
+                    .entry(target_id.to_string())
+                    .or_insert_with(|| backend.clone())
+                    .clone());
+            }
+        }
+
+        Err(DomainError::new(
+            ErrorCode::TargetNotFound,
+            format!("target `{target_id}` is not configured"),
+            false,
+        ))
+    }
+
+    fn backend_for_handle(&self, handle: &str) -> Result<Arc<dyn TerminalManager>, DomainError> {
         let bindings = self.registry_store.load()?;
         let binding = bindings
             .iter()
@@ -72,15 +105,17 @@ impl TargetRouter {
                     false,
                 )
             })?;
-        self.backends
-            .get(&binding.target_id)
-            .map(|backend| backend.as_ref())
-            .ok_or_else(|| {
-                DomainError::new(
-                    ErrorCode::TargetNotFound,
-                    format!("binding target `{}` is not configured", binding.target_id),
-                    false,
-                )
+        self.backend_for_target_id(&binding.target_id)
+            .map_err(|error| {
+                if error.code == ErrorCode::TargetNotFound {
+                    DomainError::new(
+                        ErrorCode::TargetNotFound,
+                        format!("binding target `{}` is not configured", binding.target_id),
+                        false,
+                    )
+                } else {
+                    error
+                }
             })
     }
 }
@@ -94,6 +129,11 @@ impl TerminalManager for TargetRouter {
     fn attach(&self, request: AttachRequest) -> Result<AttachResponse, DomainError> {
         self.backend_for_target(request.target.as_deref())?
             .attach(request)
+    }
+
+    fn takeover(&self, request: TakeoverRequest) -> Result<TakeoverResponse, DomainError> {
+        self.backend_for_target(request.target.as_deref())?
+            .takeover(request)
     }
 
     fn discover(&self, request: DiscoverRequest) -> Result<DiscoverResponse, DomainError> {
@@ -114,6 +154,20 @@ impl TerminalManager for TargetRouter {
         self.backend_for_handle(&request.handle)?.send(request)
     }
 
+    fn replace(&self, request: ReplaceRequest) -> Result<ReplaceResponse, DomainError> {
+        self.backend_for_handle(&request.handle)?.replace(request)
+    }
+
+    fn cleanup(&self, request: CleanupRequest) -> Result<CleanupResponse, DomainError> {
+        self.backend_for_target(request.target.as_deref())?
+            .cleanup(request)
+    }
+
+    fn layout(&self, request: LayoutRequest) -> Result<LayoutResponse, DomainError> {
+        self.backend_for_target(request.target.as_deref())?
+            .layout(request)
+    }
+
     fn wait(&self, request: WaitRequest) -> Result<WaitResponse, DomainError> {
         self.backend_for_handle(&request.handle)?.wait(request)
     }
@@ -128,6 +182,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use chrono::Utc;
@@ -137,12 +192,14 @@ mod tests {
     use crate::domain::errors::{DomainError, ErrorCode};
     use crate::domain::observation::CaptureResult;
     use crate::domain::requests::{
-        AttachRequest, CaptureRequest, CloseRequest, DiscoverRequest, ListRequest, SendRequest,
-        SpawnRequest, WaitRequest,
+        AttachRequest, CaptureRequest, CleanupRequest, CloseRequest, DiscoverRequest,
+        LayoutRequest, ListRequest, ReplaceRequest, SendRequest, SpawnRequest, TakeoverRequest,
+        WaitRequest,
     };
     use crate::domain::responses::{
-        AttachResponse, CaptureResponse, CloseResponse, DiscoverCandidate, DiscoverResponse,
-        ListResponse, SendResponse, SpawnResponse, WaitResponse,
+        AttachResponse, CaptureResponse, CleanupResponse, CloseResponse, DiscoverCandidate,
+        DiscoverResponse, LayoutResponse, LayoutTab, ListResponse, ReplaceResponse, SendResponse,
+        SpawnResponse, TakeoverResponse, WaitResponse,
     };
     use crate::domain::status::{BindingSource, CaptureMode, SpawnTarget, TerminalStatus};
     use crate::persistence::RegistryStore;
@@ -164,13 +221,19 @@ mod tests {
     struct RecordingTerminalManager {
         target_id: String,
         calls: Arc<Mutex<Vec<Call>>>,
+        bindings: Vec<TerminalBinding>,
     }
 
     impl RecordingTerminalManager {
         fn new(target_id: impl Into<String>) -> Self {
+            Self::with_bindings(target_id, Vec::new())
+        }
+
+        fn with_bindings(target_id: impl Into<String>, bindings: Vec<TerminalBinding>) -> Self {
             Self {
                 target_id: target_id.into(),
                 calls: Arc::new(Mutex::new(Vec::new())),
+                bindings,
             }
         }
 
@@ -205,6 +268,17 @@ mod tests {
             })
         }
 
+        fn takeover(&self, request: TakeoverRequest) -> Result<TakeoverResponse, DomainError> {
+            self.record(Call::Attach(request.target.clone()));
+            Ok(TakeoverResponse {
+                handle: "zh_takeover".to_string(),
+                target_id: self.target_id.clone(),
+                attached: true,
+                baseline_established: true,
+                matched_selector: "id:terminal:1".to_string(),
+            })
+        }
+
         fn discover(&self, request: DiscoverRequest) -> Result<DiscoverResponse, DomainError> {
             self.record(Call::Discover(request.target.clone()));
             Ok(DiscoverResponse {
@@ -227,7 +301,7 @@ mod tests {
         fn list(&self, request: ListRequest) -> Result<ListResponse, DomainError> {
             self.record(Call::List(request.target.clone()));
             Ok(ListResponse {
-                bindings: Vec::new(),
+                bindings: self.bindings.clone(),
             })
         }
 
@@ -239,10 +313,17 @@ mod tests {
                     mode: "full".to_string(),
                     content: "ok".to_string(),
                     tail_lines: None,
+                    line_offset: None,
+                    line_limit: None,
                     line_window_applied: false,
+                    next_cursor: None,
+                    ansi_normalized: false,
                     truncated: false,
                     captured_at: Utc::now(),
                     baseline: None,
+                    interaction_id: None,
+                    interaction_completed: None,
+                    interaction_exit_code: None,
                 },
             })
         }
@@ -255,12 +336,58 @@ mod tests {
             })
         }
 
+        fn replace(&self, request: ReplaceRequest) -> Result<ReplaceResponse, DomainError> {
+            self.record(Call::Send(request.handle.clone()));
+            Ok(ReplaceResponse {
+                handle: request.handle,
+                replaced: true,
+                interaction_id: Some("zi_replace".to_string()),
+            })
+        }
+
+        fn cleanup(&self, request: CleanupRequest) -> Result<CleanupResponse, DomainError> {
+            self.record(Call::List(request.target.clone()));
+            Ok(CleanupResponse {
+                removed_handles: vec!["zh_cleanup".to_string()],
+                removed_count: 1,
+                dry_run: request.dry_run,
+            })
+        }
+
+        fn layout(&self, request: LayoutRequest) -> Result<LayoutResponse, DomainError> {
+            self.record(Call::List(request.target.clone()));
+            Ok(LayoutResponse {
+                target_id: self.target_id.clone(),
+                session_name: request.session_name,
+                tabs: vec![LayoutTab {
+                    tab_name: "editor".to_string(),
+                    panes: vec![DiscoverCandidate {
+                        target_id: self.target_id.clone(),
+                        selector: "id:terminal:1".to_string(),
+                        pane_id: Some("terminal:1".to_string()),
+                        session_name: "gpu".to_string(),
+                        tab_name: Some("editor".to_string()),
+                        title: Some("shell".to_string()),
+                        command: Some("fish".to_string()),
+                        focused: false,
+                        preview: None,
+                        preview_basis: None,
+                        captured_at: None,
+                    }],
+                }],
+            })
+        }
+
         fn wait(&self, request: WaitRequest) -> Result<WaitResponse, DomainError> {
             self.record(Call::Wait(request.handle.clone()));
             Ok(WaitResponse {
                 handle: request.handle,
                 status: "idle".to_string(),
                 observed_at: Utc::now(),
+                completion_basis: None,
+                interaction_id: None,
+                interaction_completed: None,
+                interaction_exit_code: None,
             })
         }
 
@@ -282,12 +409,45 @@ mod tests {
         local: RecordingTerminalManager,
         remote: Option<RecordingTerminalManager>,
     ) -> TargetRouter {
-        let mut backends: HashMap<String, Box<dyn TerminalManager>> = HashMap::new();
-        backends.insert("local".to_string(), Box::new(local));
+        let mut backends: HashMap<String, Arc<dyn TerminalManager>> = HashMap::new();
+        backends.insert("local".to_string(), Arc::new(local));
         if let Some(remote) = remote {
-            backends.insert(remote.target_id.clone(), Box::new(remote));
+            backends.insert(remote.target_id.clone(), Arc::new(remote));
         }
-        TargetRouter::new(registry_store, backends)
+        TargetRouter::new(registry_store, backends, None)
+    }
+
+    fn build_lazy_router(
+        registry_store: RegistryStore,
+        local: RecordingTerminalManager,
+        creation_count: Arc<AtomicUsize>,
+        created_targets: Arc<Mutex<Vec<String>>>,
+        remote_calls: Arc<Mutex<Vec<Call>>>,
+    ) -> TargetRouter {
+        let mut backends: HashMap<String, Arc<dyn TerminalManager>> = HashMap::new();
+        backends.insert("local".to_string(), Arc::new(local));
+
+        TargetRouter::new(
+            registry_store,
+            backends,
+            Some(Box::new(move |target_id| {
+                if target_id == "ssh:a100" {
+                    creation_count.fetch_add(1, Ordering::SeqCst);
+                    created_targets
+                        .lock()
+                        .expect("created_targets lock should succeed")
+                        .push(target_id.to_string());
+                    let mut manager = RecordingTerminalManager::with_bindings(
+                        target_id,
+                        vec![sample_binding("zh_remote_list", target_id)],
+                    );
+                    manager.calls = remote_calls.clone();
+                    Ok(Some(Arc::new(manager)))
+                } else {
+                    Ok(None)
+                }
+            })),
+        )
     }
 
     fn sample_binding(handle: &str, target_id: &str) -> TerminalBinding {
@@ -453,6 +613,10 @@ mod tests {
                 handle: "zh_capture".to_string(),
                 mode: CaptureMode::Full,
                 tail_lines: None,
+                line_offset: None,
+                line_limit: None,
+                cursor: None,
+                normalize_ansi: false,
             })
             .expect("capture should route by binding target");
         router
@@ -460,6 +624,7 @@ mod tests {
                 handle: "zh_send".to_string(),
                 text: "printf 'ok'".to_string(),
                 keys: Vec::new(),
+                input_mode: None,
                 submit: true,
             })
             .expect("send should route by binding target");
@@ -489,6 +654,166 @@ mod tests {
                 Call::Wait("zh_wait".to_string()),
                 Call::Close("zh_close".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn discover_with_alias_only_target_creates_ready_remote_backend() {
+        let registry_store = RegistryStore::new(temp_registry_path());
+        let local = RecordingTerminalManager::new("local");
+        let local_calls = local.calls.clone();
+        let creation_count = Arc::new(AtomicUsize::new(0));
+        let created_targets = Arc::new(Mutex::new(Vec::new()));
+        let remote_calls = Arc::new(Mutex::new(Vec::new()));
+        let router = build_lazy_router(
+            registry_store,
+            local,
+            creation_count.clone(),
+            created_targets.clone(),
+            remote_calls.clone(),
+        );
+
+        let discover_response = router
+            .discover(DiscoverRequest {
+                target: Some("a100".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: None,
+                include_preview: false,
+                preview_lines: None,
+            })
+            .expect("alias-only target should lazily create remote backend");
+
+        assert_eq!(discover_response.candidates[0].target_id, "ssh:a100");
+        assert!(local_calls
+            .lock()
+            .expect("calls lock should succeed")
+            .is_empty());
+        assert_eq!(creation_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *remote_calls.lock().expect("calls lock should succeed"),
+            vec![Call::Discover(Some("a100".to_string()))]
+        );
+        assert_eq!(
+            *created_targets
+                .lock()
+                .expect("created_targets lock should succeed"),
+            vec!["ssh:a100".to_string()]
+        );
+    }
+
+    #[test]
+    fn attach_with_alias_only_target_preserves_target_id_shape() {
+        let registry_store = RegistryStore::new(temp_registry_path());
+        let local = RecordingTerminalManager::new("local");
+        let local_calls = local.calls.clone();
+        let creation_count = Arc::new(AtomicUsize::new(0));
+        let created_targets = Arc::new(Mutex::new(Vec::new()));
+        let remote_calls = Arc::new(Mutex::new(Vec::new()));
+        let router = build_lazy_router(
+            registry_store,
+            local,
+            creation_count.clone(),
+            created_targets.clone(),
+            remote_calls.clone(),
+        );
+
+        let response = router
+            .attach(AttachRequest {
+                target: Some("a100".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("alias-only attach should lazily create remote backend");
+
+        assert_eq!(response.target_id, "ssh:a100");
+        assert!(local_calls
+            .lock()
+            .expect("calls lock should succeed")
+            .is_empty());
+        assert_eq!(creation_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *remote_calls.lock().expect("calls lock should succeed"),
+            vec![Call::Attach(Some("a100".to_string()))]
+        );
+        assert_eq!(
+            *created_targets
+                .lock()
+                .expect("created_targets lock should succeed"),
+            vec!["ssh:a100".to_string()]
+        );
+    }
+
+    #[test]
+    fn alias_only_and_canonical_selection_reuse_cached_remote_backend_across_selection_calls() {
+        let registry_store = RegistryStore::new(temp_registry_path());
+        let local = RecordingTerminalManager::new("local");
+        let local_calls = local.calls.clone();
+        let creation_count = Arc::new(AtomicUsize::new(0));
+        let created_targets = Arc::new(Mutex::new(Vec::new()));
+        let remote_calls = Arc::new(Mutex::new(Vec::new()));
+        let router = build_lazy_router(
+            registry_store,
+            local,
+            creation_count.clone(),
+            created_targets.clone(),
+            remote_calls.clone(),
+        );
+
+        let spawn_response = router
+            .spawn(SpawnRequest {
+                target: Some("a100".to_string()),
+                session_name: "gpu".to_string(),
+                spawn_target: SpawnTarget::ExistingTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("lazygit".to_string()),
+                argv: None,
+                title: Some("lg".to_string()),
+                wait_ready: false,
+            })
+            .expect("bare alias spawn should use lazy remote backend");
+        let discover_response = router
+            .discover(DiscoverRequest {
+                target: Some("ssh:a100".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: None,
+                include_preview: false,
+                preview_lines: None,
+            })
+            .expect("canonical discover should reuse cached backend");
+        let list_response = router
+            .list(ListRequest {
+                target: Some("a100".to_string()),
+                session_name: Some("gpu".to_string()),
+            })
+            .expect("alias-only list should reuse cached backend");
+
+        assert_eq!(spawn_response.target_id, "ssh:a100");
+        assert_eq!(discover_response.candidates[0].target_id, "ssh:a100");
+        assert_eq!(list_response.bindings.len(), 1);
+        assert_eq!(list_response.bindings[0].target_id, "ssh:a100");
+        assert!(local_calls
+            .lock()
+            .expect("calls lock should succeed")
+            .is_empty());
+        assert_eq!(creation_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *remote_calls.lock().expect("calls lock should succeed"),
+            vec![
+                Call::Spawn(Some("a100".to_string())),
+                Call::Discover(Some("ssh:a100".to_string())),
+                Call::List(Some("a100".to_string())),
+            ]
+        );
+        assert_eq!(
+            *created_targets
+                .lock()
+                .expect("created_targets lock should succeed"),
+            vec!["ssh:a100".to_string()]
         );
     }
 
@@ -531,6 +856,10 @@ mod tests {
                 handle: "zh_legacy".to_string(),
                 mode: CaptureMode::Full,
                 tail_lines: None,
+                line_offset: None,
+                line_limit: None,
+                cursor: None,
+                normalize_ansi: false,
             })
             .expect("legacy binding should route to local backend");
 
@@ -576,6 +905,10 @@ mod tests {
                 handle: "zh_missing".to_string(),
                 mode: CaptureMode::Full,
                 tail_lines: None,
+                line_offset: None,
+                line_limit: None,
+                cursor: None,
+                normalize_ansi: false,
             })
             .expect_err("missing handle should fail");
 

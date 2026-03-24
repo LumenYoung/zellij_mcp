@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AdapterError {
     #[error("zjctl command execution is not implemented yet")]
     Unimplemented,

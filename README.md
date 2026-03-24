@@ -82,30 +82,44 @@ Important consequence:
 The current model keeps a single local MCP daemon and lets selection tools opt into a remote target.
 
 - omit `target` to use the local backend
-- set `target` on `zellij_spawn`, `zellij_attach`, `zellij_discover`, or `zellij_list` to select a configured SSH target alias
+- set `target` on `zellij_spawn`, `zellij_attach`, `zellij_discover`, or `zellij_list` to select an SSH target alias such as `aws`
+- the target value can be a bare alias like `aws`, and the daemon resolves it canonically to `ssh:aws`
 - follow-up tools such as `zellij_send`, `zellij_wait`, `zellij_capture`, and `zellij_close` do not need `target`; the daemon routes them by the persisted handle binding
 - remote `zjctl` and `zellij` commands are executed over SSH by the local daemon
 
 Runtime configuration is daemon-side through `ZELLIJ_MCP_TARGETS`.
 
+The current shape is layered, with shared `defaults` and optional per-alias partial `overrides`:
+
 Example:
 
 ```bash
-ZELLIJ_MCP_TARGETS='{"a100":{"host":"a100","remote_zjctl_bin":"/home/yang/bin/zjctl","remote_zellij_bin":"zellij","remote_env":{"ZELLIJ_SESSION_NAME":"a100"},"ssh_options":[]}}' \
+ZELLIJ_MCP_TARGETS='{"defaults":{"remote_zjctl_bin":"zjctl","remote_zellij_bin":"zellij","remote_env":{"ZELLIJ_SESSION_NAME":"remote"},"ssh_options":["-o","BatchMode=yes"]},"overrides":{"aws":{"host":"aws","remote_env":{"ZELLIJ_SESSION_NAME":"aws"}},"a100":{"host":"a100","remote_env":{"ZELLIJ_SESSION_NAME":"a100"}}}}' \
 ./target/release/zellij_mcp
 ```
 
-Phase-1 assumptions:
+In that layered form, each alias starts from `defaults`, then only the fields present under its override replace or extend them. The daemon also keeps accepting the older legacy map shape for backward compatibility, but the layered `defaults` plus `overrides` form is the intended alias-only setup.
 
-- the remote host already has `zjctl` available
-- the remote host already has `zellij` available
-- SSH credentials and the alias are already configured
-- the remote Zellij session/plugin approval is already in place
+Readiness and remediation:
+
+- the daemon checks remote SSH targets before it tries to use them, then classifies the target as `Ready`, `AutoFixable`, or `ManualActionRequired`
+- `AutoFixable` means the daemon can safely apply bounded remediation, such as starting a detached helper client, running `zjctl install` when `zjctl` already resolves, and retrying readiness exactly once
+- `AutoFixable` is used specifically for missing binaries, helper-client absence, and RPC-not-ready drift that can still be recovered through deterministic user-space setup
+- when the remote command path does not already include it, the daemon prepends `$HOME/.local/bin` for non-interactive SSH probing and execution so ordinary hosts do not need per-host binary paths
+- `ManualActionRequired` covers the remaining interactive cases, especially unmanaged plugin approval prompts that still need a human to confirm them in the remote Zellij session
+- readiness does not claim zero-touch success for every host, it only fixes the safe, bounded cases automatically
+
+Freshness and diagnosability:
+
+- startup now logs daemon instance id, package version, build stamp, pid, and started-at timestamp to stderr
+- every successful MCP tool response now includes `_daemon` metadata with the same identity fields so stale local processes are visible per request
+- MCP error data now includes daemon identity as well, which makes mixed local/remote failures easier to attribute to the right running binary
 
 Practical setup note:
 
 - if a locally copied Linux binary fails on the remote host with a glibc version error, build it natively on the remote host in user space and install it into the remote `~/.local/bin`
-- `zjctl` RPC currently needs an attached Zellij client; on a headless remote host, that may require a user-space helper such as a detached `tmux` session running `zellij attach <session>`
+- the daemon normalizes the remote HOME and PATH for non-interactive SSH probing and execution, so remote tools installed in `~/.local/bin` are found without per-host path overrides
+- `zjctl` RPC still needs an attached Zellij client, so a headless remote host may still need a user-space helper such as a detached `tmux` session running `zellij attach <session>`
 
 Bootstrap helper:
 
@@ -131,6 +145,12 @@ Important constraint:
 - if you later want the remote daemon to stay reachable without any SSH transport, that becomes a separate transport feature
 - this also does not remove Zellij's own requirement for a connected client when the remote plugin RPC path is in use
 - `zellij_discover` now degrades preview failures to metadata-only candidates instead of failing the whole call, but metadata-only discovery can still be the cleaner choice on very busy live panes
+
+Target and handle semantics:
+
+- the canonical target id stored in responses and bindings is `ssh:<alias>`
+- selection tools accept the alias form from the user, while follow-up calls keep using the persisted handle binding
+- that separation keeps the single local MCP architecture intact and avoids nested remote daemons
 
 Configured runtime values:
 
@@ -158,7 +178,14 @@ For new agent-owned panes:
 Notes:
 
 - `wait_ready=true` is a convenience idle probe, not a process-start or app-ready guarantee
-- a later `zellij_list` revalidation can upgrade a spawned handle from `busy` to `ready` once the pane is reachable and a baseline capture succeeds
+- a later `zellij_list` revalidation can upgrade a spawned handle from `busy` to `ready` once the pane selector is reachable again; use `zellij_capture` when you need a fresh output baseline
+
+## Remote troubleshooting quick map
+
+- `TARGET_NOT_FOUND`: the selected alias is unknown or the remote pane selector no longer resolves; verify `ZELLIJ_MCP_TARGETS`, the session name, and whether the pane still exists
+- `CAPTURE_FAILED`: the handle exists but the capture path degraded; retry with the same handle, then use `zellij_list` to revalidate ownership before assuming the pane is gone
+- `PLUGIN_NOT_READY`: the host is reachable but RPC preconditions are missing; distinguish helper-client absence, RPC-not-ready drift, and manual plugin approval before retrying
+- `ZJCTL_UNAVAILABLE`: the transport or remote binary path is the problem; verify SSH reachability, native remote install, and that `zjctl` / `zellij` resolve in the non-interactive remote PATH
 
 ## More detail
 

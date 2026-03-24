@@ -2,10 +2,11 @@ use serde_json::Value;
 
 use crate::domain::errors::{DomainError, ErrorCode};
 use crate::domain::requests::{
-    AttachRequest, CaptureRequest, CloseRequest, DiscoverRequest, ListRequest, SendRequest,
-    SpawnRequest, WaitRequest,
+    AttachRequest, CaptureRequest, CleanupRequest, CloseRequest, DiscoverRequest, LayoutRequest,
+    ListRequest, ReplaceRequest, SendRequest, SpawnRequest, TakeoverRequest, WaitRequest,
 };
 use crate::domain::status::CaptureMode;
+use crate::server::daemon_identity_json;
 use crate::services::TerminalManager;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,7 +15,7 @@ pub struct ToolDefinition {
     pub description: &'static str,
 }
 
-pub const TOOL_DEFINITIONS: [ToolDefinition; 8] = [
+pub const TOOL_DEFINITIONS: [ToolDefinition; 12] = [
     ToolDefinition {
         name: "zellij_spawn",
         description: "Create a managed Zellij execution target.",
@@ -24,12 +25,20 @@ pub const TOOL_DEFINITIONS: [ToolDefinition; 8] = [
         description: "Attach an existing Zellij pane to daemon management.",
     },
     ToolDefinition {
+        name: "zellij_takeover",
+        description: "Search and attach an existing Zellij pane in one step.",
+    },
+    ToolDefinition {
         name: "zellij_discover",
         description: "Discover live Zellij panes before attaching.",
     },
     ToolDefinition {
         name: "zellij_send",
         description: "Send input to a managed pane.",
+    },
+    ToolDefinition {
+        name: "zellij_replace",
+        description: "Cooperatively reuse a managed shell-like pane for a new command.",
     },
     ToolDefinition {
         name: "zellij_wait",
@@ -46,6 +55,14 @@ pub const TOOL_DEFINITIONS: [ToolDefinition; 8] = [
     ToolDefinition {
         name: "zellij_list",
         description: "List known managed Zellij handles.",
+    },
+    ToolDefinition {
+        name: "zellij_layout",
+        description: "Inspect tabs and panes grouped by layout.",
+    },
+    ToolDefinition {
+        name: "zellij_cleanup",
+        description: "Clean up persisted stale or closed pane state.",
     },
 ];
 
@@ -71,7 +88,7 @@ impl McpServer {
     }
 
     pub fn execute_tool(&self, name: &str, arguments: Value) -> Result<Value, DomainError> {
-        match name {
+        let response = match name {
             "zellij_spawn" => {
                 let request: SpawnRequest = serde_json::from_value(arguments).map_err(|error| {
                     DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
@@ -87,6 +104,16 @@ impl McpServer {
                         DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
                     })?;
                 let response = self.terminal_manager.attach(request)?;
+                serde_json::to_value(response).map_err(|error| {
+                    DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
+                })
+            }
+            "zellij_takeover" => {
+                let request: TakeoverRequest =
+                    serde_json::from_value(arguments).map_err(|error| {
+                        DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
+                    })?;
+                let response = self.terminal_manager.takeover(request)?;
                 serde_json::to_value(response).map_err(|error| {
                     DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
                 })
@@ -120,11 +147,41 @@ impl McpServer {
                     DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
                 })
             }
+            "zellij_layout" => {
+                let request: LayoutRequest =
+                    serde_json::from_value(arguments).map_err(|error| {
+                        DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
+                    })?;
+                let response = self.terminal_manager.layout(request)?;
+                serde_json::to_value(response).map_err(|error| {
+                    DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
+                })
+            }
+            "zellij_cleanup" => {
+                let request: CleanupRequest =
+                    serde_json::from_value(arguments).map_err(|error| {
+                        DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
+                    })?;
+                let response = self.terminal_manager.cleanup(request)?;
+                serde_json::to_value(response).map_err(|error| {
+                    DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
+                })
+            }
             "zellij_send" => {
                 let request: SendRequest = serde_json::from_value(arguments).map_err(|error| {
                     DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
                 })?;
                 let response = self.terminal_manager.send(request)?;
+                serde_json::to_value(response).map_err(|error| {
+                    DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
+                })
+            }
+            "zellij_replace" => {
+                let request: ReplaceRequest =
+                    serde_json::from_value(arguments).map_err(|error| {
+                        DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
+                    })?;
+                let response = self.terminal_manager.replace(request)?;
                 serde_json::to_value(response).map_err(|error| {
                     DomainError::new(ErrorCode::InvalidArgument, error.to_string(), false)
                 })
@@ -152,8 +209,17 @@ impl McpServer {
                 format!("unsupported tool `{name}`"),
                 false,
             )),
-        }
+        }?;
+
+        Ok(attach_daemon_identity(response))
     }
+}
+
+fn attach_daemon_identity(mut response: Value) -> Value {
+    if let Some(object) = response.as_object_mut() {
+        object.insert("_daemon".to_string(), daemon_identity_json());
+    }
+    response
 }
 
 impl Default for ToolDefinition {
@@ -190,6 +256,39 @@ impl TerminalManager for NoopTerminalManager {
         &self,
         _request: AttachRequest,
     ) -> Result<crate::domain::responses::AttachResponse, DomainError> {
+        Err(DomainError::new(
+            ErrorCode::InvalidArgument,
+            "terminal manager is not configured",
+            false,
+        ))
+    }
+
+    fn takeover(
+        &self,
+        _request: TakeoverRequest,
+    ) -> Result<crate::domain::responses::TakeoverResponse, DomainError> {
+        Err(DomainError::new(
+            ErrorCode::InvalidArgument,
+            "terminal manager is not configured",
+            false,
+        ))
+    }
+
+    fn cleanup(
+        &self,
+        _request: CleanupRequest,
+    ) -> Result<crate::domain::responses::CleanupResponse, DomainError> {
+        Err(DomainError::new(
+            ErrorCode::InvalidArgument,
+            "terminal manager is not configured",
+            false,
+        ))
+    }
+
+    fn layout(
+        &self,
+        _request: LayoutRequest,
+    ) -> Result<crate::domain::responses::LayoutResponse, DomainError> {
         Err(DomainError::new(
             ErrorCode::InvalidArgument,
             "terminal manager is not configured",
@@ -241,6 +340,17 @@ impl TerminalManager for NoopTerminalManager {
         ))
     }
 
+    fn replace(
+        &self,
+        _request: ReplaceRequest,
+    ) -> Result<crate::domain::responses::ReplaceResponse, DomainError> {
+        Err(DomainError::new(
+            ErrorCode::InvalidArgument,
+            "terminal manager is not configured",
+            false,
+        ))
+    }
+
     fn wait(
         &self,
         _request: WaitRequest,
@@ -272,12 +382,14 @@ mod tests {
     use crate::domain::errors::DomainError;
     use crate::domain::observation::CaptureResult;
     use crate::domain::requests::{
-        AttachRequest, CaptureRequest, CloseRequest, DiscoverRequest, ListRequest, SendRequest,
-        SpawnRequest, WaitRequest,
+        AttachRequest, CaptureRequest, CleanupRequest, CloseRequest, DiscoverRequest,
+        LayoutRequest, ListRequest, ReplaceRequest, SendRequest, SpawnRequest, TakeoverRequest,
+        WaitRequest,
     };
     use crate::domain::responses::{
-        AttachResponse, CaptureResponse, CloseResponse, DiscoverCandidate, DiscoverResponse,
-        ListResponse, SendResponse, SpawnResponse, WaitResponse,
+        AttachResponse, CaptureResponse, CleanupResponse, CloseResponse, DiscoverCandidate,
+        DiscoverResponse, LayoutResponse, LayoutTab, ListResponse, ReplaceResponse, SendResponse,
+        SpawnResponse, TakeoverResponse, WaitResponse,
     };
     use crate::domain::status::{BindingSource, SpawnTarget, TerminalStatus};
     use crate::services::TerminalManager;
@@ -305,6 +417,47 @@ mod tests {
                 target_id: "local".to_string(),
                 attached: true,
                 baseline_established: true,
+            })
+        }
+
+        fn takeover(&self, _request: TakeoverRequest) -> Result<TakeoverResponse, DomainError> {
+            Ok(TakeoverResponse {
+                handle: "zh_test".to_string(),
+                target_id: "local".to_string(),
+                attached: true,
+                baseline_established: true,
+                matched_selector: "id:terminal:7".to_string(),
+            })
+        }
+
+        fn cleanup(&self, _request: CleanupRequest) -> Result<CleanupResponse, DomainError> {
+            Ok(CleanupResponse {
+                removed_handles: vec!["zh_cleanup".to_string()],
+                removed_count: 1,
+                dry_run: false,
+            })
+        }
+
+        fn layout(&self, _request: LayoutRequest) -> Result<LayoutResponse, DomainError> {
+            Ok(LayoutResponse {
+                target_id: "local".to_string(),
+                session_name: "gpu".to_string(),
+                tabs: vec![LayoutTab {
+                    tab_name: "editor".to_string(),
+                    panes: vec![DiscoverCandidate {
+                        target_id: "local".to_string(),
+                        selector: "id:terminal:7".to_string(),
+                        pane_id: Some("terminal:7".to_string()),
+                        session_name: "gpu".to_string(),
+                        tab_name: Some("editor".to_string()),
+                        title: Some("editor".to_string()),
+                        command: Some("fish".to_string()),
+                        focused: false,
+                        preview: None,
+                        preview_basis: None,
+                        captured_at: None,
+                    }],
+                }],
             })
         }
 
@@ -353,10 +506,17 @@ mod tests {
                     mode: "full".to_string(),
                     content: "hello".to_string(),
                     tail_lines: None,
+                    line_offset: None,
+                    line_limit: None,
                     line_window_applied: false,
+                    next_cursor: None,
+                    ansi_normalized: false,
                     truncated: false,
                     captured_at: chrono::Utc::now(),
                     baseline: None,
+                    interaction_id: None,
+                    interaction_completed: None,
+                    interaction_exit_code: None,
                 },
             })
         }
@@ -368,11 +528,23 @@ mod tests {
             })
         }
 
+        fn replace(&self, _request: ReplaceRequest) -> Result<ReplaceResponse, DomainError> {
+            Ok(ReplaceResponse {
+                handle: "zh_test".to_string(),
+                replaced: true,
+                interaction_id: Some("zi_test".to_string()),
+            })
+        }
+
         fn wait(&self, _request: WaitRequest) -> Result<WaitResponse, DomainError> {
             Ok(WaitResponse {
                 handle: "zh_test".to_string(),
                 status: "idle".to_string(),
                 observed_at: chrono::Utc::now(),
+                completion_basis: None,
+                interaction_id: None,
+                interaction_completed: None,
+                interaction_exit_code: None,
             })
         }
 
@@ -398,12 +570,16 @@ mod tests {
             vec![
                 "zellij_spawn",
                 "zellij_attach",
+                "zellij_takeover",
                 "zellij_discover",
                 "zellij_send",
+                "zellij_replace",
                 "zellij_wait",
                 "zellij_capture",
                 "zellij_close",
                 "zellij_list",
+                "zellij_layout",
+                "zellij_cleanup",
             ]
         );
     }
@@ -426,6 +602,7 @@ mod tests {
 
         assert_eq!(response["handle"], "zh_test");
         assert_eq!(response["attached"], true);
+        assert_eq!(response["_daemon"]["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
@@ -446,6 +623,7 @@ mod tests {
 
         assert_eq!(response["candidates"][0]["selector"], "id:terminal:7");
         assert_eq!(response["candidates"][0]["command"], "fish");
+        assert_eq!(response["_daemon"]["package"], env!("CARGO_PKG_NAME"));
     }
 
     #[test]

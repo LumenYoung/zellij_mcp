@@ -153,8 +153,9 @@ That router should:
 ### Target Resolution Rules
 
 - missing `target` means local
-- explicit `target` selects configured SSH target alias
-- unknown `target` returns a stable target-configuration error
+- explicit `target` selects an SSH target alias and is canonicalized to `ssh:<alias>`
+- alias-only defaults make ordinary aliases work without predeclaring per-host binary paths
+- transport or readiness failures are reported during remote preflight if the alias cannot actually be reached or prepared
 
 ## Target Configuration
 
@@ -163,6 +164,7 @@ Transport details should stay in daemon-side config, not in tool requests.
 The request should only say:
 
 - `target: "a100"`
+- the alias can be bare, and the daemon resolves it canonically to `ssh:a100`
 
 The daemon-side target config owns things like:
 
@@ -175,17 +177,34 @@ Current `ZELLIJ_MCP_TARGETS` shape:
 
 ```json
 {
-  "a100": {
-    "host": "a100",
-    "remote_zjctl_bin": "/home/jiaye.yang/.local/bin/zjctl",
-    "remote_zellij_bin": "/home/jiaye.yang/.local/bin/zellij",
+  "defaults": {
+    "remote_zjctl_bin": "zjctl",
+    "remote_zellij_bin": "zellij",
     "remote_env": {
-      "ZELLIJ_SESSION_NAME": "a100"
+      "ZELLIJ_SESSION_NAME": "remote"
     },
     "ssh_options": ["-o", "BatchMode=yes"]
+  },
+  "overrides": {
+    "aws": {
+      "host": "aws",
+      "remote_env": {
+        "ZELLIJ_SESSION_NAME": "aws"
+      }
+    },
+    "a100": {
+      "host": "a100",
+      "remote_env": {
+        "ZELLIJ_SESSION_NAME": "a100"
+      }
+    }
   }
 }
 ```
+
+The daemon parses that layered shape into per-target `SshTargetConfig` values, then applies alias-specific partial overrides on top of the shared defaults.
+
+This keeps ordinary hosts from needing per-host binary paths when the tools already live in standard locations or in `~/.local/bin`. Bare aliases therefore do not need to be predeclared unless you want to override the shared defaults for a particular host.
 
 Current code parses that shape into `SshTargetConfig` with these fields:
 
@@ -199,22 +218,34 @@ The local backend is configured separately through the normal local daemon env s
 
 ## Readiness And Bootstrap
 
-The current implementation does not yet run a separate readiness or bootstrap phase before each routed request.
+The implementation now performs remote readiness checks before it routes SSH-backed work.
 
-The intended seam is still:
+The readiness model is intentionally narrow and bounded:
 
-- `resolve_target(target_id)`
-- `check_ready(target_id)`
-- later `bootstrap_if_needed(target_id)`
+- `Ready`: the target already has what it needs for the current request
+- `AutoFixable`: the daemon can safely apply bounded remediation and try again
+- `ManualActionRequired`: a human still has to take action before the target can proceed
 
-Readiness should cover at least:
+In operator-facing language, that last state is the manual-action-required path.
 
-- SSH connectivity
-- `zellij` availability
-- `zjctl` availability
-- plugin RPC health
+Remote probing and execution already normalize the remote HOME and PATH. When non-interactive SSH is missing it, the daemon prepends `$HOME/.local/bin` before concluding that `zellij` or `zjctl` are unavailable.
 
-For now, bootstrap remains helper-script driven. Automatic install can remain deferred until packaging and release distribution are stable.
+Auto-fix stays safe and bounded. It can install the `zjctl` plugin when `zjctl` is already resolvable, start a detached helper client when that is the missing precondition, and retry readiness exactly once.
+
+The daemon does not try to force through unmanaged interactive approval prompts. Those stay in `ManualActionRequired` until a person approves them in the remote Zellij session.
+
+Remote `zjctl` RPC still depends on a connected Zellij client. If the host is otherwise healthy but still needs a helper client, the daemon treats that as a bounded auto-fixable condition. If the host needs unmanaged plugin approval, the daemon stops at `ManualActionRequired` instead of guessing.
+
+The practical meaning of the states is:
+
+- `Ready`: proceed with the routed SSH request
+- `AutoFixable`: apply safe remediation, then retry the same bounded probe or request
+- `ManualActionRequired`: stop and tell the user what still needs human input
+
+The daemon now also surfaces freshness metadata in two places that matter operationally:
+
+- startup stderr logs include daemon instance id, version, build stamp, pid, and start time
+- every successful response and every MCP error payload includes daemon identity so a stale local process is obvious during debugging
 
 ## Practical Findings From `a100`
 
@@ -223,9 +254,10 @@ Validated facts from the current real-host experiments:
 - `ssh a100` works in non-interactive batch mode
 - copied local Linux binaries can fail on remote glibc mismatch
 - native user-space rebuild on the remote host solves that compatibility issue
+- `~/.local/bin` is a useful remote install location because the daemon now prepends it for non-interactive SSH probing and execution when it is otherwise missing from `PATH`
 - `zjctl` plugin RPC can require a connected Zellij client on a headless host
 - a detached user-space `tmux` helper client was sufficient to make RPC healthy on `a100`
-- once the remote host was ready, wrapper-backed remote MCP operations succeeded
+- once the remote host was ready, alias-only remote MCP operations succeeded
 - preview-enabled discover now degrades cleanly instead of failing the whole tool on pane capture issues
 
 These findings affect backend readiness and bootstrap design, but they do not change the single-daemon routing decision.
@@ -244,7 +276,7 @@ These findings affect backend readiness and bootstrap design, but they do not ch
 
 - remote operations pay SSH overhead per operation in step 1
 - alias stability is assumed; if that changes later, we may want a target fingerprint safeguard
-- remote readiness/bootstrap remains operationally non-trivial on some hosts
+- remote readiness and any remaining manual-action-required steps remain operationally non-trivial on some hosts
 
 ### When We Would Revisit Backend Strategy
 
@@ -271,20 +303,24 @@ Implemented:
 - return `TARGET_NOT_FOUND` for unknown configured targets
 - support backward-compatible registry loads where older bindings omitted `target_id`
 - parse `ZELLIJ_MCP_TARGETS` into per-target SSH backend configs at startup
+- classify readiness as `Ready`, `AutoFixable`, or `ManualActionRequired`
+- perform bounded safe remediation before retrying a remote probe or request
+- preserve handle semantics so follow-up operations stay routed by the stored binding, not by request-time `target`
+- preload persisted remote target ids on startup and revalidate remote bindings through the backend factory after restart
+- return daemon freshness metadata on every successful MCP response and inside MCP error payloads
+- degrade remote spawn and discover follow-up uncertainty to recoverable `busy` / metadata-only outcomes instead of losing ownership or failing the whole discover call
 
-Still not implemented:
+Still manual when the host needs it:
 
-- proactive readiness checks before remote operations
-- automatic remote bootstrap/install when required binaries are missing
-- a dedicated end-to-end SSH integration test harness in CI
+- unmanaged interactive plugin approval prompts
+- any other remote action that cannot be resolved safely without a human session on the target host
 
 ## Practical Smoke Workflow
 
-1. Prepare the remote host with `./scripts/zellij-mcp-bootstrap-ssh <alias> --session <session>` if needed.
-2. Start the local daemon with `ZELLIJ_MCP_TARGETS` configured for that alias.
-3. Call one of the selection tools with `target: "<alias>"`, for example `zellij_discover` or `zellij_attach`.
-4. Confirm the response carries `target_id: "ssh:<alias>"`.
-5. Follow with `zellij_capture`, `zellij_wait`, `zellij_send`, or `zellij_close` using only the returned handle.
+1. Start the local daemon with `ZELLIJ_MCP_TARGETS` configured using `defaults` and any alias overrides you need.
+2. Call one of the selection tools with `target: "<alias>"`, for example `zellij_discover` or `zellij_attach`.
+3. Confirm the response carries `target_id: "ssh:<alias>"`.
+4. Follow with `zellij_capture`, `zellij_wait`, `zellij_send`, or `zellij_close` using only the returned handle.
 
 Example remote discover request:
 
@@ -301,9 +337,11 @@ Expected behavior:
 - the request is routed by the local daemon to the SSH-backed backend
 - returned candidates or handles use canonical `target_id` values such as `ssh:a100`
 - follow-up handle operations no longer need `target`
+- remote HOME and PATH normalization happens before the non-interactive probe or execution path if the environment needs it
+- `~/.local/bin` is included automatically when the daemon has to make the remote environment usable
 
 ## Operational Helpers
 
-- `scripts/zellij-mcp-bootstrap-ssh` remains the main user-space bootstrap path for remote hosts
+- `scripts/zellij-mcp-bootstrap-ssh` remains useful as a user-space helper for remote setup and recovery
 - `scripts/zellij-mcp-ssh` remains useful for fallback or smoke comparisons against the older wrapper-based flow
 - neither helper is the primary interface contract for normal single-MCP usage

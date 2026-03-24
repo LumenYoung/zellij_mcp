@@ -11,10 +11,10 @@ use serde_json::json;
 
 use crate::domain::errors::{DomainError, ErrorCode};
 use crate::domain::requests::{
-    AttachRequest, CaptureRequest, CloseRequest, DiscoverRequest, ListRequest, SendRequest,
-    SpawnRequest, WaitRequest,
+    AttachRequest, CaptureRequest, CleanupRequest, CloseRequest, DiscoverRequest, ListRequest,
+    LayoutRequest, ReplaceRequest, SendRequest, SpawnRequest, TakeoverRequest, WaitRequest,
 };
-use crate::server::McpServer;
+use crate::server::{McpServer, daemon_identity, daemon_identity_json};
 
 #[derive(Clone)]
 pub struct RmcpServer {
@@ -47,6 +47,14 @@ impl RmcpServer {
         self.execute("zellij_attach", request)
     }
 
+    #[tool(description = "Search and attach an existing Zellij pane in one step.")]
+    fn zellij_takeover(
+        &self,
+        Parameters(request): Parameters<TakeoverRequest>,
+    ) -> Result<String, ErrorData> {
+        self.execute("zellij_takeover", request)
+    }
+
     #[tool(description = "Discover live Zellij panes before attaching.")]
     fn zellij_discover(
         &self,
@@ -61,6 +69,14 @@ impl RmcpServer {
         Parameters(request): Parameters<SendRequest>,
     ) -> Result<String, ErrorData> {
         self.execute("zellij_send", request)
+    }
+
+    #[tool(description = "Cooperatively reuse a managed shell-like pane for a new command.")]
+    fn zellij_replace(
+        &self,
+        Parameters(request): Parameters<ReplaceRequest>,
+    ) -> Result<String, ErrorData> {
+        self.execute("zellij_replace", request)
     }
 
     #[tool(description = "Wait for a managed pane to become idle.")]
@@ -95,6 +111,22 @@ impl RmcpServer {
         self.execute("zellij_list", request)
     }
 
+    #[tool(description = "Inspect tabs and panes grouped by layout.")]
+    fn zellij_layout(
+        &self,
+        Parameters(request): Parameters<LayoutRequest>,
+    ) -> Result<String, ErrorData> {
+        self.execute("zellij_layout", request)
+    }
+
+    #[tool(description = "Clean up persisted stale or closed pane state.")]
+    fn zellij_cleanup(
+        &self,
+        Parameters(request): Parameters<CleanupRequest>,
+    ) -> Result<String, ErrorData> {
+        self.execute("zellij_cleanup", request)
+    }
+
     fn execute<T>(&self, tool_name: &str, request: T) -> Result<String, ErrorData>
     where
         T: Serialize,
@@ -105,6 +137,7 @@ impl RmcpServer {
             .inner
             .execute_tool(tool_name, arguments)
             .map_err(mcp_error_from_domain)?;
+        let response = attach_daemon_identity(response);
 
         serde_json::to_string_pretty(&response)
             .map_err(|error| ErrorData::internal_error(error.to_string(), None))
@@ -117,12 +150,20 @@ impl RmcpServer {
     }
 }
 
+fn attach_daemon_identity(mut response: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = response.as_object_mut() {
+        object.insert("_daemon".to_string(), daemon_identity_json());
+    }
+    response
+}
+
 fn mcp_error_from_domain(error: DomainError) -> ErrorData {
     let code = serialized_domain_code(&error.code);
     let data = json!({
         "code": code,
         "message": error.message,
         "retryable": error.retryable,
+        "daemon": daemon_identity_json(),
     });
 
     match error.code {
@@ -146,8 +187,17 @@ fn serialized_domain_code(code: &ErrorCode) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::mcp_error_from_domain;
+    use super::{attach_daemon_identity, mcp_error_from_domain};
     use crate::domain::errors::{DomainError, ErrorCode};
+    use serde_json::json;
+
+    #[test]
+    fn attaches_daemon_identity_to_successful_responses() {
+        let response = attach_daemon_identity(json!({"ok": true}));
+
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["_daemon"]["package"], env!("CARGO_PKG_NAME"));
+    }
 
     #[test]
     fn preserves_stable_domain_code_in_mcp_error_data() {
@@ -156,9 +206,11 @@ mod tests {
             "missing handle",
             false,
         ));
+        let data = error.data.expect("error data");
 
         assert_eq!(error.message, "HANDLE_NOT_FOUND");
-        assert_eq!(error.data.expect("error data")["code"], "HANDLE_NOT_FOUND");
+        assert_eq!(data["code"], "HANDLE_NOT_FOUND");
+        assert_eq!(data["daemon"]["package"], env!("CARGO_PKG_NAME"));
     }
 }
 
@@ -166,6 +218,13 @@ mod tests {
 impl ServerHandler for RmcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Managed Zellij daemon tools exposed over MCP stdio.".to_string())
+            .with_instructions(format!(
+                "Managed Zellij daemon tools exposed over MCP stdio. daemon={} version={} build_stamp={} pid={} started_at={}",
+                daemon_identity().instance_id,
+                daemon_identity().version,
+                daemon_identity().build_stamp,
+                daemon_identity().process_id,
+                daemon_identity().started_at.to_rfc3339(),
+            ))
     }
 }

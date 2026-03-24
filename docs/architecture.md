@@ -68,6 +68,7 @@ Services own business semantics:
 - spawn vs attach behavior
 - discover vs attach behavior
 - command boundary resets
+- explicit interaction markers for daemon-submitted shell commands on supported shell-like panes
 - delta and current capture behavior
 - stale target revalidation
 - per-handle serialization
@@ -95,6 +96,8 @@ For SSH-backed deployment, the important boundary is still the same: `zjctl` and
 ### Persistence
 
 Persistence stores lightweight daemon state in JSON files under a local state directory. The daemon persists bindings and capture metadata, then revalidates them against live Zellij state on startup.
+
+For supported shell-like panes, observations can now also persist an explicit interaction id plus completion metadata for the most recent daemon-submitted shell interaction. That lets `capture(current)` prefer explicit interaction output and lets `wait` report stronger completion evidence than idle-only polling when the marker is present.
 
 Spawn lifecycle detail:
 
@@ -181,7 +184,7 @@ The current implementation now special-cases repaint-heavy captures for `current
 
 The daemon now also supports a small named-key layer for common control sequences such as arrows, escape, tab, enter, backspace, and ctrl-c by translating them to terminal byte sequences before dispatch.
 
-`capture` also supports optional line-window shaping through `tail_lines`. This clips the already-computed `full`, `delta`, or `current` result before it is returned, while observation baselines continue to update from the untrimmed full snapshot.
+`capture` also supports optional post-selection output shaping. `tail_lines` keeps the existing recent-lines clip, while `line_offset`, `line_limit`, and `cursor` now provide resumable forward line windows over the already-computed `full` or `current` result. `delta` intentionally rejects that forward paging path because the daemon still advances delta baselines after each capture and therefore does not persist a snapshot-stable cursor stream there. Optional ANSI stripping happens on that semantic output just before line windowing, while observation baselines continue to update from the unmodified full snapshot.
 
 ## Persistence and Recovery
 
@@ -196,6 +199,7 @@ On startup the daemon:
 2. validates each binding against live Zellij state via the adapter
 3. restores valid bindings
 4. marks missing targets as stale
+5. emits daemon freshness metadata to stderr and preloads persisted remote target ids so remote bindings can revalidate deterministically after restart
 
 ## Concurrency Model
 
@@ -225,7 +229,9 @@ The daemon returns stable domain errors rather than backend-specific command out
 - `PLUGIN_NOT_READY`
 - `PERSISTENCE_ERROR`
 
-`PLUGIN_NOT_READY` should cover cases where `zjctl` is installed but the target session has not yet approved or loaded the plugin.
+`PLUGIN_NOT_READY` should cover cases where `zjctl` is installed but the target session still lacks RPC readiness. In practice that includes manual plugin approval, helper-client absence, and post-start RPC drift.
+
+Successful MCP responses now also carry `_daemon` identity metadata, and MCP error payloads carry the same daemon identity under `data.daemon`, so stale binaries and mixed-instance reports can be diagnosed without guessing.
 
 ## Validation Plan
 
