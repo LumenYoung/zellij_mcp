@@ -11,8 +11,8 @@ use serde_json::json;
 
 use crate::domain::errors::{DomainError, ErrorCode};
 use crate::domain::requests::{
-    AttachRequest, CaptureRequest, CleanupRequest, CloseRequest, DiscoverRequest, ListRequest,
-    LayoutRequest, ReplaceRequest, SendRequest, SpawnRequest, TakeoverRequest, WaitRequest,
+    AttachRequest, CaptureRequest, CleanupRequest, CloseRequest, DiscoverRequest, LayoutRequest,
+    ListRequest, ReplaceRequest, SendRequest, SpawnRequest, TakeoverRequest, WaitRequest,
 };
 use crate::server::{McpServer, daemon_identity, daemon_identity_json};
 
@@ -185,6 +185,21 @@ fn serialized_domain_code(code: &ErrorCode) -> String {
         .unwrap_or_else(|| format!("{code:?}"))
 }
 
+#[tool_handler]
+impl ServerHandler for RmcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(format!(
+                "Managed Zellij daemon tools exposed over MCP stdio. daemon={} version={} build_stamp={} pid={} started_at={}",
+                daemon_identity().instance_id,
+                daemon_identity().version,
+                daemon_identity().build_stamp,
+                daemon_identity().process_id,
+                daemon_identity().started_at.to_rfc3339(),
+            ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{attach_daemon_identity, mcp_error_from_domain};
@@ -211,20 +226,5 @@ mod tests {
         assert_eq!(error.message, "HANDLE_NOT_FOUND");
         assert_eq!(data["code"], "HANDLE_NOT_FOUND");
         assert_eq!(data["daemon"]["package"], env!("CARGO_PKG_NAME"));
-    }
-}
-
-#[tool_handler]
-impl ServerHandler for RmcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(format!(
-                "Managed Zellij daemon tools exposed over MCP stdio. daemon={} version={} build_stamp={} pid={} started_at={}",
-                daemon_identity().instance_id,
-                daemon_identity().version,
-                daemon_identity().build_stamp,
-                daemon_identity().process_id,
-                daemon_identity().started_at.to_rfc3339(),
-            ))
     }
 }

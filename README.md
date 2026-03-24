@@ -1,6 +1,8 @@
-# zellij-skill
+# Zellij MCP
 
 Rust MCP daemon for safe agent interaction with Zellij panes through `zjctl`.
+
+Current release line: `0.1.0`
 
 ## What it provides
 

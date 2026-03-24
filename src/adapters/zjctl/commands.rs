@@ -140,7 +140,9 @@ mod tests {
                 command: vec!["lazygit".to_string()],
             }
             .args(),
-            vec!["pane", "launch", "--cwd", "/tmp", "--name", "editor", "--", "lazygit"]
+            vec![
+                "pane", "launch", "--cwd", "/tmp", "--name", "editor", "--", "lazygit"
+            ]
         );
     }
 

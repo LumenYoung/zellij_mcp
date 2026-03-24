@@ -3,8 +3,8 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use crate::adapters::zjctl::{
-    is_plugin_permission_prompt, is_rpc_not_ready_message, missing_binary_name, AdapterError,
-    ZjctlAdapter,
+    AdapterError, ZjctlAdapter, is_plugin_permission_prompt, is_rpc_not_ready_message,
+    missing_binary_name,
 };
 use crate::domain::binding::TerminalBinding;
 use crate::domain::errors::{DomainError, ErrorCode};
@@ -1021,10 +1021,9 @@ where
         if let Some((_, completed, exit_code)) = Self::interaction_capture_from_observation(
             observation.last_full_content.as_deref().unwrap_or(""),
             observation,
-        ) {
-            if completed {
-                observation.complete_interaction(exit_code, snapshot.captured_at);
-            }
+        ) && completed
+        {
+            observation.complete_interaction(exit_code, snapshot.captured_at);
         }
         self.write_observations(&observations)
     }
@@ -1299,7 +1298,7 @@ where
         binding.status = active.status;
         binding.updated_at = active.updated_at;
 
-        Self::ensure_binding_active(&binding)?;
+        Self::ensure_binding_active(binding)?;
 
         let snapshot = self.run_binding_operation_with_retry(
             &request.handle,
@@ -1367,10 +1366,10 @@ where
 
         let hash = Self::hash_content(&snapshot.content);
         observation.update_full_snapshot(snapshot.content, hash, snapshot.captured_at);
-        if let Some((_, completed, exit_code)) = explicit_interaction {
-            if completed {
-                observation.complete_interaction(exit_code, snapshot.captured_at);
-            }
+        if let Some((_, completed, exit_code)) = explicit_interaction
+            && completed
+        {
+            observation.complete_interaction(exit_code, snapshot.captured_at);
         }
         let interaction_id = observation.interaction_id.clone();
         let interaction_completed = observation
@@ -1430,12 +1429,11 @@ where
             None
         };
 
-        if let Some(interaction_id) = interaction_id.as_deref() {
-            if let Some(wrapped) =
+        if let Some(interaction_id) = interaction_id.as_deref()
+            && let Some(wrapped) =
                 Self::build_wrapped_submit_payload(&binding, &request.text, interaction_id)
-            {
-                payload = wrapped;
-            }
+        {
+            payload = wrapped;
         }
         if clear_attached_input {
             payload.insert(0, '\u{15}');
@@ -1730,21 +1728,19 @@ where
         if let Some(observation) = observations
             .iter_mut()
             .find(|item| item.handle == request.handle)
-        {
-            if let Some((_, completed, exit_code)) =
+            && let Some((_, completed, exit_code)) =
                 Self::interaction_capture_from_observation(&snapshot.content, observation)
-            {
-                interaction_id = observation.interaction_id.clone();
-                interaction_completed = Some(completed);
-                interaction_exit_code = exit_code;
-                if completed {
-                    observation.complete_interaction(exit_code, snapshot.captured_at);
-                    completion_basis = Some("interaction_marker".to_string());
-                }
-                let hash = Self::hash_content(&snapshot.content);
-                observation.update_full_snapshot(snapshot.content, hash, snapshot.captured_at);
-                self.write_observations(&observations)?;
+        {
+            interaction_id = observation.interaction_id.clone();
+            interaction_completed = Some(completed);
+            interaction_exit_code = exit_code;
+            if completed {
+                observation.complete_interaction(exit_code, snapshot.captured_at);
+                completion_basis = Some("interaction_marker".to_string());
             }
+            let hash = Self::hash_content(&snapshot.content);
+            observation.update_full_snapshot(snapshot.content, hash, snapshot.captured_at);
+            self.write_observations(&observations)?;
         }
 
         Ok(WaitResponse {
@@ -1848,12 +1844,12 @@ fn map_key_sequence(key: &str) -> Result<String, DomainError> {
         "f11" => "\u{1b}[23~".to_string(),
         "f12" => "\u{1b}[24~".to_string(),
         other => {
-            if let Some(chord) = other.strip_prefix("ctrl_") {
-                if chord.len() == 1 {
-                    let byte = chord.as_bytes()[0];
-                    if byte.is_ascii_lowercase() {
-                        return Ok(((byte - b'a' + 1) as char).to_string());
-                    }
+            if let Some(chord) = other.strip_prefix("ctrl_")
+                && chord.len() == 1
+            {
+                let byte = chord.as_bytes()[0];
+                if byte.is_ascii_lowercase() {
+                    return Ok(((byte - b'a' + 1) as char).to_string());
                 }
             }
 
@@ -3311,9 +3307,11 @@ mod tests {
             .expect("submit_line mode should succeed");
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
-        assert!(sent[0]
-            .0
-            .starts_with("\u{15}printf '__ZELLIJ_MCP_INTERACTION__:start:"));
+        assert!(
+            sent[0]
+                .0
+                .starts_with("\u{15}printf '__ZELLIJ_MCP_INTERACTION__:start:")
+        );
         assert!(sent[0].0.contains("echo ok"));
         assert!(sent[0].0.contains("__ZELLIJ_MCP_INTERACTION__:end:"));
         assert!(sent[0].1);
@@ -3396,9 +3394,11 @@ mod tests {
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
         assert_eq!(sent.len(), 1);
-        assert!(sent[0]
-            .0
-            .starts_with("\u{15}printf '__ZELLIJ_MCP_INTERACTION__:start:"));
+        assert!(
+            sent[0]
+                .0
+                .starts_with("\u{15}printf '__ZELLIJ_MCP_INTERACTION__:start:")
+        );
         assert!(sent[0].0.contains("echo hello"));
         assert!(sent[0].0.contains("__ZELLIJ_MCP_INTERACTION__:end:"));
         assert!(sent[0].1);
@@ -3444,9 +3444,11 @@ mod tests {
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
         assert_eq!(sent.len(), 1);
-        assert!(sent[0]
-            .0
-            .starts_with("printf '__ZELLIJ_MCP_INTERACTION__:start:"));
+        assert!(
+            sent[0]
+                .0
+                .starts_with("printf '__ZELLIJ_MCP_INTERACTION__:start:")
+        );
         assert!(sent[0].0.contains("echo hello"));
         assert!(sent[0].0.contains("__ZELLIJ_MCP_INTERACTION__:end:"));
         assert!(sent[0].1);
@@ -3666,16 +3668,20 @@ mod tests {
             .expect_err("spawn should fail on fatal wait error");
 
         assert_eq!(error.code, ErrorCode::WaitFailed);
-        assert!(service
-            .registry_store
-            .load()
-            .expect("bindings should load")
-            .is_empty());
-        assert!(service
-            .observation_store
-            .load()
-            .expect("observations should load")
-            .is_empty());
+        assert!(
+            service
+                .registry_store
+                .load()
+                .expect("bindings should load")
+                .is_empty()
+        );
+        assert!(
+            service
+                .observation_store
+                .load()
+                .expect("observations should load")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3700,16 +3706,20 @@ mod tests {
             .expect_err("spawn should fail on fatal post-launch target loss");
 
         assert_eq!(error.code, ErrorCode::TargetStale);
-        assert!(service
-            .registry_store
-            .load()
-            .expect("bindings should load")
-            .is_empty());
-        assert!(service
-            .observation_store
-            .load()
-            .expect("observations should load")
-            .is_empty());
+        assert!(
+            service
+                .registry_store
+                .load()
+                .expect("bindings should load")
+                .is_empty()
+        );
+        assert!(
+            service
+                .observation_store
+                .load()
+                .expect("observations should load")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3733,16 +3743,20 @@ mod tests {
             .expect_err("spawn should fail on fatal revalidation error");
 
         assert_eq!(error.code, ErrorCode::AttachFailed);
-        assert!(service
-            .registry_store
-            .load()
-            .expect("bindings should load")
-            .is_empty());
-        assert!(service
-            .observation_store
-            .load()
-            .expect("observations should load")
-            .is_empty());
+        assert!(
+            service
+                .registry_store
+                .load()
+                .expect("bindings should load")
+                .is_empty()
+        );
+        assert!(
+            service
+                .observation_store
+                .load()
+                .expect("observations should load")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3967,9 +3981,11 @@ mod tests {
         assert!(response.accepted);
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
         assert_eq!(sent.len(), 1);
-        assert!(sent[0]
-            .0
-            .starts_with("printf '__ZELLIJ_MCP_INTERACTION__:start:"));
+        assert!(
+            sent[0]
+                .0
+                .starts_with("printf '__ZELLIJ_MCP_INTERACTION__:start:")
+        );
         assert!(sent[0].0.contains("echo retry"));
         assert!(sent[0].0.contains("__ZELLIJ_MCP_INTERACTION__:end:"));
     }
@@ -4003,9 +4019,11 @@ mod tests {
         assert!(response.interaction_id.is_some());
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[0].0, "\u{3}");
-        assert!(sent[1]
-            .0
-            .starts_with("\u{15}printf '__ZELLIJ_MCP_INTERACTION__:start:"));
+        assert!(
+            sent[1]
+                .0
+                .starts_with("\u{15}printf '__ZELLIJ_MCP_INTERACTION__:start:")
+        );
         assert!(sent[1].0.contains("echo swapped"));
     }
 

@@ -73,17 +73,17 @@ impl TargetRouter {
             return Ok(backend);
         }
 
-        if let Some(factory) = &self.remote_backend_factory {
-            if let Some(backend) = factory(target_id)? {
-                let mut backends = self
-                    .backends
-                    .write()
-                    .expect("router backend write lock should succeed");
-                return Ok(backends
-                    .entry(target_id.to_string())
-                    .or_insert_with(|| backend.clone())
-                    .clone());
-            }
+        if let Some(factory) = &self.remote_backend_factory
+            && let Some(backend) = factory(target_id)?
+        {
+            let mut backends = self
+                .backends
+                .write()
+                .expect("router backend write lock should succeed");
+            return Ok(backends
+                .entry(target_id.to_string())
+                .or_insert_with(|| backend.clone())
+                .clone());
         }
 
         Err(DomainError::new(
@@ -497,10 +497,12 @@ mod tests {
             *local_calls.lock().expect("calls lock should succeed"),
             vec![Call::Spawn(None)]
         );
-        assert!(remote_calls
-            .lock()
-            .expect("calls lock should succeed")
-            .is_empty());
+        assert!(
+            remote_calls
+                .lock()
+                .expect("calls lock should succeed")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -523,10 +525,12 @@ mod tests {
             .expect("attach should route to remote backend");
 
         assert_eq!(response.target_id, "ssh:a100");
-        assert!(local_calls
-            .lock()
-            .expect("calls lock should succeed")
-            .is_empty());
+        assert!(
+            local_calls
+                .lock()
+                .expect("calls lock should succeed")
+                .is_empty()
+        );
         assert_eq!(
             *remote_calls.lock().expect("calls lock should succeed"),
             vec![Call::Attach(Some("  a100  ".to_string()))]
@@ -554,10 +558,12 @@ mod tests {
             .expect("canonical target_id should route to remote backend");
 
         assert_eq!(response.candidates[0].target_id, "ssh:a100");
-        assert!(local_calls
-            .lock()
-            .expect("calls lock should succeed")
-            .is_empty());
+        assert!(
+            local_calls
+                .lock()
+                .expect("calls lock should succeed")
+                .is_empty()
+        );
         assert_eq!(
             *remote_calls.lock().expect("calls lock should succeed"),
             vec![Call::Discover(Some("ssh:a100".to_string()))]
@@ -584,10 +590,12 @@ mod tests {
             *local_calls.lock().expect("calls lock should succeed"),
             vec![Call::List(Some("   ".to_string()))]
         );
-        assert!(remote_calls
-            .lock()
-            .expect("calls lock should succeed")
-            .is_empty());
+        assert!(
+            remote_calls
+                .lock()
+                .expect("calls lock should succeed")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -642,10 +650,12 @@ mod tests {
             })
             .expect("close should route by binding target");
 
-        assert!(local_calls
-            .lock()
-            .expect("calls lock should succeed")
-            .is_empty());
+        assert!(
+            local_calls
+                .lock()
+                .expect("calls lock should succeed")
+                .is_empty()
+        );
         assert_eq!(
             *remote_calls.lock().expect("calls lock should succeed"),
             vec![
@@ -685,10 +695,12 @@ mod tests {
             .expect("alias-only target should lazily create remote backend");
 
         assert_eq!(discover_response.candidates[0].target_id, "ssh:a100");
-        assert!(local_calls
-            .lock()
-            .expect("calls lock should succeed")
-            .is_empty());
+        assert!(
+            local_calls
+                .lock()
+                .expect("calls lock should succeed")
+                .is_empty()
+        );
         assert_eq!(creation_count.load(Ordering::SeqCst), 1);
         assert_eq!(
             *remote_calls.lock().expect("calls lock should succeed"),
@@ -729,10 +741,12 @@ mod tests {
             .expect("alias-only attach should lazily create remote backend");
 
         assert_eq!(response.target_id, "ssh:a100");
-        assert!(local_calls
-            .lock()
-            .expect("calls lock should succeed")
-            .is_empty());
+        assert!(
+            local_calls
+                .lock()
+                .expect("calls lock should succeed")
+                .is_empty()
+        );
         assert_eq!(creation_count.load(Ordering::SeqCst), 1);
         assert_eq!(
             *remote_calls.lock().expect("calls lock should succeed"),
@@ -796,10 +810,12 @@ mod tests {
         assert_eq!(discover_response.candidates[0].target_id, "ssh:a100");
         assert_eq!(list_response.bindings.len(), 1);
         assert_eq!(list_response.bindings[0].target_id, "ssh:a100");
-        assert!(local_calls
-            .lock()
-            .expect("calls lock should succeed")
-            .is_empty());
+        assert!(
+            local_calls
+                .lock()
+                .expect("calls lock should succeed")
+                .is_empty()
+        );
         assert_eq!(creation_count.load(Ordering::SeqCst), 1);
         assert_eq!(
             *remote_calls.lock().expect("calls lock should succeed"),
@@ -867,10 +883,12 @@ mod tests {
             *local_calls.lock().expect("calls lock should succeed"),
             vec![Call::Capture("zh_legacy".to_string())]
         );
-        assert!(remote_calls
-            .lock()
-            .expect("calls lock should succeed")
-            .is_empty());
+        assert!(
+            remote_calls
+                .lock()
+                .expect("calls lock should succeed")
+                .is_empty()
+        );
     }
 
     #[test]

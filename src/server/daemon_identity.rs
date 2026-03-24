@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 static DAEMON_IDENTITY: OnceLock<DaemonIdentity> = OnceLock::new();
 

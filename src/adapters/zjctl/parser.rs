@@ -1,7 +1,7 @@
 use serde::Deserialize;
 
-use crate::adapters::zjctl::client::ResolvedTarget;
 use crate::adapters::zjctl::AdapterError;
+use crate::adapters::zjctl::client::ResolvedTarget;
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_single_selector(output: &str) -> Result<String, AdapterError> {

@@ -47,7 +47,11 @@ struct SshTargetOverride {
 }
 
 impl SshTargetOverride {
-    fn merge_with_defaults(&self, alias: &str, defaults: &AliasOnlyTargetDefaults) -> SshTargetConfig {
+    fn merge_with_defaults(
+        &self,
+        alias: &str,
+        defaults: &AliasOnlyTargetDefaults,
+    ) -> SshTargetConfig {
         let mut resolved = defaults.for_alias(alias);
 
         if let Some(host) = self.host.as_ref().filter(|host| !host.trim().is_empty()) {
@@ -340,19 +344,21 @@ async fn main() {
         let registry_store = registry_store.clone();
         let observation_store = observation_store.clone();
 
-        Box::new(move |target_id: &str| -> Result<Option<Arc<dyn TerminalManager>>, DomainError> {
-            let Some((target_id, config)) = target_configs.resolve_ssh_alias_target(target_id)
-            else {
-                return Ok(None);
-            };
+        Box::new(
+            move |target_id: &str| -> Result<Option<Arc<dyn TerminalManager>>, DomainError> {
+                let Some((target_id, config)) = target_configs.resolve_ssh_alias_target(target_id)
+                else {
+                    return Ok(None);
+                };
 
-            Ok(Some(build_remote_backend(
-                target_id,
-                &config,
-                &registry_store,
-                &observation_store,
-            )?))
-        })
+                Ok(Some(build_remote_backend(
+                    target_id,
+                    &config,
+                    &registry_store,
+                    &observation_store,
+                )?))
+            },
+        )
     };
 
     for target_id in persisted_remote_target_ids(&registry_store).unwrap_or_default() {
@@ -361,7 +367,9 @@ async fn main() {
                 backends.insert(target_id, backend);
             }
             Ok(None) => {
-                eprintln!("zellij_mcp startup skipped persisted target that is no longer configured");
+                eprintln!(
+                    "zellij_mcp startup skipped persisted target that is no longer configured"
+                );
             }
             Err(error) => {
                 eprintln!(
@@ -389,18 +397,18 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        build_remote_backend_with_classifier, build_remote_backend_with_classifier_and_remediation,
-        default_remote_zellij_bin, default_remote_zjctl_bin, load_target_configs,
-        map_remote_readiness_failure, parse_target_configs, persisted_remote_target_ids,
-        SshTargetOverride,
+        SshTargetOverride, build_remote_backend_with_classifier,
+        build_remote_backend_with_classifier_and_remediation, default_remote_zellij_bin,
+        default_remote_zjctl_bin, load_target_configs, map_remote_readiness_failure,
+        parse_target_configs, persisted_remote_target_ids,
     };
     use std::cell::{Cell, RefCell};
     use zellij_mcp::adapters::zjctl::SshTargetConfig;
     use zellij_mcp::adapters::zjctl::{SshBackendReadiness, SshReadinessFailure};
     use zellij_mcp::domain::binding::TerminalBinding;
     use zellij_mcp::domain::errors::ErrorCode;
-    use zellij_mcp::persistence::{ObservationStore, RegistryStore};
     use zellij_mcp::domain::status::{BindingSource, TerminalStatus};
+    use zellij_mcp::persistence::{ObservationStore, RegistryStore};
 
     #[test]
     fn parses_zellij_mcp_targets_alias_map_into_ssh_target_configs() {
@@ -770,7 +778,10 @@ mod tests {
             },
             |_, failure| {
                 remediation_calls.set(remediation_calls.get() + 1);
-                assert!(matches!(failure, SshReadinessFailure::HelperClientMissing { .. }));
+                assert!(matches!(
+                    failure,
+                    SshReadinessFailure::HelperClientMissing { .. }
+                ));
                 true
             },
         );

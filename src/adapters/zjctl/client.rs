@@ -366,10 +366,10 @@ fn resolve_existing_remote_binary(
             .and_then(|is_executable| is_executable.then(|| configured.to_string()));
     }
 
-    if let Some(normalized_path) = normalized_path {
-        if let Ok(Some(resolved)) = probe.command_v(normalized_path, configured) {
-            return Some(resolved);
-        }
+    if let Some(normalized_path) = normalized_path
+        && let Ok(Some(resolved)) = probe.command_v(normalized_path, configured)
+    {
+        return Some(resolved);
     }
 
     home.and_then(|home| {
@@ -1419,11 +1419,12 @@ mod tests {
     use crate::domain::status::SpawnTarget;
 
     use super::{
+        PreparedSpawn, RemoteProbe, RemoteRemediationRunner, ResolvedTarget, SshBackendReadiness,
+        SshReadinessFailure, SshTargetConfig,
         attempt_safe_ssh_readiness_remediation_with_probe_and_runner,
         classify_ssh_backend_readiness_with_probe, format_seconds, matches_selector, parse_command,
         prepare_spawn, resolve_new_tab_target, resolve_spawn_command,
-        resolve_ssh_runtime_config_with_probe, PreparedSpawn, RemoteProbe, RemoteRemediationRunner,
-        ResolvedTarget, SshBackendReadiness, SshReadinessFailure, SshTargetConfig,
+        resolve_ssh_runtime_config_with_probe,
     };
 
     #[derive(Default)]
@@ -1622,9 +1623,11 @@ mod tests {
 
         let error = resolve_spawn_command(&request).expect_err("mixed command forms should fail");
         assert!(matches!(error, AdapterError::ParseError(_)));
-        assert!(error
-            .to_string()
-            .contains("either `command` or `argv`, not both"));
+        assert!(
+            error
+                .to_string()
+                .contains("either `command` or `argv`, not both")
+        );
     }
 
     #[test]
@@ -1662,9 +1665,11 @@ mod tests {
 
         let error = resolve_spawn_command(&request).expect_err("empty argv should fail");
         assert!(matches!(error, AdapterError::ParseError(_)));
-        assert!(error
-            .to_string()
-            .contains("must contain at least one element"));
+        assert!(
+            error
+                .to_string()
+                .contains("must contain at least one element")
+        );
     }
 
     #[test]
@@ -1939,16 +1944,20 @@ mod tests {
             resolved.remote_zellij_bin,
             format!("{home}/.local/bin/zellij")
         );
-        assert!(probe
-            .calls
-            .borrow()
-            .iter()
-            .any(|call| call == &format!("command_v:zjctl:{normalized_path}")));
-        assert!(probe
-            .calls
-            .borrow()
-            .iter()
-            .any(|call| call == &format!("command_v:zellij:{normalized_path}")));
+        assert!(
+            probe
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == &format!("command_v:zjctl:{normalized_path}"))
+        );
+        assert!(
+            probe
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == &format!("command_v:zellij:{normalized_path}"))
+        );
     }
 
     #[test]
@@ -2147,16 +2156,20 @@ mod tests {
         );
 
         assert!(remediated);
-        assert!(runner
-            .commands
-            .borrow()
-            .iter()
-            .any(|command| command.contains("zellij-mcp-client-aws")));
-        assert!(runner
-            .commands
-            .borrow()
-            .iter()
-            .any(|command| command.contains("new-session -d -s")));
+        assert!(
+            runner
+                .commands
+                .borrow()
+                .iter()
+                .any(|command| command.contains("zellij-mcp-client-aws"))
+        );
+        assert!(
+            runner
+                .commands
+                .borrow()
+                .iter()
+                .any(|command| command.contains("new-session -d -s"))
+        );
     }
 
     #[test]
@@ -2203,15 +2216,19 @@ mod tests {
         );
 
         assert!(remediated);
-        assert!(runner
-            .commands
-            .borrow()
-            .iter()
-            .all(|command| !command.contains("send-keys")));
-        assert!(runner
-            .commands
-            .borrow()
-            .iter()
-            .all(|command| !command.contains("Allow? (y/n)")));
+        assert!(
+            runner
+                .commands
+                .borrow()
+                .iter()
+                .all(|command| !command.contains("send-keys"))
+        );
+        assert!(
+            runner
+                .commands
+                .borrow()
+                .iter()
+                .all(|command| !command.contains("Allow? (y/n)"))
+        );
     }
 }
