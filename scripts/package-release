@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: package-release [tag]
+
+Build and package the local Zellij MCP release artifact using the same
+version/tag contract as .github/workflows/release.yml.
+
+Examples:
+  scripts/package-release v0.1.0
+  scripts/package-release
+
+If no tag is provided, the script uses the Cargo.toml version and assumes the
+matching release tag v<version>.
+EOF
+}
+
+if [[ ${1-} == "-h" || ${1-} == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$ROOT_DIR"
+
+version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
+if [[ -z "$version" ]]; then
+  printf 'failed to read version from Cargo.toml\n' >&2
+  exit 1
+fi
+
+tag=${1:-v$version}
+expected_tag="v$version"
+if [[ "$tag" != "$expected_tag" ]]; then
+  printf 'tag %s does not match Cargo.toml version %s\n' "$tag" "$expected_tag" >&2
+  exit 1
+fi
+
+artifact_basename="zellij-mcp-${version}-linux-x86_64"
+
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo build --release
+
+mkdir -p dist
+cp target/release/zellij_mcp dist/zellij_mcp
+tar -C dist -czf "dist/${artifact_basename}.tar.gz" zellij_mcp
+sha256sum "dist/${artifact_basename}.tar.gz" > "dist/${artifact_basename}.tar.gz.sha256"
+
+printf 'created %s\n' "dist/${artifact_basename}.tar.gz"
+printf 'created %s\n' "dist/${artifact_basename}.tar.gz.sha256"

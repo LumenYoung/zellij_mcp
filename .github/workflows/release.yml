@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build release artifact
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Verify tag matches Cargo version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
+          if [[ -z "$version" ]]; then
+            echo "failed to read version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${version}" >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "ARTIFACT_BASENAME=zellij-mcp-${version}-linux-x86_64" >> "$GITHUB_ENV"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/zellij_mcp dist/zellij_mcp
+          tar -C dist -czf "dist/${ARTIFACT_BASENAME}.tar.gz" zellij_mcp
+          sha256sum "dist/${ARTIFACT_BASENAME}.tar.gz" > "dist/${ARTIFACT_BASENAME}.tar.gz.sha256"
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_BASENAME }}
+          path: |
+            dist/${{ env.ARTIFACT_BASENAME }}.tar.gz
+            dist/${{ env.ARTIFACT_BASENAME }}.tar.gz.sha256
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ env.ARTIFACT_BASENAME }}.tar.gz
+            dist/${{ env.ARTIFACT_BASENAME }}.tar.gz.sha256
+          generate_release_notes: true
