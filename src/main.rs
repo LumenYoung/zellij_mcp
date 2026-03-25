@@ -3,10 +3,9 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use zellij_mcp::adapters::zjctl::{
-    SshBackendReadiness, SshReadinessFailure, SshTargetConfig, SshZjctlClient, ZjctlClient,
-    attempt_safe_ssh_readiness_remediation, classify_ssh_backend_readiness,
+    SshTargetConfig, SshZjctlClient, ZjctlClient, missing_binary_name, resolve_ssh_runtime_config,
 };
-use zellij_mcp::domain::errors::{DomainError, ErrorCode};
+use zellij_mcp::domain::errors::DomainError;
 use zellij_mcp::persistence::{ObservationStore, RegistryStore};
 use zellij_mcp::server::{McpServer, RmcpServer, daemon_identity};
 use zellij_mcp::services::{TargetRouter, TerminalManager, TerminalService};
@@ -178,109 +177,6 @@ fn load_target_configs(raw_targets: Option<&str>) -> Result<TargetConfigs, serde
         .map(|configs| configs.unwrap_or_else(TargetConfigs::default))
 }
 
-fn map_remote_readiness_failure(target_id: &str, failure: SshReadinessFailure) -> DomainError {
-    match failure {
-        SshReadinessFailure::MissingBinary { host, binary } => DomainError::new(
-            ErrorCode::ZjctlUnavailable,
-            format!(
-                "remote target `{target_id}` on host `{host}` is missing required binary `{binary}`; install it on the remote PATH (for example ~/.local/bin) before retrying"
-            ),
-            true,
-        ),
-        SshReadinessFailure::SshUnreachable { host, .. } => DomainError::new(
-            ErrorCode::ZjctlUnavailable,
-            format!(
-                "remote target `{target_id}` on host `{host}` is not reachable over SSH; verify the SSH alias, connectivity, and command availability before retrying"
-            ),
-            true,
-        ),
-        SshReadinessFailure::PluginPermissionPrompt { host, .. } => DomainError::new(
-            ErrorCode::PluginNotReady,
-            format!(
-                "remote target `{target_id}` on host `{host}` is waiting on a Zellij plugin permission prompt; approve the plugin permissions before retrying"
-            ),
-            false,
-        ),
-        SshReadinessFailure::HelperClientMissing { host, .. } => DomainError::new(
-            ErrorCode::PluginNotReady,
-            format!(
-                "remote target `{target_id}` on host `{host}` does not have an attached Zellij helper/client yet; start or attach a helper client before retrying"
-            ),
-            true,
-        ),
-        SshReadinessFailure::RpcNotReady { host, .. } => DomainError::new(
-            ErrorCode::PluginNotReady,
-            format!(
-                "remote target `{target_id}` on host `{host}` is not ready for zjctl RPC yet; ensure the remote Zellij helper/client is attached and RPC is ready before retrying"
-            ),
-            true,
-        ),
-    }
-}
-
-fn build_remote_backend_with_classifier<F>(
-    target_id: String,
-    config: &SshTargetConfig,
-    registry_store: &RegistryStore,
-    observation_store: &ObservationStore,
-    classify: F,
-) -> Result<Arc<dyn TerminalManager>, DomainError>
-where
-    F: Fn(&SshTargetConfig) -> SshBackendReadiness,
-{
-    build_remote_backend_with_classifier_and_remediation(
-        target_id,
-        config,
-        registry_store,
-        observation_store,
-        classify,
-        attempt_safe_ssh_readiness_remediation,
-    )
-}
-
-fn build_remote_backend_with_classifier_and_remediation<F, R>(
-    target_id: String,
-    config: &SshTargetConfig,
-    registry_store: &RegistryStore,
-    observation_store: &ObservationStore,
-    classify: F,
-    remediate: R,
-) -> Result<Arc<dyn TerminalManager>, DomainError>
-where
-    F: Fn(&SshTargetConfig) -> SshBackendReadiness,
-    R: Fn(&SshTargetConfig, &SshReadinessFailure) -> bool,
-{
-    let resolved_config = match classify(config) {
-        SshBackendReadiness::Ready(resolved) => resolved,
-        SshBackendReadiness::AutoFixable(failure) => {
-            if remediate(config, &failure) {
-                match classify(config) {
-                    SshBackendReadiness::Ready(resolved) => resolved,
-                    SshBackendReadiness::AutoFixable(retry_failure)
-                    | SshBackendReadiness::ManualActionRequired(retry_failure) => {
-                        return Err(map_remote_readiness_failure(&target_id, retry_failure));
-                    }
-                }
-            } else {
-                return Err(map_remote_readiness_failure(&target_id, failure));
-            }
-        }
-        SshBackendReadiness::ManualActionRequired(failure) => {
-            return Err(map_remote_readiness_failure(&target_id, failure));
-        }
-    };
-
-    let service = TerminalService::new(
-        target_id,
-        SshZjctlClient::new(resolved_config),
-        registry_store.clone(),
-        observation_store.clone(),
-    );
-    let _ = service.revalidate_all();
-
-    Ok(Arc::new(service) as Arc<dyn TerminalManager>)
-}
-
 fn persisted_remote_target_ids(registry_store: &RegistryStore) -> Result<Vec<String>, DomainError> {
     let mut targets: Vec<String> = registry_store
         .load()?
@@ -299,13 +195,51 @@ fn build_remote_backend(
     registry_store: &RegistryStore,
     observation_store: &ObservationStore,
 ) -> Result<Arc<dyn TerminalManager>, DomainError> {
-    build_remote_backend_with_classifier(
+    let resolved_config = resolve_ssh_runtime_config(config).map_err(|error| match error {
+        zellij_mcp::adapters::zjctl::AdapterError::ZjctlUnavailable => DomainError::new(
+            zellij_mcp::domain::errors::ErrorCode::ZjctlUnavailable,
+            format!(
+                "remote target `{target_id}` on host `{}` is not reachable over SSH; verify the SSH alias, connectivity, and command availability before retrying",
+                config.host
+            ),
+            true,
+        ),
+        zellij_mcp::adapters::zjctl::AdapterError::CommandFailed(message)
+            if missing_binary_name(&message).is_some() =>
+        {
+            DomainError::new(
+                zellij_mcp::domain::errors::ErrorCode::ZjctlUnavailable,
+                format!(
+                    "remote target `{target_id}` on host `{}` could not resolve required binaries before session selection: {message}",
+                    config.host
+                ),
+                true,
+            )
+        }
+        zellij_mcp::adapters::zjctl::AdapterError::CommandFailed(message) => DomainError::new(
+            zellij_mcp::domain::errors::ErrorCode::ZjctlUnavailable,
+            format!(
+                "remote target `{target_id}` on host `{}` failed during runtime preparation before session selection: {message}",
+                config.host
+            ),
+            true,
+        ),
+        other => DomainError::new(
+            zellij_mcp::domain::errors::ErrorCode::ZjctlUnavailable,
+            format!(
+                "remote target `{target_id}` on host `{}` failed during runtime preparation before session selection: {}",
+                config.host, other
+            ),
+            true,
+        ),
+    })?;
+
+    Ok(Arc::new(TerminalService::new(
         target_id,
-        config,
-        registry_store,
-        observation_store,
-        classify_ssh_backend_readiness,
-    )
+        SshZjctlClient::new(resolved_config),
+        registry_store.clone(),
+        observation_store.clone(),
+    )) as Arc<dyn TerminalManager>)
 }
 
 #[tokio::main]
@@ -397,16 +331,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        SshTargetOverride, build_remote_backend_with_classifier,
-        build_remote_backend_with_classifier_and_remediation, default_remote_zellij_bin,
-        default_remote_zjctl_bin, load_target_configs, map_remote_readiness_failure,
-        parse_target_configs, persisted_remote_target_ids,
+        SshTargetOverride, build_remote_backend, default_remote_zellij_bin,
+        default_remote_zjctl_bin, load_target_configs, parse_target_configs,
+        persisted_remote_target_ids,
     };
-    use std::cell::{Cell, RefCell};
     use zellij_mcp::adapters::zjctl::SshTargetConfig;
-    use zellij_mcp::adapters::zjctl::{SshBackendReadiness, SshReadinessFailure};
     use zellij_mcp::domain::binding::TerminalBinding;
-    use zellij_mcp::domain::errors::ErrorCode;
     use zellij_mcp::domain::status::{BindingSource, TerminalStatus};
     use zellij_mcp::persistence::{ObservationStore, RegistryStore};
 
@@ -665,55 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_reports_missing_binaries_with_actionable_message() {
-        let error = map_remote_readiness_failure(
-            "ssh:aws",
-            SshReadinessFailure::MissingBinary {
-                host: "aws".to_string(),
-                binary: "zjctl".to_string(),
-            },
-        );
-
-        assert_eq!(error.code, ErrorCode::ZjctlUnavailable);
-        assert!(error.retryable);
-        assert!(error.message.contains("missing required binary `zjctl`"));
-        assert!(error.message.contains("~/.local/bin"));
-    }
-
-    #[test]
-    fn readiness_reports_plugin_permission_prompt_with_actionable_message() {
-        let error = map_remote_readiness_failure(
-            "ssh:aws",
-            SshReadinessFailure::PluginPermissionPrompt {
-                host: "aws".to_string(),
-                detail: "permission prompt".to_string(),
-            },
-        );
-
-        assert_eq!(error.code, ErrorCode::PluginNotReady);
-        assert!(!error.retryable);
-        assert!(error.message.contains("plugin permission prompt"));
-        assert!(error.message.contains("approve"));
-    }
-
-    #[test]
-    fn readiness_reports_helper_client_absence_with_actionable_message() {
-        let error = map_remote_readiness_failure(
-            "ssh:aws",
-            SshReadinessFailure::HelperClientMissing {
-                host: "aws".to_string(),
-                detail: "helper client is not attached yet".to_string(),
-            },
-        );
-
-        assert_eq!(error.code, ErrorCode::PluginNotReady);
-        assert!(error.retryable);
-        assert!(error.message.contains("helper/client"));
-        assert!(error.message.contains("before retrying"));
-    }
-
-    #[test]
-    fn readiness_reports_rpc_timeout_without_fresh_ssh_fallback() {
+    fn remote_backend_construction_is_session_agnostic() {
         let (registry_store, observation_store) = remote_backend_stores();
         let config = SshTargetConfig {
             host: "aws".to_string(),
@@ -722,159 +604,16 @@ mod tests {
             remote_env: BTreeMap::new(),
             ssh_options: Vec::new(),
         };
-
-        let result = build_remote_backend_with_classifier(
+        let result = build_remote_backend(
             "ssh:aws".to_string(),
             &config,
             &registry_store,
             &observation_store,
-            |_| {
-                SshBackendReadiness::AutoFixable(SshReadinessFailure::RpcNotReady {
-                    host: "aws".to_string(),
-                    detail: "timed out".to_string(),
-                })
-            },
-        );
-
-        let error = match result {
-            Ok(_) => panic!("rpc timeout readiness should fail before backend construction"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.code, ErrorCode::PluginNotReady);
-        assert!(error.retryable);
-        assert!(error.message.contains("not ready for zjctl RPC yet"));
-    }
-
-    #[test]
-    fn readiness_auto_fix_retries_doctor_once_after_safe_remediation() {
-        let (registry_store, observation_store) = remote_backend_stores();
-        let config = SshTargetConfig {
-            host: "aws".to_string(),
-            remote_zjctl_bin: "zjctl".to_string(),
-            remote_zellij_bin: "zellij".to_string(),
-            remote_env: BTreeMap::new(),
-            ssh_options: Vec::new(),
-        };
-        let classify_calls = Cell::new(0usize);
-        let remediation_calls = Cell::new(0usize);
-
-        let result = build_remote_backend_with_classifier_and_remediation(
-            "ssh:aws".to_string(),
-            &config,
-            &registry_store,
-            &observation_store,
-            |_| {
-                let call = classify_calls.get();
-                classify_calls.set(call + 1);
-                if call == 0 {
-                    SshBackendReadiness::AutoFixable(SshReadinessFailure::HelperClientMissing {
-                        host: "aws".to_string(),
-                        detail: "helper client is not attached yet".to_string(),
-                    })
-                } else {
-                    SshBackendReadiness::Ready(config.clone())
-                }
-            },
-            |_, failure| {
-                remediation_calls.set(remediation_calls.get() + 1);
-                assert!(matches!(
-                    failure,
-                    SshReadinessFailure::HelperClientMissing { .. }
-                ));
-                true
-            },
         );
 
         assert!(
             result.is_ok(),
-            "safe remediation should allow one readiness retry"
+            "backend construction should not require session readiness"
         );
-        assert_eq!(remediation_calls.get(), 1);
-        assert_eq!(classify_calls.get(), 2);
-    }
-
-    #[test]
-    fn readiness_does_not_auto_approve_unmanaged_prompt() {
-        let (registry_store, observation_store) = remote_backend_stores();
-        let config = SshTargetConfig {
-            host: "aws".to_string(),
-            remote_zjctl_bin: "zjctl".to_string(),
-            remote_zellij_bin: "zellij".to_string(),
-            remote_env: BTreeMap::new(),
-            ssh_options: Vec::new(),
-        };
-        let remediation_calls = Cell::new(0usize);
-
-        let result = build_remote_backend_with_classifier_and_remediation(
-            "ssh:aws".to_string(),
-            &config,
-            &registry_store,
-            &observation_store,
-            |_| {
-                SshBackendReadiness::ManualActionRequired(
-                    SshReadinessFailure::PluginPermissionPrompt {
-                        host: "aws".to_string(),
-                        detail: "Allow? (y/n)".to_string(),
-                    },
-                )
-            },
-            |_, _| {
-                remediation_calls.set(remediation_calls.get() + 1);
-                true
-            },
-        );
-
-        let error = match result {
-            Ok(_) => panic!("permission prompt should stay manual"),
-            Err(error) => error,
-        };
-        assert_eq!(remediation_calls.get(), 0);
-        assert_eq!(error.code, ErrorCode::PluginNotReady);
-        assert!(!error.retryable);
-        assert!(error.message.contains("approve the plugin permissions"));
-    }
-
-    #[test]
-    fn readiness_auto_fix_reports_missing_binary_when_remediation_does_not_help() {
-        let (registry_store, observation_store) = remote_backend_stores();
-        let config = SshTargetConfig {
-            host: "aws".to_string(),
-            remote_zjctl_bin: "zjctl".to_string(),
-            remote_zellij_bin: "zellij".to_string(),
-            remote_env: BTreeMap::new(),
-            ssh_options: Vec::new(),
-        };
-        let attempted_failures = RefCell::new(Vec::new());
-
-        let result = build_remote_backend_with_classifier_and_remediation(
-            "ssh:aws".to_string(),
-            &config,
-            &registry_store,
-            &observation_store,
-            |_| {
-                SshBackendReadiness::AutoFixable(SshReadinessFailure::MissingBinary {
-                    host: "aws".to_string(),
-                    binary: "zjctl".to_string(),
-                })
-            },
-            |_, failure| {
-                attempted_failures.borrow_mut().push(failure.clone());
-                false
-            },
-        );
-
-        let error = match result {
-            Ok(_) => panic!("missing binary should fail if remediation does not succeed"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            attempted_failures.borrow().as_slice(),
-            &[SshReadinessFailure::MissingBinary {
-                host: "aws".to_string(),
-                binary: "zjctl".to_string(),
-            }]
-        );
-        assert_eq!(error.code, ErrorCode::ZjctlUnavailable);
     }
 }

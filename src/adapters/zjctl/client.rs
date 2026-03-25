@@ -34,6 +34,7 @@ pub struct CaptureSnapshot {
 
 pub trait ZjctlAdapter {
     fn is_available(&self) -> bool;
+    fn ensure_session_ready(&self, session_name: &str) -> Result<(), AdapterError>;
     fn spawn(&self, request: &SpawnRequest) -> Result<ResolvedTarget, AdapterError>;
     fn resolve_selector(&self, request: &AttachRequest) -> Result<ResolvedTarget, AdapterError>;
     fn list_targets_in_session(
@@ -132,7 +133,11 @@ trait RemoteProbe {
         binary: &str,
     ) -> Result<Option<String>, AdapterError>;
     fn is_executable(&self, absolute_path: &str) -> Result<bool, AdapterError>;
-    fn check_rpc_readiness(&self, config: &SshTargetConfig) -> Result<(), AdapterError>;
+    fn check_rpc_readiness(
+        &self,
+        config: &SshTargetConfig,
+        session_name: &str,
+    ) -> Result<(), AdapterError>;
 }
 
 struct SshRemoteProbe<'a> {
@@ -192,22 +197,33 @@ impl RemoteProbe for SshRemoteProbe<'_> {
         Ok(output.status.success())
     }
 
-    fn check_rpc_readiness(&self, config: &SshTargetConfig) -> Result<(), AdapterError> {
+    fn check_rpc_readiness(
+        &self,
+        config: &SshTargetConfig,
+        session_name: &str,
+    ) -> Result<(), AdapterError> {
         let client = SshZjctlClient::new(config.clone());
-        client.run_command(None, ZjctlCommand::List).map(|_| ())
+        client
+            .run_command(Some(session_name), ZjctlCommand::List)
+            .map(|_| ())
     }
 }
 
-pub fn classify_ssh_backend_readiness(config: &SshTargetConfig) -> SshBackendReadiness {
-    classify_ssh_backend_readiness_with_probe(config, &SshRemoteProbe::new(config))
+pub fn classify_ssh_backend_readiness(
+    config: &SshTargetConfig,
+    session_name: &str,
+) -> SshBackendReadiness {
+    classify_ssh_backend_readiness_with_probe(config, session_name, &SshRemoteProbe::new(config))
 }
 
 pub fn attempt_safe_ssh_readiness_remediation(
     config: &SshTargetConfig,
+    session_name: &str,
     failure: &SshReadinessFailure,
 ) -> bool {
     attempt_safe_ssh_readiness_remediation_with_probe_and_runner(
         config,
+        session_name,
         failure,
         &SshRemoteProbe::new(config),
         &SshRemoteRemediationRunner,
@@ -216,10 +232,11 @@ pub fn attempt_safe_ssh_readiness_remediation(
 
 fn classify_ssh_backend_readiness_with_probe(
     config: &SshTargetConfig,
+    session_name: &str,
     probe: &dyn RemoteProbe,
 ) -> SshBackendReadiness {
     match resolve_ssh_runtime_config_with_probe(config, probe) {
-        Ok(resolved) => match probe.check_rpc_readiness(&resolved) {
+        Ok(resolved) => match probe.check_rpc_readiness(&resolved, session_name) {
             Ok(()) => SshBackendReadiness::Ready(resolved),
             Err(error) => classify_ssh_readiness_failure(&resolved.host, error),
         },
@@ -229,6 +246,7 @@ fn classify_ssh_backend_readiness_with_probe(
 
 fn attempt_safe_ssh_readiness_remediation_with_probe_and_runner(
     config: &SshTargetConfig,
+    session_name: &str,
     failure: &SshReadinessFailure,
     probe: &dyn RemoteProbe,
     runner: &dyn RemoteRemediationRunner,
@@ -241,7 +259,7 @@ fn attempt_safe_ssh_readiness_remediation_with_probe_and_runner(
         | SshReadinessFailure::PluginPermissionPrompt { .. } => return false,
     }
 
-    let context = SshReadinessRemediationContext::discover(config, probe);
+    let context = SshReadinessRemediationContext::discover(config, session_name, probe);
     let mut remediated = false;
 
     if let Some(zjctl_bin) = context.zjctl_bin.as_deref() {
@@ -268,7 +286,7 @@ struct SshReadinessRemediationContext {
 }
 
 impl SshReadinessRemediationContext {
-    fn discover(config: &SshTargetConfig, probe: &dyn RemoteProbe) -> Self {
+    fn discover(config: &SshTargetConfig, session_name: &str, probe: &dyn RemoteProbe) -> Self {
         let home = probe.discover_home().ok();
         let configured_path = config.remote_env.get("PATH").cloned();
         let normalized_path = match (configured_path, home.as_deref()) {
@@ -301,7 +319,7 @@ impl SshReadinessRemediationContext {
             home.as_deref(),
             probe,
         );
-        let session_name = remote_session_name(config);
+        let session_name = session_name.trim().to_string();
         let helper_session_name = format!("zellij-mcp-client-{session_name}");
 
         Self {
@@ -337,16 +355,6 @@ impl SshReadinessRemediationContext {
 
         assignments
     }
-}
-
-fn remote_session_name(config: &SshTargetConfig) -> String {
-    config
-        .remote_env
-        .get("ZELLIJ_SESSION_NAME")
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .unwrap_or(config.host.as_str())
-        .to_string()
 }
 
 fn resolve_existing_remote_binary(
@@ -500,6 +508,18 @@ fn classify_ssh_readiness_failure(host: &str, error: AdapterError) -> SshBackend
     }
 }
 
+fn readiness_failure_to_adapter_error(failure: SshReadinessFailure) -> AdapterError {
+    match failure {
+        SshReadinessFailure::MissingBinary { binary, .. } => AdapterError::CommandFailed(format!(
+            "remote binary `{binary}` was not found after probing PATH and common locations"
+        )),
+        SshReadinessFailure::SshUnreachable { detail, .. }
+        | SshReadinessFailure::PluginPermissionPrompt { detail, .. }
+        | SshReadinessFailure::HelperClientMissing { detail, .. }
+        | SshReadinessFailure::RpcNotReady { detail, .. } => AdapterError::CommandFailed(detail),
+    }
+}
+
 pub fn missing_binary_name(message: &str) -> Option<String> {
     let prefix = "remote binary `";
     let suffix = "` was not found after probing PATH and common locations";
@@ -518,9 +538,12 @@ pub fn is_plugin_permission_prompt(message: &str) -> bool {
 pub fn is_rpc_not_ready_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("rpc")
+        || lower.contains("zrpc")
+        || lower.contains("no response from plugin")
         || lower.contains("timed out")
         || lower.contains("timeout")
         || lower.contains("not ready")
+        || lower.contains("no active session")
         || lower.contains("helper")
         || lower.contains("client")
 }
@@ -530,6 +553,7 @@ pub fn is_helper_client_missing_message(message: &str) -> bool {
     (lower.contains("helper") && lower.contains("client"))
         || lower.contains("not attached yet")
         || lower.contains("no active clients")
+        || lower.contains("no active session")
 }
 
 pub fn resolve_ssh_runtime_config(
@@ -901,6 +925,40 @@ impl ZjctlAdapter for SshZjctlClient {
         self.run_command(None, ZjctlCommand::Availability).is_ok()
     }
 
+    fn ensure_session_ready(&self, session_name: &str) -> Result<(), AdapterError> {
+        match classify_ssh_backend_readiness(&self.config, session_name) {
+            SshBackendReadiness::Ready(resolved) => {
+                let mut client = self.clone();
+                client.config = resolved;
+                client
+                    .run_command(Some(session_name), ZjctlCommand::List)
+                    .map(|_| ())
+            }
+            SshBackendReadiness::AutoFixable(failure) => {
+                if attempt_safe_ssh_readiness_remediation(&self.config, session_name, &failure) {
+                    match classify_ssh_backend_readiness(&self.config, session_name) {
+                        SshBackendReadiness::Ready(resolved) => {
+                            let mut client = self.clone();
+                            client.config = resolved;
+                            client
+                                .run_command(Some(session_name), ZjctlCommand::List)
+                                .map(|_| ())
+                        }
+                        SshBackendReadiness::AutoFixable(retry_failure)
+                        | SshBackendReadiness::ManualActionRequired(retry_failure) => {
+                            Err(readiness_failure_to_adapter_error(retry_failure))
+                        }
+                    }
+                } else {
+                    Err(readiness_failure_to_adapter_error(failure))
+                }
+            }
+            SshBackendReadiness::ManualActionRequired(failure) => {
+                Err(readiness_failure_to_adapter_error(failure))
+            }
+        }
+    }
+
     fn spawn(&self, request: &SpawnRequest) -> Result<ResolvedTarget, AdapterError> {
         let prepared = prepare_spawn(request)?;
         let spawn_command = match &prepared.command {
@@ -1054,6 +1112,10 @@ impl ZjctlAdapter for SshZjctlClient {
 impl ZjctlAdapter for ZjctlClient {
     fn is_available(&self) -> bool {
         self.run_command(None, ZjctlCommand::Availability).is_ok()
+    }
+
+    fn ensure_session_ready(&self, session_name: &str) -> Result<(), AdapterError> {
+        self.list_targets_in_session(session_name).map(|_| ())
     }
 
     fn spawn(&self, _request: &SpawnRequest) -> Result<ResolvedTarget, AdapterError> {
@@ -1472,7 +1534,11 @@ mod tests {
             Ok(*self.executables.get(absolute_path).unwrap_or(&false))
         }
 
-        fn check_rpc_readiness(&self, _config: &SshTargetConfig) -> Result<(), AdapterError> {
+        fn check_rpc_readiness(
+            &self,
+            _config: &SshTargetConfig,
+            _session_name: &str,
+        ) -> Result<(), AdapterError> {
             self.record("check_rpc_readiness");
             self.rpc_readiness.clone().unwrap_or(Ok(()))
         }
@@ -2011,7 +2077,7 @@ mod tests {
             calls: RefCell::new(Vec::new()),
         };
 
-        let readiness = classify_ssh_backend_readiness_with_probe(&config, &probe);
+        let readiness = classify_ssh_backend_readiness_with_probe(&config, "aws", &probe);
 
         assert_eq!(
             readiness,
@@ -2044,7 +2110,7 @@ mod tests {
             calls: RefCell::new(Vec::new()),
         };
 
-        let readiness = classify_ssh_backend_readiness_with_probe(&config, &probe);
+        let readiness = classify_ssh_backend_readiness_with_probe(&config, "aws", &probe);
 
         assert_eq!(
             readiness,
@@ -2073,7 +2139,7 @@ mod tests {
             calls: RefCell::new(Vec::new()),
         };
 
-        let readiness = classify_ssh_backend_readiness_with_probe(&config, &probe);
+        let readiness = classify_ssh_backend_readiness_with_probe(&config, "aws", &probe);
 
         assert_eq!(
             readiness,
@@ -2104,13 +2170,75 @@ mod tests {
             calls: RefCell::new(Vec::new()),
         };
 
-        let readiness = classify_ssh_backend_readiness_with_probe(&config, &probe);
+        let readiness = classify_ssh_backend_readiness_with_probe(&config, "aws", &probe);
 
         assert_eq!(
             readiness,
             SshBackendReadiness::AutoFixable(SshReadinessFailure::HelperClientMissing {
                 host: "aws".to_string(),
                 detail: "helper client is not attached yet".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn readiness_classifies_no_active_session_as_helper_client_missing() {
+        let config = SshTargetConfig {
+            host: "a100".to_string(),
+            remote_zjctl_bin: "/home/remote/.local/bin/zjctl".to_string(),
+            remote_zellij_bin: "/home/remote/.local/bin/zellij".to_string(),
+            remote_env: BTreeMap::new(),
+            ssh_options: Vec::new(),
+        };
+        let probe = FakeProbe {
+            home: None,
+            path: None,
+            command_v: HashMap::new(),
+            executables: HashMap::new(),
+            rpc_readiness: Some(Err(AdapterError::CommandFailed(
+                "There is no active session!".to_string(),
+            ))),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let readiness = classify_ssh_backend_readiness_with_probe(&config, "a100", &probe);
+
+        assert_eq!(
+            readiness,
+            SshBackendReadiness::AutoFixable(SshReadinessFailure::HelperClientMissing {
+                host: "a100".to_string(),
+                detail: "There is no active session!".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn readiness_classifies_zrpc_no_response_as_rpc_not_ready() {
+        let config = SshTargetConfig {
+            host: "aws".to_string(),
+            remote_zjctl_bin: "/home/remote/.local/bin/zjctl".to_string(),
+            remote_zellij_bin: "/home/remote/.local/bin/zellij".to_string(),
+            remote_env: BTreeMap::new(),
+            ssh_options: Vec::new(),
+        };
+        let probe = FakeProbe {
+            home: None,
+            path: None,
+            command_v: HashMap::new(),
+            executables: HashMap::new(),
+            rpc_readiness: Some(Err(AdapterError::CommandFailed(
+                "Error: no response from zrpc plugin".to_string(),
+            ))),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let readiness = classify_ssh_backend_readiness_with_probe(&config, "aws", &probe);
+
+        assert_eq!(
+            readiness,
+            SshBackendReadiness::AutoFixable(SshReadinessFailure::RpcNotReady {
+                host: "aws".to_string(),
+                detail: "Error: no response from zrpc plugin".to_string(),
             })
         );
     }
@@ -2147,6 +2275,7 @@ mod tests {
 
         let remediated = attempt_safe_ssh_readiness_remediation_with_probe_and_runner(
             &config,
+            "aws",
             &SshReadinessFailure::MissingBinary {
                 host: "aws".to_string(),
                 binary: "zjctl".to_string(),
@@ -2207,6 +2336,7 @@ mod tests {
 
         let remediated = attempt_safe_ssh_readiness_remediation_with_probe_and_runner(
             &config,
+            "prod-shell",
             &SshReadinessFailure::RpcNotReady {
                 host: "aws".to_string(),
                 detail: "helper client is not attached yet".to_string(),

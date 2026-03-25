@@ -103,6 +103,16 @@ where
         }
     }
 
+    fn ensure_session_ready(
+        &self,
+        session_name: &str,
+        error_code: ErrorCode,
+    ) -> Result<(), DomainError> {
+        self.adapter
+            .ensure_session_ready(session_name)
+            .map_err(|error| self.map_adapter_error(error, error_code))
+    }
+
     fn hash_content(content: &str) -> String {
         let mut hasher = DefaultHasher::new();
         content.hash(&mut hasher);
@@ -506,6 +516,8 @@ where
             return Ok(bindings[index].clone());
         }
 
+        self.ensure_session_ready(&bindings[index].session_name, ErrorCode::AttachFailed)?;
+
         for attempt in 0..3 {
             for request in Self::build_revalidation_requests(&bindings[index]) {
                 match self.adapter.resolve_selector(&request) {
@@ -547,6 +559,7 @@ where
         F: Fn(&TerminalBinding) -> Result<T, AdapterError>,
     {
         let mut current = binding.clone();
+        self.ensure_session_ready(&current.session_name, error_code.clone())?;
         for attempt in 0..3 {
             match operation(&current) {
                 Ok(result) => return Ok(result),
@@ -1051,6 +1064,7 @@ where
 {
     fn spawn(&self, request: SpawnRequest) -> Result<SpawnResponse, DomainError> {
         self.ensure_available()?;
+        self.ensure_session_ready(&request.session_name, ErrorCode::SpawnFailed)?;
 
         let resolved = self
             .adapter
@@ -1162,6 +1176,7 @@ where
 
     fn attach(&self, request: AttachRequest) -> Result<AttachResponse, DomainError> {
         self.ensure_available()?;
+        self.ensure_session_ready(&request.session_name, ErrorCode::AttachFailed)?;
 
         let resolved = self
             .adapter
@@ -1172,6 +1187,7 @@ where
 
     fn takeover(&self, request: TakeoverRequest) -> Result<TakeoverResponse, DomainError> {
         self.ensure_available()?;
+        self.ensure_session_ready(&request.session_name, ErrorCode::AttachFailed)?;
 
         let candidates = self
             .adapter
@@ -1214,6 +1230,7 @@ where
 
     fn discover(&self, request: DiscoverRequest) -> Result<DiscoverResponse, DomainError> {
         self.ensure_available()?;
+        self.ensure_session_ready(&request.session_name, ErrorCode::AttachFailed)?;
         let preview_lines =
             Self::validate_positive_lines(request.preview_lines, "preview_lines")?.unwrap_or(8);
 
@@ -1587,6 +1604,7 @@ where
 
     fn layout(&self, request: LayoutRequest) -> Result<LayoutResponse, DomainError> {
         self.ensure_available()?;
+        self.ensure_session_ready(&request.session_name, ErrorCode::AttachFailed)?;
 
         let mut grouped: std::collections::BTreeMap<String, Vec<DiscoverCandidate>> =
             std::collections::BTreeMap::new();
@@ -1964,6 +1982,10 @@ mod tests {
     impl ZjctlAdapter for MockAdapter {
         fn is_available(&self) -> bool {
             true
+        }
+
+        fn ensure_session_ready(&self, _session_name: &str) -> Result<(), AdapterError> {
+            Ok(())
         }
 
         fn spawn(&self, _request: &SpawnRequest) -> Result<ResolvedTarget, AdapterError> {
