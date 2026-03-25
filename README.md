@@ -23,7 +23,7 @@ Recent spawn hardening:
 
 - `zellij_spawn(wait_ready=true)` may return `status="busy"` when the pane is real but rendered-screen idle detection does not settle within the bounded wait window
 - the daemon now persists spawned handles before post-launch probing so a real launch is not lost just because follow-up readiness or capture work degrades
-- `target="new_tab"` now uses a direct `zellij run` + post-list resolution path because the older fresh-tab RPC handoff could stall after the pane was already created
+- `spawn_target="new_tab"` now uses a direct `zellij run` + post-list resolution path because the older fresh-tab RPC handoff could stall after the pane was already created
 
 ## Requirements
 
@@ -194,3 +194,4 @@ Notes:
 - `docs/architecture.md`
 - `docs/mcp-contract.md`
 - `docs/ssh-remote-design.md`
+`zellij_discover` returns live pane metadata plus attach-ready `selector` values. `zellij_attach` then requires one exact selector so the daemon can bind one specific pane and return a stable `handle` for later `send`, `wait`, `capture`, and `close` calls.
