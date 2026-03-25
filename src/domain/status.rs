@@ -20,7 +20,9 @@ pub enum TerminalStatus {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SpawnTarget {
+    /// Create a new tab and launch the pane there.
     NewTab,
+    /// Create a new pane inside the named existing tab.
     ExistingTab,
 }
 

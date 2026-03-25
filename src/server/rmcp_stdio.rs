@@ -31,7 +31,7 @@ impl RmcpServer {
         }
     }
 
-    #[tool(description = "Create a managed Zellij execution target.")]
+    #[tool(description = "Create a managed pane on the local backend or selected SSH target.")]
     fn zellij_spawn(
         &self,
         Parameters(request): Parameters<SpawnRequest>,
@@ -39,7 +39,7 @@ impl RmcpServer {
         self.execute("zellij_spawn", request)
     }
 
-    #[tool(description = "Attach an existing Zellij pane to daemon management.")]
+    #[tool(description = "Attach one live pane by exact selector and return a daemon handle.")]
     fn zellij_attach(
         &self,
         Parameters(request): Parameters<AttachRequest>,
@@ -47,7 +47,7 @@ impl RmcpServer {
         self.execute("zellij_attach", request)
     }
 
-    #[tool(description = "Search and attach an existing Zellij pane in one step.")]
+    #[tool(description = "Search for one live pane, then attach it and return a daemon handle.")]
     fn zellij_takeover(
         &self,
         Parameters(request): Parameters<TakeoverRequest>,
@@ -55,7 +55,7 @@ impl RmcpServer {
         self.execute("zellij_takeover", request)
     }
 
-    #[tool(description = "Discover live Zellij panes before attaching.")]
+    #[tool(description = "List live panes in a Zellij session and return attach-ready selectors.")]
     fn zellij_discover(
         &self,
         Parameters(request): Parameters<DiscoverRequest>,
@@ -63,7 +63,7 @@ impl RmcpServer {
         self.execute("zellij_discover", request)
     }
 
-    #[tool(description = "Send input to a managed pane.")]
+    #[tool(description = "Send text or keys to a managed pane handle.")]
     fn zellij_send(
         &self,
         Parameters(request): Parameters<SendRequest>,
@@ -71,7 +71,7 @@ impl RmcpServer {
         self.execute("zellij_send", request)
     }
 
-    #[tool(description = "Cooperatively reuse a managed shell-like pane for a new command.")]
+    #[tool(description = "Reuse a shell-like managed pane handle for a new command.")]
     fn zellij_replace(
         &self,
         Parameters(request): Parameters<ReplaceRequest>,
@@ -79,7 +79,7 @@ impl RmcpServer {
         self.execute("zellij_replace", request)
     }
 
-    #[tool(description = "Wait for a managed pane to become idle.")]
+    #[tool(description = "Wait for a managed pane handle to become idle.")]
     fn zellij_wait(
         &self,
         Parameters(request): Parameters<WaitRequest>,
@@ -87,7 +87,7 @@ impl RmcpServer {
         self.execute("zellij_wait", request)
     }
 
-    #[tool(description = "Capture output from a managed pane.")]
+    #[tool(description = "Read output from a managed pane handle.")]
     fn zellij_capture(
         &self,
         Parameters(request): Parameters<CaptureRequest>,
@@ -95,7 +95,7 @@ impl RmcpServer {
         self.execute("zellij_capture", request)
     }
 
-    #[tool(description = "Close a managed pane.")]
+    #[tool(description = "Close a managed pane handle.")]
     fn zellij_close(
         &self,
         Parameters(request): Parameters<CloseRequest>,
@@ -103,7 +103,9 @@ impl RmcpServer {
         self.execute("zellij_close", request)
     }
 
-    #[tool(description = "List known managed Zellij handles.")]
+    #[tool(
+        description = "List daemon-managed pane handles, optionally filtered by backend or session."
+    )]
     fn zellij_list(
         &self,
         Parameters(request): Parameters<ListRequest>,
@@ -111,7 +113,9 @@ impl RmcpServer {
         self.execute("zellij_list", request)
     }
 
-    #[tool(description = "Inspect tabs and panes grouped by layout.")]
+    #[tool(
+        description = "Inspect tabs and panes in a session on the local backend or selected SSH target."
+    )]
     fn zellij_layout(
         &self,
         Parameters(request): Parameters<LayoutRequest>,

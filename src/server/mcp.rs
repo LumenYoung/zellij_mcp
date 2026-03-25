@@ -18,47 +18,47 @@ pub struct ToolDefinition {
 pub const TOOL_DEFINITIONS: [ToolDefinition; 12] = [
     ToolDefinition {
         name: "zellij_spawn",
-        description: "Create a managed Zellij execution target.",
+        description: "Create a managed pane on the local backend or selected SSH target.",
     },
     ToolDefinition {
         name: "zellij_attach",
-        description: "Attach an existing Zellij pane to daemon management.",
+        description: "Attach one live pane by exact selector and return a daemon handle.",
     },
     ToolDefinition {
         name: "zellij_takeover",
-        description: "Search and attach an existing Zellij pane in one step.",
+        description: "Search for one live pane, then attach it and return a daemon handle.",
     },
     ToolDefinition {
         name: "zellij_discover",
-        description: "Discover live Zellij panes before attaching.",
+        description: "List live panes in a Zellij session and return attach-ready selectors.",
     },
     ToolDefinition {
         name: "zellij_send",
-        description: "Send input to a managed pane.",
+        description: "Send text or keys to a managed pane handle.",
     },
     ToolDefinition {
         name: "zellij_replace",
-        description: "Cooperatively reuse a managed shell-like pane for a new command.",
+        description: "Reuse a shell-like managed pane handle for a new command.",
     },
     ToolDefinition {
         name: "zellij_wait",
-        description: "Wait for a managed pane to become idle.",
+        description: "Wait for a managed pane handle to become idle.",
     },
     ToolDefinition {
         name: "zellij_capture",
-        description: "Capture output from a managed pane.",
+        description: "Read output from a managed pane handle.",
     },
     ToolDefinition {
         name: "zellij_close",
-        description: "Close a managed pane.",
+        description: "Close a managed pane handle.",
     },
     ToolDefinition {
         name: "zellij_list",
-        description: "List known managed Zellij handles.",
+        description: "List daemon-managed pane handles, optionally filtered by backend or session.",
     },
     ToolDefinition {
         name: "zellij_layout",
-        description: "Inspect tabs and panes grouped by layout.",
+        description: "Inspect tabs and panes in a session on the local backend or selected SSH target.",
     },
     ToolDefinition {
         name: "zellij_cleanup",

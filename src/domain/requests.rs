@@ -12,9 +12,12 @@ pub enum InputMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct SpawnRequest {
+    /// SSH target; omit for local backend.
     #[serde(default)]
     pub target: Option<String>,
+    /// Zellij session name on the selected backend.
     pub session_name: String,
+    /// Where to create the new pane: a new tab or an existing tab.
     pub spawn_target: SpawnTarget,
     pub tab_name: Option<String>,
     pub cwd: Option<String>,
@@ -26,20 +29,26 @@ pub struct SpawnRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct AttachRequest {
+    /// SSH target; omit for local backend.
     #[serde(default)]
     pub target: Option<String>,
+    /// Zellij session name on the selected backend.
     pub session_name: String,
     pub tab_name: Option<String>,
+    /// Exact pane selector; must resolve to one live pane.
     pub selector: String,
     pub alias: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct DiscoverRequest {
+    /// SSH target; omit for local backend.
     #[serde(default)]
     pub target: Option<String>,
+    /// Zellij session name on the selected backend.
     pub session_name: String,
     pub tab_name: Option<String>,
+    /// Optional pane selector filter used before attach.
     pub selector: Option<String>,
     #[serde(default = "default_true")]
     pub include_preview: bool,
@@ -48,6 +57,7 @@ pub struct DiscoverRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct SendRequest {
+    /// Daemon-managed pane handle from spawn, attach, or takeover.
     pub handle: String,
     #[serde(default)]
     pub text: String,
@@ -60,10 +70,13 @@ pub struct SendRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct TakeoverRequest {
+    /// SSH target; omit for local backend.
     #[serde(default)]
     pub target: Option<String>,
+    /// Zellij session name on the selected backend.
     pub session_name: String,
     pub tab_name: Option<String>,
+    /// Optional exact pane selector to narrow takeover to one pane.
     pub selector: Option<String>,
     pub command_contains: Option<String>,
     #[serde(default)]
@@ -73,6 +86,7 @@ pub struct TakeoverRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct ReplaceRequest {
+    /// Daemon-managed shell-like pane handle to reuse.
     pub handle: String,
     pub command: String,
     #[serde(default = "default_true")]
@@ -81,6 +95,7 @@ pub struct ReplaceRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct CleanupRequest {
+    /// SSH target; omit for local backend.
     #[serde(default)]
     pub target: Option<String>,
     #[serde(default)]
@@ -92,13 +107,16 @@ pub struct CleanupRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct LayoutRequest {
+    /// SSH target; omit for local backend.
     #[serde(default)]
     pub target: Option<String>,
+    /// Zellij session name on the selected backend.
     pub session_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct WaitRequest {
+    /// Daemon-managed pane handle from spawn, attach, or takeover.
     pub handle: String,
     pub idle_ms: u64,
     pub timeout_ms: u64,
@@ -106,6 +124,7 @@ pub struct WaitRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct CaptureRequest {
+    /// Daemon-managed pane handle from spawn, attach, or takeover.
     pub handle: String,
     pub mode: CaptureMode,
     pub tail_lines: Option<usize>,
@@ -118,14 +137,17 @@ pub struct CaptureRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct CloseRequest {
+    /// Daemon-managed pane handle from spawn, attach, or takeover.
     pub handle: String,
     pub force: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, schemars::JsonSchema)]
 pub struct ListRequest {
+    /// SSH target; omit for local backend.
     #[serde(default)]
     pub target: Option<String>,
+    /// Optional Zellij session filter on the selected backend.
     pub session_name: Option<String>,
 }
 
