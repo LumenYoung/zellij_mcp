@@ -14,7 +14,7 @@ Options:
   --local-zjctl-repo PATH    Local zjctl repo path (default: /home/yang/Documents/git/zjctl)
   --ssh-option ARG           Extra ssh argument token (repeatable)
   --skip-helper-client       Skip detached tmux helper client setup
-  --skip-plugin-install      Skip zjctl plugin install step
+  --skip-plugin-install      Skip repo-owned plugin artifact install step
   -h, --help                 Show this help text
 
 What it does:
@@ -23,7 +23,7 @@ What it does:
   - syncs this repo to the remote host and clones or updates zjctl
   - builds zellij_mcp and zjctl natively on the remote host
   - installs binaries into remote ~/.local/bin
-  - optionally installs zrpc.wasm and starts a detached tmux helper client
+  - optionally installs the repo-built zrpc.wasm and starts a detached tmux helper client
   - runs zjctl doctor against the target session at the end
   - prepares the host for the current single-MCP daemon flow or helper-script fallback usage
 EOF
@@ -105,8 +105,6 @@ while (($#)); do
 done
 
 [[ -n $host ]] || die "missing required <ssh-alias>"
-[[ -d $local_zjctl_repo ]] || die "local zjctl repo not found: $local_zjctl_repo"
-
 ssh_base=(ssh -oBatchMode=yes -oConnectTimeout=20 "${ssh_options[@]}" "$host")
 
 run_ssh() {
@@ -140,6 +138,8 @@ remote_state_dir="$remote_home/.local/state/zellij-mcp-$host"
 remote_git_root="$remote_home/Documents/git"
 remote_skill_repo="$remote_git_root/zellij-skill"
 remote_zjctl_repo="$remote_git_root/zjctl"
+remote_plugin_dir="$remote_home/.config/zellij/plugins"
+remote_plugin_artifact="$remote_skill_repo/target/wasm32-wasip1/release/zrpc.wasm"
 remote_path="$remote_home/.cargo/bin:$remote_bin_dir:/usr/local/bin:/usr/bin:/bin"
 quoted_remote_bin_dir=$(quote_posix_sh "$remote_bin_dir")
 quoted_remote_state_dir=$(quote_posix_sh "$remote_state_dir")
@@ -147,6 +147,8 @@ quoted_remote_git_root=$(quote_posix_sh "$remote_git_root")
 quoted_remote_home=$(quote_posix_sh "$remote_home")
 quoted_remote_skill_repo=$(quote_posix_sh "$remote_skill_repo")
 quoted_remote_zjctl_repo=$(quote_posix_sh "$remote_zjctl_repo")
+quoted_remote_plugin_dir=$(quote_posix_sh "$remote_plugin_dir")
+quoted_remote_plugin_artifact=$(quote_posix_sh "$remote_plugin_artifact")
 quoted_remote_path=$(quote_posix_sh "$remote_path")
 quoted_session_name=$(quote_posix_sh "$session_name")
 quoted_helper_session=$(quote_posix_sh "$helper_session")
@@ -155,7 +157,7 @@ quoted_attach_command=$(quote_posix_sh "$attach_command")
 
 printf 'Bootstrapping %s in user space\n' "$host" >&2
 
-run_ssh "mkdir -p$({ join_quoted_args "$remote_bin_dir" "$remote_state_dir" "$remote_git_root"; })"
+run_ssh "mkdir -p$({ join_quoted_args "$remote_bin_dir" "$remote_state_dir" "$remote_git_root" "$remote_plugin_dir"; })"
 
 run_ssh "if [ ! -x ${quoted_remote_home}/.cargo/bin/cargo ]; then curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal; fi"
 
@@ -164,10 +166,10 @@ tar --exclude='target' --exclude='.git' -czf - -C "$repo_root" . | \
 
 run_ssh "if [ -d ${quoted_remote_zjctl_repo}/.git ]; then git -C ${quoted_remote_zjctl_repo} fetch --depth 1 origin && git -C ${quoted_remote_zjctl_repo} reset --hard origin/HEAD; else git clone --depth 1 https://github.com/mrshu/zjctl.git ${quoted_remote_zjctl_repo}; fi"
 
-run_ssh "export PATH=${quoted_remote_path}; cargo build --release --manifest-path ${quoted_remote_zjctl_repo}/Cargo.toml; cargo build --release --manifest-path ${quoted_remote_skill_repo}/Cargo.toml; install -m 755 ${quoted_remote_zjctl_repo}/target/release/zjctl ${quoted_remote_bin_dir}/zjctl; install -m 755 ${quoted_remote_skill_repo}/target/release/zellij_mcp ${quoted_remote_bin_dir}/zellij_mcp"
+run_ssh "export PATH=${quoted_remote_path}; cargo build --release --manifest-path ${quoted_remote_zjctl_repo}/Cargo.toml; cargo build --release --manifest-path ${quoted_remote_skill_repo}/Cargo.toml; cargo build-plugin --manifest-path ${quoted_remote_skill_repo}/Cargo.toml; install -m 755 ${quoted_remote_zjctl_repo}/target/release/zjctl ${quoted_remote_bin_dir}/zjctl; install -m 755 ${quoted_remote_skill_repo}/target/release/zellij_mcp ${quoted_remote_bin_dir}/zellij_mcp"
 
 if (( skip_plugin_install == 0 )); then
-  run_ssh "export PATH=${quoted_remote_path}; ${quoted_remote_bin_dir}/zjctl install"
+  run_ssh "install -m 644 ${quoted_remote_plugin_artifact} ${quoted_remote_plugin_dir}/zrpc.wasm"
 fi
 
 if (( skip_helper_client == 0 )); then

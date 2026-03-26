@@ -1,10 +1,23 @@
-[package]
-name = "zellij_mcp"
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "crates/zjctl-proto",
+    "crates/zrpc",
+]
+default-members = [
+    ".",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/mrshu/zjctl"
 
-[dependencies]
+[workspace.dependencies]
 chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
 rmcp = { version = "1.2", features = ["server", "macros", "transport-io"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -12,3 +25,23 @@ shell-words = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+zellij-tile = "0.43"
+zjctl-proto = { path = "crates/zjctl-proto" }
+
+[package]
+name = "zellij_mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono.workspace = true
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shell-words.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+zjctl-proto.workspace = true

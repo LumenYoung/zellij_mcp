@@ -1,0 +1,17 @@
+[package]
+name = "zjctl-proto"
+description = "Protocol types for zjctl RPC communication"
+readme = "README.md"
+keywords = ["zellij", "rpc", "protocol"]
+categories = ["data-structures"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+regex.workspace = true

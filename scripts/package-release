@@ -39,15 +39,18 @@ if [[ "$tag" != "$expected_tag" ]]; then
 fi
 
 artifact_basename="zellij-mcp-${version}-linux-x86_64"
+plugin_artifact="target/wasm32-wasip1/release/zrpc.wasm"
 
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo build --release
+cargo build-plugin
 
 mkdir -p dist
 cp target/release/zellij_mcp dist/zellij_mcp
-tar -C dist -czf "dist/${artifact_basename}.tar.gz" zellij_mcp
+cp "$plugin_artifact" dist/zrpc.wasm
+tar -C dist -czf "dist/${artifact_basename}.tar.gz" zellij_mcp zrpc.wasm
 sha256sum "dist/${artifact_basename}.tar.gz" > "dist/${artifact_basename}.tar.gz.sha256"
 
 printf 'created %s\n' "dist/${artifact_basename}.tar.gz"

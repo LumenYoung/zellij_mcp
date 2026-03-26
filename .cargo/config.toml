@@ -1,0 +1,4 @@
+[alias]
+build-plugin = "build --release -p zjctl-zrpc --target wasm32-wasip1"
+
+[build]

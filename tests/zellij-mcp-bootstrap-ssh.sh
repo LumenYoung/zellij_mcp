@@ -72,7 +72,44 @@ EOF
   rm -rf "$temp_dir"
 }
 
+run_plugin_build_and_install_test() {
+  local temp_dir fake_ssh local_zjctl_repo stdout_file stderr_file log_file
+  temp_dir=$(mktemp -d)
+  fake_ssh="$temp_dir/ssh"
+  local_zjctl_repo="$temp_dir/local-zjctl"
+  stdout_file="$temp_dir/stdout.log"
+  stderr_file="$temp_dir/stderr.log"
+  log_file="$temp_dir/ssh.log"
+  mkdir -p "$local_zjctl_repo"
+
+  cat >"$fake_ssh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$BOOTSTRAP_TEST_LOG"
+if [[ ${*: -1} == 'printf %s "$HOME"' ]]; then
+  printf '%s' "/remote-home"
+fi
+cat >/dev/null || true
+EOF
+  chmod +x "$fake_ssh"
+
+  PATH="$temp_dir:$PATH" \
+  BOOTSTRAP_TEST_LOG="$log_file" \
+  "$SCRIPT_PATH" \
+  fake-host \
+  --remote-home "/remote-home" \
+  --session "phase4" \
+  --local-zjctl-repo "$local_zjctl_repo" \
+  --skip-helper-client >"$stdout_file" 2>"$stderr_file"
+
+  assert_contains "cargo build-plugin --manifest-path '/remote-home/Documents/git/zellij-skill'/Cargo.toml" "$(<"$log_file")" "bootstrap should build the repo-owned plugin artifact"
+  assert_contains "install -m 644 '/remote-home/Documents/git/zellij-skill/target/wasm32-wasip1/release/zrpc.wasm' '/remote-home/.config/zellij/plugins'/zrpc.wasm" "$(<"$log_file")" "bootstrap should install the built plugin artifact directly"
+
+  rm -rf "$temp_dir"
+}
+
 run_missing_alias_test
 run_help_test
 run_quote_contract_test
+run_plugin_build_and_install_test
 printf 'ok\n'
