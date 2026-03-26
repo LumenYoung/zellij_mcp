@@ -35,12 +35,19 @@ Recent spawn hardening:
 
 ```bash
 cargo build --release
+cargo build-plugin
 ```
 
 Binary path:
 
 ```text
 target/release/zellij_mcp
+```
+
+Plugin artifact path:
+
+```text
+target/wasm32-wasip1/release/zrpc.wasm
 ```
 
 ## Run manually
@@ -105,10 +112,10 @@ In that layered form, each alias starts from `defaults`, then only the fields pr
 Readiness and remediation:
 
 - the daemon checks remote SSH targets before it tries to use them, then classifies the target as `Ready`, `AutoFixable`, or `ManualActionRequired`
-- `AutoFixable` means the daemon can safely apply bounded remediation, such as starting a detached helper client, running `zjctl install` when `zjctl` already resolves, and retrying readiness exactly once
+- `AutoFixable` means the daemon can safely apply bounded remediation, such as copying the repo-built `zrpc.wasm` into the standard plugin directory, starting a detached helper client, and retrying readiness exactly once
 - `AutoFixable` is used specifically for missing binaries, helper-client absence, and RPC-not-ready drift that can still be recovered through deterministic user-space setup
 - when the remote command path does not already include it, the daemon prepends `$HOME/.local/bin` for non-interactive SSH probing and execution so ordinary hosts do not need per-host binary paths
-- `ManualActionRequired` covers the remaining interactive cases, especially unmanaged plugin approval prompts that still need a human to confirm them in the remote Zellij session
+- `ManualActionRequired` covers the remaining non-auto-fixable cases, including unmanaged plugin approval prompts and daemon/plugin protocol-version skew that requires matching artifacts before retrying
 - readiness does not claim zero-touch success for every host, it only fixes the safe, bounded cases automatically
 
 Freshness and diagnosability:
@@ -129,7 +136,7 @@ Bootstrap helper:
 ./scripts/zellij-mcp-bootstrap-ssh a100 --session a100
 ```
 
-The bootstrap helper stays entirely in user space. It installs Rust if needed, syncs this repo, clones or updates `zjctl`, builds the required binaries natively on the remote host, installs the plugin, starts a detached helper client, and finishes by running `zjctl doctor`.
+The bootstrap helper stays entirely in user space. It installs Rust if needed, syncs this repo, clones or updates `zjctl`, builds `zellij_mcp`, `zjctl`, and the repo-owned `zrpc.wasm` natively on the remote host, copies the plugin artifact into the standard Zellij plugin directory, starts a detached helper client, and finishes by running `zjctl doctor`.
 
 Operational helper note:
 
@@ -187,6 +194,7 @@ Notes:
 - `TARGET_NOT_FOUND`: the selected alias is unknown or the remote pane selector no longer resolves; verify `ZELLIJ_MCP_TARGETS`, the session name, and whether the pane still exists
 - `CAPTURE_FAILED`: the handle exists but the capture path degraded; retry with the same handle, then use `zellij_list` to revalidate ownership before assuming the pane is gone
 - `PLUGIN_NOT_READY`: the host is reachable but RPC preconditions are missing; distinguish helper-client absence, RPC-not-ready drift, and manual plugin approval before retrying
+- `PROTOCOL_VERSION_MISMATCH`: the daemon and loaded `zrpc` plugin disagree on `PROTOCOL_VERSION`; rebuild or reload matching artifacts before retrying because helper/plugin relaunch alone will not fix skew
 - `ZJCTL_UNAVAILABLE`: the transport or remote binary path is the problem; verify SSH reachability, native remote install, and that `zjctl` / `zellij` resolve in the non-interactive remote PATH
 
 ## More detail

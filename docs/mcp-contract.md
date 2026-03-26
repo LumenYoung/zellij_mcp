@@ -433,6 +433,7 @@ Input:
 - `CLOSE_FAILED`
 - `ZJCTL_UNAVAILABLE`
 - `PLUGIN_NOT_READY`
+- `PROTOCOL_VERSION_MISMATCH`
 - `PERSISTENCE_ERROR`
 
 ## Response Metadata
@@ -446,6 +447,7 @@ Input:
 - `TARGET_NOT_FOUND`: either the configured target alias is missing or a previously known selector no longer resolves; check target config first, then revalidate session/pane existence
 - `CAPTURE_FAILED`: the daemon still has a routed handle, but capture could not complete; retry with the same handle and let `zellij_list` or `zellij_capture` revalidate before discarding the binding
 - `PLUGIN_NOT_READY`: SSH transport reached the host, but plugin approval, helper-client presence, or RPC readiness is still missing; distinguish those cases before escalating to transport debugging
+- `PROTOCOL_VERSION_MISMATCH`: the daemon reached the plugin but `response.v` does not match the daemon's expected protocol version; use matching daemon/plugin artifacts before retrying rather than repeating helper or plugin-launch remediation
 - `ZJCTL_UNAVAILABLE`: the daemon could not reach the binary or the SSH-backed execution path; verify SSH reachability, non-interactive PATH resolution, and native binary availability on the remote host
 
 ## Phase 1 Guarantees

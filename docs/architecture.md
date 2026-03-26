@@ -227,9 +227,12 @@ The daemon returns stable domain errors rather than backend-specific command out
 - `CLOSE_FAILED`
 - `ZJCTL_UNAVAILABLE`
 - `PLUGIN_NOT_READY`
+- `PROTOCOL_VERSION_MISMATCH`
 - `PERSISTENCE_ERROR`
 
 `PLUGIN_NOT_READY` should cover cases where `zjctl` is installed but the target session still lacks RPC readiness. In practice that includes manual plugin approval, helper-client absence, and post-start RPC drift.
+
+`PROTOCOL_VERSION_MISMATCH` covers the narrower compatibility case where the daemon reaches the loaded `zrpc` plugin but the plugin replies with a different protocol version than the daemon expects. That is a compatibility problem, not transient RPC drift, so the daemon treats it as non-retryable until matching artifacts are loaded.
 
 Successful MCP responses now also carry `_daemon` identity metadata, and MCP error payloads carry the same daemon identity under `data.daemon`, so stale binaries and mixed-instance reports can be diagnosed without guessing.
 

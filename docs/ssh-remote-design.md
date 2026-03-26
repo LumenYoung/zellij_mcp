@@ -224,13 +224,15 @@ The readiness model is intentionally narrow and bounded:
 
 - `Ready`: the target already has what it needs for the current request
 - `AutoFixable`: the daemon can safely apply bounded remediation and try again
-- `ManualActionRequired`: a human still has to take action before the target can proceed
+- `ManualActionRequired`: a human still has to take action before the target can proceed, or the loaded daemon/plugin artifacts must be brought back into version alignment
 
 In operator-facing language, that last state is the manual-action-required path.
 
 Remote probing and execution already normalize the remote HOME and PATH. When non-interactive SSH is missing it, the daemon prepends `$HOME/.local/bin` before concluding that `zellij` or `zjctl` are unavailable.
 
-Auto-fix stays safe and bounded. It can install the `zjctl` plugin when `zjctl` is already resolvable, start a detached helper client when that is the missing precondition, and retry readiness exactly once.
+Auto-fix stays safe and bounded. It can install the repo-built `zrpc.wasm` into the standard plugin directory, start a detached helper client when that is the missing precondition, and retry readiness exactly once.
+
+Protocol/version mismatch is intentionally not part of that auto-fix bucket. Once the daemon can talk to the plugin well enough to learn that their protocol versions differ, retrying the same helper or plugin-launch flow is not enough; the operator needs matching artifacts loaded on the host.
 
 The daemon does not try to force through unmanaged interactive approval prompts. Those stay in `ManualActionRequired` until a person approves them in the remote Zellij session.
 
@@ -240,7 +242,7 @@ The practical meaning of the states is:
 
 - `Ready`: proceed with the routed SSH request
 - `AutoFixable`: apply safe remediation, then retry the same bounded probe or request
-- `ManualActionRequired`: stop and tell the user what still needs human input
+- `ManualActionRequired`: stop and tell the user what still needs human input or compatibility repair
 
 The daemon now also surfaces freshness metadata in two places that matter operationally:
 
