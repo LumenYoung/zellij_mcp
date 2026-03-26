@@ -3,8 +3,8 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use crate::adapters::zjctl::{
-    AdapterError, ZjctlAdapter, is_plugin_permission_prompt, is_rpc_not_ready_message,
-    missing_binary_name,
+    AdapterError, ZjctlAdapter, is_plugin_permission_prompt,
+    is_protocol_version_mismatch_message, is_rpc_not_ready_message, missing_binary_name,
 };
 use crate::domain::binding::TerminalBinding;
 use crate::domain::errors::{DomainError, ErrorCode};
@@ -223,6 +223,9 @@ where
             AdapterError::CommandFailed(message) if is_plugin_permission_prompt(&message) => {
                 DomainError::new(ErrorCode::PluginNotReady, message, false)
             }
+            AdapterError::CommandFailed(message) if is_protocol_version_mismatch_message(&message) => {
+                DomainError::new(ErrorCode::ProtocolVersionMismatch, message, false)
+            }
             AdapterError::CommandFailed(message) if is_rpc_not_ready_message(&message) => {
                 DomainError::new(ErrorCode::PluginNotReady, message, true)
             }
@@ -236,6 +239,31 @@ where
             format!("handle `{handle}` is not active"),
             false,
         )
+    }
+
+    fn is_remote_target(&self) -> bool {
+        self.target_id.starts_with("ssh:")
+    }
+
+    fn is_unresolved_spawn_binding(binding: &TerminalBinding) -> bool {
+        binding.source == BindingSource::Spawned && binding.pane_id.is_none()
+    }
+
+    fn should_skip_availability_for_binding(&self, binding: &TerminalBinding) -> bool {
+        self.is_remote_target() && Self::is_unresolved_spawn_binding(binding)
+    }
+
+    fn read_binding(&self, handle: &str) -> Result<TerminalBinding, DomainError> {
+        self.read_bindings()?
+            .into_iter()
+            .find(|binding| binding.handle == handle)
+            .ok_or_else(|| {
+                DomainError::new(
+                    ErrorCode::HandleNotFound,
+                    format!("handle `{handle}` is not registered"),
+                    false,
+                )
+            })
     }
 
     fn ensure_binding_active(binding: &TerminalBinding) -> Result<(), DomainError> {
@@ -358,6 +386,174 @@ where
         requests
     }
 
+    fn is_terminal_target(target: &crate::adapters::zjctl::ResolvedTarget) -> bool {
+        target
+            .pane_id
+            .as_deref()
+            .is_some_and(|pane_id| pane_id.starts_with("terminal:"))
+    }
+
+    fn provisional_spawn_selector(request: &SpawnRequest) -> String {
+        request
+            .title
+            .as_ref()
+            .map(|title| format!("title:{title}"))
+            .or_else(|| {
+                request
+                    .command
+                    .as_ref()
+                    .map(|command| format!("command:{command}"))
+            })
+            .or_else(|| {
+                request
+                    .argv
+                    .as_ref()
+                    .map(|argv| format!("command:{}", argv.join(" ")))
+            })
+            .or_else(|| request.tab_name.as_ref().map(|tab| format!("tab:{tab}")))
+            .unwrap_or_else(|| "focused".to_string())
+    }
+
+    fn spawn_response_from_binding(&self, binding: &TerminalBinding) -> SpawnResponse {
+        SpawnResponse {
+            handle: binding.handle.clone(),
+            target_id: self.target_id.clone(),
+            session_name: binding.session_name.clone(),
+            tab_name: binding.tab_name.clone(),
+            selector: binding.selector.clone(),
+            status: match binding.status {
+                TerminalStatus::Ready => "ready".to_string(),
+                TerminalStatus::Busy => "busy".to_string(),
+                TerminalStatus::Stale => "stale".to_string(),
+                TerminalStatus::Closed => "closed".to_string(),
+            },
+        }
+    }
+
+    fn spawn_reconcile_budget(wait_ready: bool) -> Duration {
+        if wait_ready {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(300)
+        }
+    }
+
+    fn resolve_spawn_candidate(
+        binding: &TerminalBinding,
+        observation: &TerminalObservation,
+        after: Vec<crate::adapters::zjctl::ResolvedTarget>,
+    ) -> Option<crate::adapters::zjctl::ResolvedTarget> {
+        let before_ids: std::collections::HashSet<&str> = observation
+            .spawn_before_pane_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut candidates: Vec<_> = after
+            .into_iter()
+            .filter(Self::is_terminal_target)
+            .filter(|target| {
+                target
+                    .pane_id
+                    .as_deref()
+                    .is_some_and(|pane_id| !before_ids.contains(pane_id))
+            })
+            .collect();
+
+        if let Some(tab_name) = observation
+            .spawn_tab_name
+            .as_ref()
+            .or(binding.tab_name.as_ref())
+        {
+            candidates.retain(|target| target.tab_name.as_deref() == Some(tab_name.as_str()));
+        }
+
+        if let Some(title) = observation.spawn_title.as_ref().or(binding.alias.as_ref()) {
+            let title_matches: Vec<_> = candidates
+                .iter()
+                .filter(|target| target.title.as_deref() == Some(title.as_str()))
+                .cloned()
+                .collect();
+            if let [target] = title_matches.as_slice() {
+                return Some(target.clone());
+            }
+        }
+
+        if let Some(command) = observation
+            .spawn_command
+            .as_ref()
+            .or(binding.launch_command.as_ref())
+        {
+            let command_matches: Vec<_> = candidates
+                .iter()
+                .filter(|target| target.command.as_deref() == Some(command.as_str()))
+                .cloned()
+                .collect();
+            if let [target] = command_matches.as_slice() {
+                return Some(target.clone());
+            }
+        }
+
+        match candidates.as_slice() {
+            [target] => Some(target.clone()),
+            _ => None,
+        }
+    }
+
+    fn reconcile_spawn_binding(
+        &self,
+        handle: &str,
+        budget: Duration,
+    ) -> Result<Option<TerminalBinding>, DomainError> {
+        let started = Instant::now();
+        loop {
+            let mut bindings = self.read_bindings()?;
+            let index = bindings
+                .iter()
+                .position(|binding| binding.handle == handle)
+                .ok_or_else(|| {
+                    DomainError::new(
+                        ErrorCode::HandleNotFound,
+                        format!("handle `{handle}` is not registered"),
+                        false,
+                    )
+                })?;
+
+            if bindings[index].pane_id.is_some() && !bindings[index].selector.is_empty() {
+                return Ok(Some(bindings[index].clone()));
+            }
+
+            let observations = self.read_observations()?;
+            let observation = observations
+                .iter()
+                .find(|item| item.handle == handle)
+                .cloned()
+                .unwrap_or_default();
+
+            let after = self
+                .adapter
+                .list_targets_in_session(&bindings[index].session_name)
+                .map_err(|error| self.map_adapter_error(error, ErrorCode::SpawnFailed))?;
+
+            if let Some(resolved) =
+                Self::resolve_spawn_candidate(&bindings[index], &observation, after)
+            {
+                bindings[index].selector = resolved.selector;
+                bindings[index].pane_id = resolved.pane_id;
+                bindings[index].tab_name = resolved.tab_name;
+                bindings[index].status = TerminalStatus::Ready;
+                bindings[index].updated_at = Utc::now();
+                let resolved_binding = bindings[index].clone();
+                self.write_bindings(&bindings)?;
+                return Ok(Some(resolved_binding));
+            }
+
+            if started.elapsed() >= budget {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+
     fn should_clear_attached_input(
         binding: &TerminalBinding,
         request: &SendRequest,
@@ -391,16 +587,8 @@ where
             })?;
 
         let mut observations = self.read_observations()?;
-        let observation = observations
-            .iter_mut()
-            .find(|item| item.handle == handle)
-            .ok_or_else(|| {
-                DomainError::new(
-                    ErrorCode::HandleNotFound,
-                    format!("observation for `{handle}` is missing"),
-                    false,
-                )
-            })?;
+        let index = Self::ensure_observation_slot(&mut observations, handle);
+        let observation = &mut observations[index];
 
         let hash = Self::hash_content(&snapshot.content);
         observation.update_full_snapshot(snapshot.content, hash, snapshot.captured_at);
@@ -408,6 +596,26 @@ where
         self.write_observations(&observations)?;
 
         Ok(())
+    }
+
+    fn sync_binding_from_active(binding: &mut TerminalBinding, active: &TerminalBinding) {
+        binding.selector = active.selector.clone();
+        binding.pane_id = active.pane_id.clone();
+        binding.tab_name = active.tab_name.clone();
+        binding.status = active.status;
+        binding.updated_at = active.updated_at;
+    }
+
+    fn ensure_observation_slot(observations: &mut Vec<TerminalObservation>, handle: &str) -> usize {
+        if let Some(index) = observations.iter().position(|item| item.handle == handle) {
+            return index;
+        }
+
+        observations.push(TerminalObservation {
+            handle: handle.to_string(),
+            ..TerminalObservation::default()
+        });
+        observations.len() - 1
     }
 
     fn attach_resolved_target(
@@ -516,6 +724,15 @@ where
             return Ok(bindings[index].clone());
         }
 
+        if Self::is_unresolved_spawn_binding(&bindings[index]) {
+            if let Some(reconciled) =
+                self.reconcile_spawn_binding(handle, Duration::from_millis(500))?
+            {
+                return Ok(reconciled);
+            }
+            return Ok(bindings[index].clone());
+        }
+
         self.ensure_session_ready(&bindings[index].session_name, ErrorCode::AttachFailed)?;
 
         for attempt in 0..3 {
@@ -559,7 +776,9 @@ where
         F: Fn(&TerminalBinding) -> Result<T, AdapterError>,
     {
         let mut current = binding.clone();
-        self.ensure_session_ready(&current.session_name, error_code.clone())?;
+        if !self.should_skip_availability_for_binding(&current) {
+            self.ensure_session_ready(&current.session_name, error_code.clone())?;
+        }
         for attempt in 0..3 {
             match operation(&current) {
                 Ok(result) => return Ok(result),
@@ -1019,16 +1238,8 @@ where
     ) -> Result<(), DomainError> {
         let hash = Self::hash_content(&snapshot.content);
         let mut observations = self.read_observations()?;
-        let observation = observations
-            .iter_mut()
-            .find(|item| item.handle == handle)
-            .ok_or_else(|| {
-                DomainError::new(
-                    ErrorCode::HandleNotFound,
-                    format!("observation for `{handle}` is missing"),
-                    false,
-                )
-            })?;
+        let index = Self::ensure_observation_slot(&mut observations, handle);
+        let observation = &mut observations[index];
         observation.update_full_snapshot(snapshot.content, hash, snapshot.captured_at);
         observation.reset_command_boundary();
         if let Some((_, completed, exit_code)) = Self::interaction_capture_from_observation(
@@ -1042,13 +1253,17 @@ where
     }
 
     pub fn revalidate_all(&self) -> Result<(), DomainError> {
-        if !self.adapter.is_available() {
+        if !self.is_remote_target() && !self.adapter.is_available() {
             return Ok(());
         }
 
         let bindings = self.read_bindings()?;
         for binding in bindings {
             if !self.binding_belongs_to_target(&binding) {
+                continue;
+            }
+            if self.should_skip_availability_for_binding(&binding) {
+                let _ = self.refresh_binding_target(&binding.handle);
                 continue;
             }
             let _ = self.refresh_binding_target(&binding.handle)?;
@@ -1063,24 +1278,46 @@ where
     A: ZjctlAdapter + Send + Sync,
 {
     fn spawn(&self, request: SpawnRequest) -> Result<SpawnResponse, DomainError> {
-        self.ensure_available()?;
-        self.ensure_session_ready(&request.session_name, ErrorCode::SpawnFailed)?;
+        let detached_remote_launch = self.target_id.starts_with("ssh:");
+        if !detached_remote_launch {
+            self.ensure_available()?;
+        }
+        let before = if detached_remote_launch {
+            self.adapter
+                .list_targets_in_session(&request.session_name)
+                .unwrap_or_default()
+        } else {
+            self.ensure_session_ready(&request.session_name, ErrorCode::SpawnFailed)?;
+            self.adapter
+                .list_targets_in_session(&request.session_name)
+                .map_err(|error| self.map_adapter_error(error, ErrorCode::SpawnFailed))?
+        };
 
-        let resolved = self
+        let launched = self
             .adapter
-            .spawn(&request)
+            .launch_spawn(&request)
             .map_err(|error| self.map_adapter_error(error, ErrorCode::SpawnFailed))?;
+        let detached_launch = launched.is_none();
 
         let handle = Self::next_handle();
         let now = Utc::now();
+        let selector = launched
+            .as_ref()
+            .map(|resolved| resolved.selector.clone())
+            .unwrap_or_else(|| Self::provisional_spawn_selector(&request));
         let binding = TerminalBinding {
             handle: handle.clone(),
             target_id: self.target_id.clone(),
             alias: request.title.clone(),
-            session_name: resolved.session_name.clone(),
-            tab_name: resolved.tab_name.clone(),
-            selector: resolved.selector.clone(),
-            pane_id: resolved.pane_id.clone(),
+            session_name: request.session_name.clone(),
+            tab_name: launched
+                .as_ref()
+                .and_then(|resolved| resolved.tab_name.clone())
+                .or_else(|| request.tab_name.clone()),
+            selector,
+            pane_id: launched
+                .as_ref()
+                .and_then(|resolved| resolved.pane_id.clone()),
             cwd: request.cwd.clone(),
             launch_command: Self::launch_command_summary(&request),
             source: BindingSource::Spawned,
@@ -1088,16 +1325,39 @@ where
             created_at: now,
             updated_at: now,
         };
-        let observation = TerminalObservation {
+        let mut observation = TerminalObservation {
             handle: handle.clone(),
             ..TerminalObservation::default()
         };
+        observation.set_spawn_hints(
+            before
+                .into_iter()
+                .filter_map(|target| target.pane_id)
+                .collect(),
+            request.spawn_target,
+            request.tab_name.clone(),
+            request.title.clone(),
+            Self::launch_command_summary(&request),
+            now,
+        );
         self.persist_spawn_state(binding.clone(), observation)?;
+
+        if detached_launch {
+            return Ok(self.spawn_response_from_binding(&binding));
+        }
+
+        let active_binding = match self.ensure_handle_revalidated(&handle) {
+            Ok(binding) => binding,
+            Err(error) => {
+                self.remove_persisted_handle(&handle)?;
+                return Err(error);
+            }
+        };
 
         if request.wait_ready {
             let wait_result = self.run_binding_operation_with_retry(
                 &handle,
-                &binding,
+                &active_binding,
                 ErrorCode::WaitFailed,
                 |binding| {
                     self.adapter
@@ -1108,20 +1368,18 @@ where
                 Err(DomainError {
                     code: ErrorCode::TargetStale,
                     ..
-                }) => self.wait_via_capture_polling(&handle, &binding, 1200, 30_000),
+                }) => self.wait_via_capture_polling(&handle, &active_binding, 1200, 30_000),
                 other => other,
             };
 
             if let Err(error) = wait_result {
-                if error.code == ErrorCode::WaitTimeout {
-                    return Ok(SpawnResponse {
-                        handle,
-                        target_id: self.target_id.clone(),
-                        session_name: resolved.session_name,
-                        tab_name: resolved.tab_name,
-                        selector: resolved.selector,
-                        status: "busy".to_string(),
-                    });
+                if error.code == ErrorCode::WaitTimeout
+                    || (detached_launch
+                        && matches!(error.code, ErrorCode::TargetStale | ErrorCode::WaitFailed))
+                {
+                    let binding =
+                        self.update_spawn_status(&handle, TerminalStatus::Busy, Utc::now())?;
+                    return Ok(self.spawn_response_from_binding(&binding));
                 }
                 self.remove_persisted_handle(&handle)?;
                 return Err(error);
@@ -1131,6 +1389,13 @@ where
         let capture_binding = match self.ensure_handle_revalidated(&handle) {
             Ok(binding) => binding,
             Err(error) => {
+                if detached_launch
+                    && matches!(error.code, ErrorCode::TargetStale | ErrorCode::AttachFailed)
+                {
+                    let binding =
+                        self.update_spawn_status(&handle, TerminalStatus::Busy, Utc::now())?;
+                    return Ok(self.spawn_response_from_binding(&binding));
+                }
                 self.remove_persisted_handle(&handle)?;
                 return Err(error);
             }
@@ -1146,16 +1411,12 @@ where
         ) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                if error.code == ErrorCode::CaptureFailed {
-                    self.update_spawn_status(&handle, TerminalStatus::Busy, Utc::now())?;
-                    return Ok(SpawnResponse {
-                        handle,
-                        target_id: self.target_id.clone(),
-                        session_name: resolved.session_name,
-                        tab_name: resolved.tab_name,
-                        selector: resolved.selector,
-                        status: "busy".to_string(),
-                    });
+                if error.code == ErrorCode::CaptureFailed
+                    || (detached_launch && error.code == ErrorCode::TargetStale)
+                {
+                    let binding =
+                        self.update_spawn_status(&handle, TerminalStatus::Busy, Utc::now())?;
+                    return Ok(self.spawn_response_from_binding(&binding));
                 }
                 self.remove_persisted_handle(&handle)?;
                 return Err(error);
@@ -1163,15 +1424,9 @@ where
         };
         self.update_spawn_observation(&handle, snapshot.clone())?;
         self.update_spawn_status(&handle, TerminalStatus::Ready, snapshot.captured_at)?;
+        let ready_binding = self.ensure_handle_revalidated(&handle)?;
 
-        Ok(SpawnResponse {
-            handle,
-            target_id: self.target_id.clone(),
-            session_name: resolved.session_name,
-            tab_name: resolved.tab_name,
-            selector: resolved.selector,
-            status: "ready".to_string(),
-        })
+        Ok(self.spawn_response_from_binding(&ready_binding))
     }
 
     fn attach(&self, request: AttachRequest) -> Result<AttachResponse, DomainError> {
@@ -1296,12 +1551,15 @@ where
     }
 
     fn capture(&self, request: CaptureRequest) -> Result<CaptureResponse, DomainError> {
-        self.ensure_available()?;
+        let stored_binding = self.read_binding(&request.handle)?;
+        if !self.should_skip_availability_for_binding(&stored_binding) {
+            self.ensure_available()?;
+        }
         let tail_lines = Self::validate_positive_lines(request.tail_lines, "tail_lines")?;
         let (line_offset, line_limit) = Self::resolve_capture_window(&request)?;
 
-        let mut bindings = self.read_bindings()?;
         let active = self.ensure_handle_revalidated(&request.handle)?;
+        let mut bindings = self.read_bindings()?;
         let binding = bindings
             .iter_mut()
             .find(|binding| binding.handle == request.handle)
@@ -1312,8 +1570,7 @@ where
                     false,
                 )
             })?;
-        binding.status = active.status;
-        binding.updated_at = active.updated_at;
+        Self::sync_binding_from_active(binding, &active);
 
         Self::ensure_binding_active(binding)?;
 
@@ -1328,16 +1585,7 @@ where
         )?;
 
         let mut observations = self.read_observations()?;
-        let index = observations
-            .iter()
-            .position(|item| item.handle == request.handle)
-            .ok_or_else(|| {
-                DomainError::new(
-                    ErrorCode::HandleNotFound,
-                    format!("observation for `{}` is missing", request.handle),
-                    false,
-                )
-            })?;
+        let index = Self::ensure_observation_slot(&mut observations, &request.handle);
 
         let observation = &mut observations[index];
         let previous_full = observation.last_full_content.clone();
@@ -1394,6 +1642,9 @@ where
             .as_ref()
             .map(|_| observation.interaction_completed_at.is_some());
         let interaction_exit_code = observation.interaction_exit_code;
+        if binding.source == BindingSource::Spawned && binding.status == TerminalStatus::Busy {
+            binding.status = TerminalStatus::Ready;
+        }
         binding.updated_at = snapshot.captured_at;
         self.write_bindings(&bindings)?;
         self.write_observations(&observations)?;
@@ -1470,16 +1721,8 @@ where
 
         if let Some(interaction_id) = interaction_id {
             let mut observations = self.read_observations()?;
-            let observation = observations
-                .iter_mut()
-                .find(|item| item.handle == request.handle)
-                .ok_or_else(|| {
-                    DomainError::new(
-                        ErrorCode::HandleNotFound,
-                        format!("observation for `{}` is missing", request.handle),
-                        false,
-                    )
-                })?;
+            let index = Self::ensure_observation_slot(&mut observations, &request.handle);
+            let observation = &mut observations[index];
             observation.start_interaction(interaction_id, Utc::now());
             self.write_observations(&observations)?;
         }
@@ -1490,16 +1733,8 @@ where
                 && !clear_attached_input)
         {
             let mut observations = self.read_observations()?;
-            let observation = observations
-                .iter_mut()
-                .find(|item| item.handle == request.handle)
-                .ok_or_else(|| {
-                    DomainError::new(
-                        ErrorCode::HandleNotFound,
-                        format!("observation for `{}` is missing", request.handle),
-                        false,
-                    )
-                })?;
+            let index = Self::ensure_observation_slot(&mut observations, &request.handle);
+            let observation = &mut observations[index];
             observation.reset_command_boundary();
             self.write_observations(&observations)?;
         }
@@ -1649,10 +1884,13 @@ where
     }
 
     fn wait(&self, request: WaitRequest) -> Result<WaitResponse, DomainError> {
-        self.ensure_available()?;
+        let stored_binding = self.read_binding(&request.handle)?;
+        if !self.should_skip_availability_for_binding(&stored_binding) {
+            self.ensure_available()?;
+        }
 
-        let mut bindings = self.read_bindings()?;
         let active = self.ensure_handle_revalidated(&request.handle)?;
+        let mut bindings = self.read_bindings()?;
         let binding = bindings
             .iter_mut()
             .find(|binding| binding.handle == request.handle)
@@ -1664,8 +1902,7 @@ where
                 )
             })?;
 
-        binding.status = active.status;
-        binding.updated_at = active.updated_at;
+        Self::sync_binding_from_active(binding, &active);
         Self::ensure_binding_active(binding)?;
         binding.status = TerminalStatus::Busy;
         let busy_binding = binding.clone();
@@ -1743,11 +1980,10 @@ where
             },
         )?;
         let mut observations = self.read_observations()?;
-        if let Some(observation) = observations
-            .iter_mut()
-            .find(|item| item.handle == request.handle)
-            && let Some((_, completed, exit_code)) =
-                Self::interaction_capture_from_observation(&snapshot.content, observation)
+        let index = Self::ensure_observation_slot(&mut observations, &request.handle);
+        let observation = &mut observations[index];
+        if let Some((_, completed, exit_code)) =
+            Self::interaction_capture_from_observation(&snapshot.content, observation)
         {
             interaction_id = observation.interaction_id.clone();
             interaction_completed = Some(completed);
@@ -1756,10 +1992,10 @@ where
                 observation.complete_interaction(exit_code, snapshot.captured_at);
                 completion_basis = Some("interaction_marker".to_string());
             }
-            let hash = Self::hash_content(&snapshot.content);
-            observation.update_full_snapshot(snapshot.content, hash, snapshot.captured_at);
-            self.write_observations(&observations)?;
         }
+        let hash = Self::hash_content(&snapshot.content);
+        observation.update_full_snapshot(snapshot.content, hash, snapshot.captured_at);
+        self.write_observations(&observations)?;
 
         Ok(WaitResponse {
             handle: request.handle,
@@ -1775,8 +2011,8 @@ where
     fn close(&self, request: CloseRequest) -> Result<CloseResponse, DomainError> {
         self.ensure_available()?;
 
-        let mut bindings = self.read_bindings()?;
         let active = self.ensure_handle_revalidated(&request.handle)?;
+        let mut bindings = self.read_bindings()?;
         let index = bindings
             .iter()
             .position(|binding| binding.handle == request.handle)
@@ -1788,8 +2024,7 @@ where
                 )
             })?;
 
-        bindings[index].status = active.status;
-        bindings[index].updated_at = active.updated_at;
+        Self::sync_binding_from_active(&mut bindings[index], &active);
         if bindings[index].status == TerminalStatus::Closed {
             return Ok(CloseResponse {
                 handle: request.handle,
@@ -1897,6 +2132,8 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct MockAdapter {
+        available: bool,
+        detached_launch: bool,
         target: ResolvedTarget,
         list_targets: Vec<ResolvedTarget>,
         captures: Vec<String>,
@@ -1919,6 +2156,8 @@ mod tests {
     impl MockAdapter {
         fn single_capture(content: &str) -> Self {
             Self {
+                available: true,
+                detached_launch: false,
                 target: ResolvedTarget {
                     selector: "id:terminal:7".to_string(),
                     pane_id: Some("terminal:7".to_string()),
@@ -1981,7 +2220,7 @@ mod tests {
 
     impl ZjctlAdapter for MockAdapter {
         fn is_available(&self) -> bool {
-            true
+            self.available
         }
 
         fn ensure_session_ready(&self, _session_name: &str) -> Result<(), AdapterError> {
@@ -1990,6 +2229,15 @@ mod tests {
 
         fn spawn(&self, _request: &SpawnRequest) -> Result<ResolvedTarget, AdapterError> {
             Ok(self.target.clone())
+        }
+
+        fn launch_spawn(&self, request: &SpawnRequest) -> Result<Option<ResolvedTarget>, AdapterError> {
+            if self.detached_launch {
+                let _ = request;
+                Ok(None)
+            } else {
+                self.spawn(request).map(Some)
+            }
         }
 
         fn resolve_selector(
@@ -3670,6 +3918,145 @@ mod tests {
     }
 
     #[test]
+    fn detached_remote_spawn_skips_availability_probe_and_returns_busy_handle() {
+        let mut adapter = MockAdapter::single_capture("ready");
+        adapter.available = false;
+        adapter.detached_launch = true;
+        let service = make_remote_service("ssh:a100", adapter);
+
+        let response = service
+            .spawn(SpawnRequest {
+                target: Some("a100".to_string()),
+                session_name: "gpu".to_string(),
+                spawn_target: SpawnTarget::NewTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: Some("shell".to_string()),
+                wait_ready: true,
+            })
+            .expect("detached remote spawn should not require is_available before returning");
+
+        let bindings = service.registry_store.load().expect("bindings should load");
+        assert_eq!(response.status, "busy");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].target_id, "ssh:a100");
+        assert_eq!(bindings[0].status, TerminalStatus::Busy);
+        assert_eq!(bindings[0].pane_id, None);
+    }
+
+    #[test]
+    fn remote_busy_spawn_capture_skips_availability_and_promotes_ready() {
+        let mut adapter = MockAdapter::single_capture("phase3 recovered");
+        adapter.available = false;
+        adapter.detached_launch = true;
+        let service = make_remote_service("ssh:a100", adapter);
+
+        let spawned = service
+            .spawn(SpawnRequest {
+                target: Some("a100".to_string()),
+                session_name: "gpu".to_string(),
+                spawn_target: SpawnTarget::NewTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: Some("phase3-recover".to_string()),
+                wait_ready: true,
+            })
+            .expect("spawn should return busy");
+
+        let capture = service
+            .capture(CaptureRequest {
+                handle: spawned.handle.clone(),
+                mode: CaptureMode::Full,
+                tail_lines: None,
+                line_offset: None,
+                line_limit: None,
+                cursor: None,
+                normalize_ansi: false,
+            })
+            .expect("capture should use the persisted selector without availability probing");
+
+        let bindings = service.registry_store.load().expect("bindings should load");
+        assert_eq!(capture.capture.content, "phase3 recovered");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].handle, spawned.handle);
+        assert_eq!(bindings[0].status, TerminalStatus::Ready);
+    }
+
+    #[test]
+    fn remote_busy_spawn_wait_skips_session_ready_and_promotes_ready() {
+        let mut adapter = MockAdapter::single_capture("phase3 recovered");
+        adapter.available = false;
+        adapter.detached_launch = true;
+        let service = make_remote_service("ssh:a100", adapter);
+
+        let spawned = service
+            .spawn(SpawnRequest {
+                target: Some("a100".to_string()),
+                session_name: "gpu".to_string(),
+                spawn_target: SpawnTarget::NewTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: Some("phase3-wait".to_string()),
+                wait_ready: true,
+            })
+            .expect("spawn should return busy");
+
+        let waited = service
+            .wait(WaitRequest {
+                handle: spawned.handle.clone(),
+                idle_ms: 100,
+                timeout_ms: 1000,
+            })
+            .expect("wait should use the persisted selector without session readiness preflight");
+
+        let bindings = service.registry_store.load().expect("bindings should load");
+        assert_eq!(waited.status, "idle");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].handle, spawned.handle);
+        assert_eq!(bindings[0].status, TerminalStatus::Ready);
+    }
+
+    #[test]
+    fn remote_busy_spawn_list_skips_availability_and_surfaces_busy_binding() {
+        let mut adapter = MockAdapter::single_capture("ready");
+        adapter.available = false;
+        adapter.detached_launch = true;
+        let service = make_remote_service("ssh:a100", adapter);
+
+        let spawned = service
+            .spawn(SpawnRequest {
+                target: Some("a100".to_string()),
+                session_name: "gpu".to_string(),
+                spawn_target: SpawnTarget::NewTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: Some("phase3-list".to_string()),
+                wait_ready: true,
+            })
+            .expect("spawn should return busy");
+
+        let listed = service
+            .list(ListRequest {
+                target: Some("a100".to_string()),
+                session_name: Some("gpu".to_string()),
+            })
+            .expect("list should return the persisted busy binding without hanging");
+
+        assert_eq!(listed.bindings.len(), 1);
+        assert_eq!(listed.bindings[0].handle, spawned.handle);
+        assert_eq!(listed.bindings[0].status, TerminalStatus::Busy);
+        assert_eq!(listed.bindings[0].pane_id, None);
+    }
+
+    #[test]
     fn spawn_fatal_wait_error_cleans_up_persisted_state() {
         let mut adapter = MockAdapter::single_capture("ready");
         adapter.wait_fails = true;
@@ -3879,6 +4266,132 @@ mod tests {
             .expect("wait should succeed");
 
         assert_eq!(response.status, "idle");
+    }
+
+    #[test]
+    fn capture_preserves_refreshed_selector_after_revalidation() {
+        let root = std::env::temp_dir().join(format!("zellij-mcp-test-{}", uuid::Uuid::new_v4()));
+        let service = make_service_with_root(MockAdapter::single_capture("baseline"), root.clone());
+
+        let spawned = service
+            .spawn(SpawnRequest {
+                target: None,
+                session_name: "gpu".to_string(),
+                spawn_target: SpawnTarget::ExistingTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: None,
+                wait_ready: false,
+            })
+            .expect("spawn should succeed");
+
+        let mut bindings = service.registry_store.load().expect("bindings should load");
+        bindings[0].selector = "terminal:7".to_string();
+        service
+            .registry_store
+            .save(&bindings)
+            .expect("bindings should save");
+
+        let follow_up = make_service_with_root(MockAdapter::single_capture("after"), root);
+        follow_up
+            .capture(CaptureRequest {
+                handle: spawned.handle.clone(),
+                mode: CaptureMode::Full,
+                tail_lines: None,
+                line_offset: None,
+                line_limit: None,
+                cursor: None,
+                normalize_ansi: false,
+            })
+            .expect("capture should succeed after revalidation");
+
+        let bindings = follow_up
+            .registry_store
+            .load()
+            .expect("bindings should load");
+        assert_eq!(bindings[0].selector, "id:terminal:7");
+        assert_eq!(bindings[0].pane_id.as_deref(), Some("terminal:7"));
+    }
+
+    #[test]
+    fn capture_recreates_missing_observation() {
+        let service = make_service(MockAdapter::capture_sequence(&["baseline", "after"]));
+
+        let attach = service
+            .attach(AttachRequest {
+                target: None,
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        service
+            .observation_store
+            .save(&[])
+            .expect("observations should save");
+
+        let response = service
+            .capture(CaptureRequest {
+                handle: attach.handle.clone(),
+                mode: CaptureMode::Delta,
+                tail_lines: None,
+                line_offset: None,
+                line_limit: None,
+                cursor: None,
+                normalize_ansi: false,
+            })
+            .expect("capture should recreate observation");
+
+        assert_eq!(response.capture.content, "after");
+        let observations = service
+            .observation_store
+            .load()
+            .expect("observations should load");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].handle, attach.handle);
+        assert_eq!(observations[0].last_full_content.as_deref(), Some("after"));
+    }
+
+    #[test]
+    fn send_recreates_missing_observation_state() {
+        let service = make_service(MockAdapter::single_capture("baseline"));
+
+        let attach = service
+            .attach(AttachRequest {
+                target: None,
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        service
+            .observation_store
+            .save(&[])
+            .expect("observations should save");
+
+        service
+            .send(SendRequest {
+                handle: attach.handle.clone(),
+                text: "echo hello".to_string(),
+                keys: vec![],
+                input_mode: Some(InputMode::SubmitLine),
+                submit: false,
+            })
+            .expect("send should recreate observation state");
+
+        let observations = service
+            .observation_store
+            .load()
+            .expect("observations should load");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].handle, attach.handle);
+        assert!(observations[0].interaction_id.is_some());
     }
 
     #[test]
@@ -4430,5 +4943,20 @@ mod tests {
             .expect("list should succeed");
 
         assert_eq!(listed.bindings[0].status, TerminalStatus::Stale);
+    }
+
+    #[test]
+    fn map_adapter_error_preserves_protocol_version_mismatch_code() {
+        let service = make_service(MockAdapter::single_capture("baseline"));
+        let message = "zrpc protocol version mismatch: expected 1, got 2";
+
+        let error = service.map_adapter_error(
+            AdapterError::CommandFailed(message.to_string()),
+            ErrorCode::AttachFailed,
+        );
+
+        assert_eq!(error.code, ErrorCode::ProtocolVersionMismatch);
+        assert_eq!(error.message, message);
+        assert!(!error.retryable);
     }
 }

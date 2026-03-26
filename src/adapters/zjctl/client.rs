@@ -1,17 +1,64 @@
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
-use std::process::Command;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
+use zjctl_proto::{PROTOCOL_VERSION, RpcRequest, RpcResponse, methods};
 
-use crate::adapters::zjctl::{AdapterError, ZjctlCommand};
+use crate::adapters::zjctl::AdapterError;
 use crate::domain::requests::{AttachRequest, SpawnRequest};
 use crate::domain::status::SpawnTarget;
 
-use super::parser::{parse_capture_output, parse_list_output, parse_spawn_output};
+use super::commands::ZjctlCommand;
+use super::parser::{parse_capture_output, parse_spawn_output};
 
 fn quote_posix_sh(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+const RPC_PIPE_NAME: &str = "zjctl-rpc";
+const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn wait_for_output_with_timeout(
+    mut child: Child,
+    timeout: Duration,
+) -> Result<Output, AdapterError> {
+    let start = std::time::Instant::now();
+    loop {
+        if child.try_wait().map_err(|_| AdapterError::ZjctlUnavailable)?.is_some() {
+            return child
+                .wait_with_output()
+                .map_err(|_| AdapterError::ZjctlUnavailable);
+        }
+
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AdapterError::Timeout);
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct PaneInfo {
+    id: String,
+    pane_type: String,
+    title: String,
+    command: Option<String>,
+    tab_index: usize,
+    tab_name: String,
+    focused: bool,
+    floating: bool,
+    suppressed: bool,
+    #[serde(default)]
+    rows: usize,
+    #[serde(default)]
+    cols: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +83,9 @@ pub trait ZjctlAdapter {
     fn is_available(&self) -> bool;
     fn ensure_session_ready(&self, session_name: &str) -> Result<(), AdapterError>;
     fn spawn(&self, request: &SpawnRequest) -> Result<ResolvedTarget, AdapterError>;
+    fn launch_spawn(&self, request: &SpawnRequest) -> Result<Option<ResolvedTarget>, AdapterError> {
+        self.spawn(request).map(Some)
+    }
     fn resolve_selector(&self, request: &AttachRequest) -> Result<ResolvedTarget, AdapterError>;
     fn list_targets_in_session(
         &self,
@@ -65,9 +115,7 @@ pub trait ZjctlAdapter {
 }
 
 #[derive(Debug, Clone)]
-pub struct ZjctlClient {
-    binary: String,
-}
+pub struct ZjctlClient;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct SshTargetConfig {
@@ -99,6 +147,7 @@ pub enum SshReadinessFailure {
     PluginPermissionPrompt { host: String, detail: String },
     HelperClientMissing { host: String, detail: String },
     RpcNotReady { host: String, detail: String },
+    ProtocolVersionMismatch { host: String, detail: String },
 }
 
 trait RemoteRemediationRunner {
@@ -203,9 +252,7 @@ impl RemoteProbe for SshRemoteProbe<'_> {
         session_name: &str,
     ) -> Result<(), AdapterError> {
         let client = SshZjctlClient::new(config.clone());
-        client
-            .run_command(Some(session_name), ZjctlCommand::List)
-            .map(|_| ())
+        client.list_targets_for_session(session_name).map(|_| ())
     }
 }
 
@@ -256,20 +303,20 @@ fn attempt_safe_ssh_readiness_remediation_with_probe_and_runner(
         | SshReadinessFailure::HelperClientMissing { .. }
         | SshReadinessFailure::RpcNotReady { .. } => {}
         SshReadinessFailure::SshUnreachable { .. }
-        | SshReadinessFailure::PluginPermissionPrompt { .. } => return false,
+        | SshReadinessFailure::PluginPermissionPrompt { .. }
+        | SshReadinessFailure::ProtocolVersionMismatch { .. } => return false,
     }
 
     let context = SshReadinessRemediationContext::discover(config, session_name, probe);
     let mut remediated = false;
 
-    if let Some(zjctl_bin) = context.zjctl_bin.as_deref() {
-        remediated |= install_zjctl_plugin(config, &context, zjctl_bin, runner);
-    }
-
     if let (Some(tmux_bin), Some(zellij_bin)) =
         (context.tmux_bin.as_deref(), context.zellij_bin.as_deref())
     {
         remediated |= start_helper_client(config, &context, tmux_bin, zellij_bin, runner);
+        remediated |= launch_zrpc_plugin(config, &context, zellij_bin, runner);
+    } else if let Some(zellij_bin) = context.zellij_bin.as_deref() {
+        remediated |= launch_zrpc_plugin(config, &context, zellij_bin, runner);
     }
 
     remediated
@@ -277,8 +324,8 @@ fn attempt_safe_ssh_readiness_remediation_with_probe_and_runner(
 
 #[derive(Debug, Clone, Default)]
 struct SshReadinessRemediationContext {
+    home: Option<String>,
     normalized_path: Option<String>,
-    zjctl_bin: Option<String>,
     zellij_bin: Option<String>,
     tmux_bin: Option<String>,
     session_name: String,
@@ -301,12 +348,6 @@ impl SshReadinessRemediationContext {
             (None, None) => probe.discover_path().ok(),
         };
 
-        let zjctl_bin = resolve_existing_remote_binary(
-            &config.remote_zjctl_bin,
-            normalized_path.as_deref(),
-            home.as_deref(),
-            probe,
-        );
         let zellij_bin = resolve_existing_remote_binary(
             &config.remote_zellij_bin,
             normalized_path.as_deref(),
@@ -323,8 +364,8 @@ impl SshReadinessRemediationContext {
         let helper_session_name = format!("zellij-mcp-client-{session_name}");
 
         Self {
+            home,
             normalized_path,
-            zjctl_bin,
             zellij_bin,
             tmux_bin,
             session_name,
@@ -354,6 +395,17 @@ impl SshReadinessRemediationContext {
         }
 
         assignments
+    }
+
+    fn plugin_path(&self, config: &SshTargetConfig) -> String {
+        if let Some(xdg_config_home) = config.remote_env.get("XDG_CONFIG_HOME") {
+            return format!("{xdg_config_home}/zellij/plugins/zrpc.wasm");
+        }
+
+        self.home
+            .as_ref()
+            .map(|home| format!("{home}/.config/zellij/plugins/zrpc.wasm"))
+            .unwrap_or_else(|| "$HOME/.config/zellij/plugins/zrpc.wasm".to_string())
     }
 }
 
@@ -406,16 +458,20 @@ fn build_remote_exec_env_command(
     command
 }
 
-fn install_zjctl_plugin(
+fn launch_zrpc_plugin(
     config: &SshTargetConfig,
     context: &SshReadinessRemediationContext,
-    zjctl_bin: &str,
+    zellij_bin: &str,
     runner: &dyn RemoteRemediationRunner,
 ) -> bool {
     let command = build_remote_exec_env_command(
-        zjctl_bin,
-        &context.env_assignments(config, false),
-        &["install".to_string()],
+        zellij_bin,
+        &context.env_assignments(config, true),
+        &[
+            "action".to_string(),
+            "launch-plugin".to_string(),
+            format!("file:{}", context.plugin_path(config)),
+        ],
     );
     runner.run(config, &command).is_ok()
 }
@@ -487,6 +543,15 @@ fn classify_ssh_readiness_failure(host: &str, error: AdapterError) -> SshBackend
                 );
             }
 
+            if is_protocol_version_mismatch_message(&message) {
+                return SshBackendReadiness::ManualActionRequired(
+                    SshReadinessFailure::ProtocolVersionMismatch {
+                        host: host.to_string(),
+                        detail: message,
+                    },
+                );
+            }
+
             if is_rpc_not_ready_message(&message) {
                 return SshBackendReadiness::AutoFixable(SshReadinessFailure::RpcNotReady {
                     host: host.to_string(),
@@ -516,7 +581,10 @@ fn readiness_failure_to_adapter_error(failure: SshReadinessFailure) -> AdapterEr
         SshReadinessFailure::SshUnreachable { detail, .. }
         | SshReadinessFailure::PluginPermissionPrompt { detail, .. }
         | SshReadinessFailure::HelperClientMissing { detail, .. }
-        | SshReadinessFailure::RpcNotReady { detail, .. } => AdapterError::CommandFailed(detail),
+        | SshReadinessFailure::RpcNotReady { detail, .. }
+        | SshReadinessFailure::ProtocolVersionMismatch { detail, .. } => {
+            AdapterError::CommandFailed(detail)
+        }
     }
 }
 
@@ -548,6 +616,14 @@ pub fn is_rpc_not_ready_message(message: &str) -> bool {
         || lower.contains("client")
 }
 
+pub fn is_protocol_version_mismatch_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("zrpc protocol version mismatch")
+        || (lower.contains("protocol version mismatch")
+            && lower.contains("expected")
+            && lower.contains("got"))
+}
+
 pub fn is_helper_client_missing_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     (lower.contains("helper") && lower.contains("client"))
@@ -566,10 +642,9 @@ fn resolve_ssh_runtime_config_with_probe(
     config: &SshTargetConfig,
     probe: &dyn RemoteProbe,
 ) -> Result<SshTargetConfig, AdapterError> {
-    let needs_zjctl_probe = binary_needs_probe(&config.remote_zjctl_bin);
     let needs_zellij_probe = binary_needs_probe(&config.remote_zellij_bin);
 
-    if !needs_zjctl_probe && !needs_zellij_probe {
+    if !needs_zellij_probe {
         return Ok(config.clone());
     }
 
@@ -589,10 +664,16 @@ fn resolve_ssh_runtime_config_with_probe(
         .remote_env
         .insert("PATH".to_string(), normalized_path.clone());
 
-    resolved.remote_zjctl_bin =
-        resolve_remote_binary(&config.remote_zjctl_bin, &home, &normalized_path, probe)?;
     resolved.remote_zellij_bin =
         resolve_remote_binary(&config.remote_zellij_bin, &home, &normalized_path, probe)?;
+    if let Some(remote_zjctl_bin) = resolve_existing_remote_binary(
+        &config.remote_zjctl_bin,
+        Some(&normalized_path),
+        Some(&home),
+        probe,
+    ) {
+        resolved.remote_zjctl_bin = remote_zjctl_bin;
+    }
 
     Ok(resolved)
 }
@@ -620,6 +701,35 @@ fn prepend_path_entry(path: &str, entry: &str) -> String {
 
     segments.insert(0, entry);
     segments.join(":")
+}
+
+fn augment_path_with_binary_dirs(path: Option<String>, binaries: &[&str]) -> Option<String> {
+    let mut combined = path.unwrap_or_default();
+    let mut added_any = false;
+
+    for binary in binaries {
+        let binary = binary.trim();
+        if binary.is_empty() || !binary.contains('/') {
+            continue;
+        }
+
+        let Some(parent) = Path::new(binary).parent() else {
+            continue;
+        };
+        let parent = parent.to_string_lossy();
+        if parent.is_empty() {
+            continue;
+        }
+
+        combined = prepend_path_entry(&combined, &parent);
+        added_any = true;
+    }
+
+    if combined.is_empty() && !added_any {
+        None
+    } else {
+        Some(combined)
+    }
 }
 
 fn resolve_remote_binary(
@@ -662,14 +772,27 @@ fn run_remote_command_output(
     config: &SshTargetConfig,
     remote_command: &str,
 ) -> Result<std::process::Output, AdapterError> {
-    Command::new("ssh")
+    run_remote_command_output_with_timeout(config, remote_command, REMOTE_PROBE_TIMEOUT)
+}
+
+fn run_remote_command_output_with_timeout(
+    config: &SshTargetConfig,
+    remote_command: &str,
+    timeout: Duration,
+) -> Result<std::process::Output, AdapterError> {
+    let child = Command::new("ssh")
         .arg("-T")
         .arg("-oBatchMode=yes")
         .args(&config.ssh_options)
         .arg(&config.host)
         .arg(remote_command)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|_| AdapterError::ZjctlUnavailable)
+        ?;
+    wait_for_output_with_timeout(child, timeout)
 }
 
 fn run_remote_command_string(
@@ -691,24 +814,205 @@ fn run_remote_command_string(
     Ok(output.stdout)
 }
 
-impl ZjctlClient {
-    pub fn new(binary: impl Into<String>) -> Self {
-        Self {
-            binary: binary.into(),
-        }
+fn run_remote_command_with_stdin(
+    config: &SshTargetConfig,
+    remote_command: &str,
+    stdin_payload: &[u8],
+) -> Result<Output, AdapterError> {
+    run_remote_command_with_stdin_timeout(
+        config,
+        remote_command,
+        stdin_payload,
+        REMOTE_COMMAND_TIMEOUT,
+    )
+}
+
+fn run_remote_command_with_stdin_timeout(
+    config: &SshTargetConfig,
+    remote_command: &str,
+    stdin_payload: &[u8],
+    timeout: Duration,
+) -> Result<Output, AdapterError> {
+    let mut child = Command::new("ssh")
+        .arg("-T")
+        .arg("-oBatchMode=yes")
+        .args(&config.ssh_options)
+        .arg(&config.host)
+        .arg(remote_command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| AdapterError::ZjctlUnavailable)?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(stdin_payload)
+            .map_err(|_| AdapterError::ZjctlUnavailable)?;
     }
 
-    fn run_command(
+    wait_for_output_with_timeout(child, timeout)
+}
+
+fn default_plugin_path() -> PathBuf {
+    let rel = Path::new("zellij").join("plugins").join("zrpc.wasm");
+
+    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
+        return PathBuf::from(dir).join(rel);
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".config").join(rel);
+    }
+
+    PathBuf::from("zrpc.wasm")
+}
+
+fn default_plugin_url() -> String {
+    format!("file:{}", default_plugin_path().display())
+}
+
+fn plugin_launch_command(plugin_url: &str) -> String {
+    format!("zellij action launch-plugin \"{plugin_url}\"")
+}
+
+fn pipe_plugin_configuration_for(session_name: &str) -> String {
+    let sanitized = session_name
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
+            _ => '_',
+        })
+        .collect::<String>();
+    format!("zjctl_session={sanitized}")
+}
+
+fn pane_ids(panes: &[PaneInfo]) -> Vec<String> {
+    let mut ids: Vec<String> = panes.iter().map(|pane| pane.id.clone()).collect();
+    ids.sort();
+    ids
+}
+
+fn parse_rpc_output(
+    stdout: &str,
+    request_id: uuid::Uuid,
+    plugin_url: &str,
+) -> Result<serde_json::Value, AdapterError> {
+    for response in serde_json::Deserializer::from_str(stdout)
+        .into_iter::<RpcResponse>()
+        .flatten()
+    {
+        if response.id != request_id {
+            continue;
+        }
+
+        if response.v != PROTOCOL_VERSION {
+            return Err(AdapterError::CommandFailed(format!(
+                "zrpc protocol version mismatch: expected {}, got {}",
+                PROTOCOL_VERSION, response.v
+            )));
+        }
+
+        if response.ok {
+            return Ok(response.result.unwrap_or(serde_json::Value::Null));
+        }
+
+        let message = response
+            .error
+            .map(|error| error.message)
+            .unwrap_or_else(|| "unknown error".to_string());
+        return Err(AdapterError::CommandFailed(message));
+    }
+
+    Err(AdapterError::CommandFailed(format!(
+        "no response from zrpc plugin\n\nMake sure it is loaded in your Zellij session:\n  {}",
+        plugin_launch_command(plugin_url)
+    )))
+}
+
+fn pane_info_to_target(pane: PaneInfo, session_name: Option<&str>) -> ResolvedTarget {
+    ResolvedTarget {
+        selector: format!("id:{}", pane.id),
+        pane_id: Some(pane.id),
+        session_name: session_name.unwrap_or_default().to_string(),
+        tab_name: Some(pane.tab_name),
+        title: Some(pane.title),
+        command: pane.command,
+        focused: pane.focused,
+    }
+}
+
+fn resolve_from_candidates(
+    request: &AttachRequest,
+    candidates: Vec<ResolvedTarget>,
+) -> Result<ResolvedTarget, AdapterError> {
+    let selector = request.selector.trim();
+    let filtered: Vec<_> = candidates
+        .into_iter()
+        .filter(|target| {
+            request
+                .tab_name
+                .as_ref()
+                .is_none_or(|tab_name| target.tab_name.as_deref() == Some(tab_name.as_str()))
+        })
+        .filter(|target| matches_selector(selector, target))
+        .collect();
+
+    match filtered.as_slice() {
+        [] => Err(AdapterError::CommandFailed(format!(
+            "no pane matched selector `{selector}`"
+        ))),
+        [target] => Ok(target.clone()),
+        _ => Err(AdapterError::CommandFailed(format!(
+            "selector `{selector}` matched multiple panes"
+        ))),
+    }
+}
+
+fn selector_to_action_pane_id(selector: &str) -> Option<String> {
+    let pane_id = selector
+        .strip_prefix("id:")
+        .or_else(|| selector.strip_prefix("terminal:"))
+        .or_else(|| selector.strip_prefix("plugin:"));
+
+    if let Some(pane_id) = selector.strip_prefix("id:terminal:") {
+        return Some(format!("terminal_{pane_id}"));
+    }
+    if let Some(pane_id) = selector.strip_prefix("id:plugin:") {
+        return Some(format!("plugin_{pane_id}"));
+    }
+    if let Some(pane_id) = selector.strip_prefix("terminal:") {
+        return Some(format!("terminal_{pane_id}"));
+    }
+    if let Some(pane_id) = selector.strip_prefix("plugin:") {
+        return Some(format!("plugin_{pane_id}"));
+    }
+
+    match pane_id {
+        Some(raw) if raw.chars().all(|ch| ch.is_ascii_digit()) => Some(raw.to_string()),
+        _ => None,
+    }
+}
+
+fn is_unsupported_action_pane_target(error: &AdapterError) -> bool {
+    matches!(error, AdapterError::CommandFailed(message) if message.contains("Found argument '--pane-id'"))
+}
+
+impl ZjctlClient {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn run_zellij_command(
         &self,
         session_name: Option<&str>,
-        command: ZjctlCommand,
-    ) -> Result<Vec<u8>, AdapterError> {
-        let mut process = Command::new(&self.binary);
-        process.args(command.args());
-
+        args: &[String],
+    ) -> Result<Output, AdapterError> {
+        let mut process = Command::new("zellij");
         if let Some(session_name) = session_name {
-            process.env("ZELLIJ_SESSION_NAME", session_name);
+            process.arg("--session").arg(session_name);
         }
+        process.args(args);
 
         let output = process
             .output()
@@ -724,27 +1028,85 @@ impl ZjctlClient {
             return Err(AdapterError::CommandFailed(message));
         }
 
-        Ok(output.stdout)
+        Ok(output)
     }
 
-    fn run_zellij_action(&self, session_name: &str, args: &[String]) -> Result<(), AdapterError> {
-        self.run_zellij_command(session_name, "action", args)
-            .map(|_| ())
-    }
-
-    fn run_zellij_command(
+    fn run_zellij_action(
         &self,
         session_name: &str,
-        subcommand: &str,
         args: &[String],
     ) -> Result<Vec<u8>, AdapterError> {
-        let output = Command::new("zellij")
-            .arg("--session")
-            .arg(session_name)
-            .arg(subcommand)
+        let mut command_args = vec!["action".to_string()];
+        command_args.extend(args.iter().cloned());
+        Ok(self
+            .run_zellij_command(Some(session_name), &command_args)?
+            .stdout)
+    }
+
+    fn run_zellij_command_with_stdin(
+        &self,
+        session_name: Option<&str>,
+        args: &[String],
+        stdin_payload: &[u8],
+    ) -> Result<Output, AdapterError> {
+        let mut process = Command::new("zellij");
+        if let Some(session_name) = session_name {
+            process.arg("--session").arg(session_name);
+        }
+        let mut child = process
             .args(args)
-            .output()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|_| AdapterError::ZjctlUnavailable)?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(stdin_payload)
+                .map_err(|_| AdapterError::ZjctlUnavailable)?;
+        }
+
+        child
+            .wait_with_output()
+            .map_err(|_| AdapterError::ZjctlUnavailable)
+    }
+
+    fn rpc_call<P: Serialize>(
+        &self,
+        session_name: &str,
+        method: &str,
+        params: P,
+    ) -> Result<serde_json::Value, AdapterError> {
+        let request = RpcRequest::new(method)
+            .with_params(params)
+            .map_err(|error| AdapterError::ParseError(error.to_string()))?;
+        let plugin_url = default_plugin_url();
+        let plugin_path = default_plugin_path();
+        if !plugin_path.is_file() {
+            return Err(AdapterError::CommandFailed(format!(
+                "zrpc plugin not found at {}\n\nLoad it in Zellij:\n  {}",
+                plugin_path.display(),
+                plugin_launch_command(&plugin_url)
+            )));
+        }
+
+        let request_json = format!(
+            "{}\n",
+            serde_json::to_string(&request)
+                .map_err(|error| AdapterError::ParseError(error.to_string()))?
+        );
+        let args = vec![
+            "pipe".to_string(),
+            "--plugin".to_string(),
+            plugin_url.clone(),
+            "--plugin-configuration".to_string(),
+            pipe_plugin_configuration_for(session_name),
+            "--name".to_string(),
+            RPC_PIPE_NAME.to_string(),
+        ];
+        let output =
+            self.run_zellij_command_with_stdin(Some(session_name), &args, request_json.as_bytes())?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -756,50 +1118,170 @@ impl ZjctlClient {
             return Err(AdapterError::CommandFailed(message));
         }
 
-        Ok(output.stdout)
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_rpc_output(&stdout, request.id, &plugin_url)
+    }
+
+    fn list_panes_once(&self, session_name: &str) -> Result<Vec<PaneInfo>, AdapterError> {
+        let result = self.rpc_call(session_name, methods::PANES_LIST, serde_json::json!({}))?;
+        serde_json::from_value(result).map_err(|error| AdapterError::ParseError(error.to_string()))
     }
 
     fn list_targets_for_session(
         &self,
-        session_name: Option<&str>,
+        session_name: &str,
     ) -> Result<Vec<ResolvedTarget>, AdapterError> {
-        let stdout = self.run_command(session_name, ZjctlCommand::List)?;
-        let text = String::from_utf8_lossy(&stdout);
-        parse_list_output(&text, session_name)
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_millis(500);
+        let interval = Duration::from_millis(50);
+
+        let mut panes = self.list_panes_once(session_name)?;
+        let mut ids = pane_ids(&panes);
+
+        loop {
+            if start.elapsed() >= timeout {
+                return Ok(panes
+                    .into_iter()
+                    .map(|pane| pane_info_to_target(pane, Some(session_name)))
+                    .collect());
+            }
+
+            std::thread::sleep(interval);
+            let next = self.list_panes_once(session_name)?;
+            let next_ids = pane_ids(&next);
+            if next_ids == ids {
+                return Ok(next
+                    .into_iter()
+                    .map(|pane| pane_info_to_target(pane, Some(session_name)))
+                    .collect());
+            }
+            panes = next;
+            ids = next_ids;
+        }
     }
 
-    fn resolve_from_candidates(
+    fn resolved_target(
         &self,
-        request: &AttachRequest,
-        candidates: Vec<ResolvedTarget>,
+        session_name: &str,
+        selector: &str,
     ) -> Result<ResolvedTarget, AdapterError> {
-        let selector = request.selector.trim();
-        let filtered: Vec<_> = candidates
-            .into_iter()
-            .filter(|target| {
-                request
-                    .tab_name
-                    .as_ref()
-                    .is_none_or(|tab_name| target.tab_name.as_deref() == Some(tab_name.as_str()))
-            })
-            .filter(|target| matches_selector(selector, target))
-            .collect();
+        let request = AttachRequest {
+            target: None,
+            session_name: session_name.to_string(),
+            tab_name: None,
+            selector: selector.to_string(),
+            alias: None,
+        };
+        resolve_from_candidates(&request, self.list_targets_for_session(session_name)?)
+    }
 
-        match filtered.as_slice() {
-            [] => Err(AdapterError::CommandFailed(format!(
-                "no pane matched selector `{selector}`"
-            ))),
-            [target] => Ok(target.clone()),
-            _ => Err(AdapterError::CommandFailed(format!(
-                "selector `{selector}` matched multiple panes"
-            ))),
+    fn dump_screen(
+        &self,
+        session_name: &str,
+        selector: &str,
+        full: bool,
+    ) -> Result<Vec<u8>, AdapterError> {
+        let pane_id = selector_to_action_pane_id(selector).ok_or_else(|| {
+            AdapterError::CommandFailed(format!(
+                "selector `{selector}` could not be converted to a pane id"
+            ))
+        })?;
+        let path =
+            std::env::temp_dir().join(format!("zellij-mcp-dump-{}.txt", uuid::Uuid::new_v4()));
+        let mut args = vec![
+            "dump-screen".to_string(),
+            "--pane-id".to_string(),
+            pane_id,
+            "--path".to_string(),
+            path.display().to_string(),
+        ];
+        if full {
+            args.push("--full".to_string());
         }
+        self.run_zellij_action(session_name, &args)?;
+        let output = std::fs::read(&path).map_err(|error| {
+            AdapterError::CommandFailed(format!("failed to read dump-screen output: {error}"))
+        });
+        let _ = std::fs::remove_file(&path);
+        output
+    }
+
+    fn wait_for_idle_via_dump(
+        &self,
+        session_name: &str,
+        selector: &str,
+        idle_ms: u64,
+        timeout_ms: u64,
+    ) -> Result<(), AdapterError> {
+        let target = self.resolved_target(session_name, selector)?;
+        let selector = target.selector;
+
+        (|| {
+            let idle_duration = Duration::from_millis(idle_ms);
+            let timeout_duration = Duration::from_millis(timeout_ms);
+            let poll_interval =
+                Duration::from_millis(idle_ms.clamp(100, 1000) / 4).max(Duration::from_millis(100));
+            let start = std::time::Instant::now();
+            let mut last_change = std::time::Instant::now();
+            let mut last_hash = {
+                let content = self.dump_screen(session_name, &selector, true)?;
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                use std::hash::{Hash, Hasher};
+                content.hash(&mut hasher);
+                hasher.finish()
+            };
+
+            loop {
+                if last_change.elapsed() >= idle_duration {
+                    return Ok(());
+                }
+                if start.elapsed() >= timeout_duration {
+                    return Err(AdapterError::Timeout);
+                }
+
+                std::thread::sleep(poll_interval);
+                let content = self.dump_screen(session_name, &selector, true)?;
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                use std::hash::{Hash, Hasher};
+                content.hash(&mut hasher);
+                let current_hash = hasher.finish();
+                if current_hash != last_hash {
+                    last_hash = current_hash;
+                    last_change = std::time::Instant::now();
+                }
+            }
+        })()
+    }
+
+    fn close_handle(
+        &self,
+        session_name: &str,
+        selector: &str,
+        force: bool,
+    ) -> Result<(), AdapterError> {
+        let target = self.resolved_target(session_name, selector)?;
+        if !force && target.focused {
+            return Err(AdapterError::CommandFailed(
+                "refusing to close focused pane (use --force)".to_string(),
+            ));
+        }
+        let pane_id = selector_to_action_pane_id(target.pane_id.as_deref().unwrap_or(selector))
+            .ok_or_else(|| {
+                AdapterError::CommandFailed(format!(
+                    "selector `{selector}` could not be converted to a pane id"
+                ))
+            })?;
+        self.run_zellij_action(
+            session_name,
+            &["close-pane".to_string(), "--pane-id".to_string(), pane_id],
+        )?;
+        Ok(())
     }
 }
 
 impl Default for ZjctlClient {
     fn default() -> Self {
-        Self::new("zjctl")
+        Self::new()
     }
 }
 
@@ -815,6 +1297,17 @@ impl SshZjctlClient {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
+        let path = augment_path_with_binary_dirs(
+            assignments
+                .iter()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| value.clone()),
+            &[&self.config.remote_zellij_bin, &self.config.remote_zjctl_bin],
+        );
+        if let Some(path) = path {
+            assignments.retain(|(key, _)| key != "PATH");
+            assignments.push(("PATH".to_string(), path));
+        }
         if let Some(session_name) = session_name {
             assignments.push(("ZELLIJ_SESSION_NAME".to_string(), session_name.to_string()));
         }
@@ -841,88 +1334,460 @@ impl SshZjctlClient {
         command
     }
 
-    fn run_remote_command_string(&self, remote_command: &str) -> Result<Vec<u8>, AdapterError> {
-        run_remote_command_string(&self.config, remote_command)
+    fn remote_plugin_path_expr(&self) -> String {
+        if let Some(xdg_config_home) = self.config.remote_env.get("XDG_CONFIG_HOME") {
+            format!("{xdg_config_home}/zellij/plugins/zrpc.wasm")
+        } else {
+            "$HOME/.config/zellij/plugins/zrpc.wasm".to_string()
+        }
     }
 
-    fn run_command(
-        &self,
-        session_name: Option<&str>,
-        command: ZjctlCommand,
-    ) -> Result<Vec<u8>, AdapterError> {
-        let env_assignments = self.remote_env_assignments(session_name);
-        let args = command.args();
-        let remote_command =
-            self.build_remote_exec_command(&self.config.remote_zjctl_bin, &env_assignments, &args);
-        self.run_remote_command_string(&remote_command)
+    fn remote_plugin_url_expr(&self) -> String {
+        format!("file:{}", self.remote_plugin_path_expr())
     }
 
     fn run_zellij_command(
         &self,
-        session_name: &str,
-        subcommand: &str,
+        session_name: Option<&str>,
         args: &[String],
     ) -> Result<Vec<u8>, AdapterError> {
-        let mut command_args = vec![
-            "--session".to_string(),
-            session_name.to_string(),
-            subcommand.to_string(),
-        ];
-        command_args.extend(args.iter().cloned());
         let remote_command = self.build_remote_exec_command(
             &self.config.remote_zellij_bin,
-            &self.remote_env_assignments(None),
-            &command_args,
+            &self.remote_env_assignments(session_name),
+            args,
         );
         self.run_remote_command_string(&remote_command)
     }
 
-    fn run_zellij_action(&self, session_name: &str, args: &[String]) -> Result<(), AdapterError> {
-        self.run_zellij_command(session_name, "action", args)
+    fn run_remote_command_string(&self, remote_command: &str) -> Result<Vec<u8>, AdapterError> {
+        run_remote_command_string(&self.config, remote_command)
+    }
+
+    fn run_remote_command_detached(&self, remote_command: &str) -> Result<(), AdapterError> {
+        let detached = format!(
+            "nohup sh -lc {} >/dev/null 2>&1 </dev/null &",
+            quote_posix_sh(remote_command)
+        );
+        Command::new("ssh")
+            .arg("-T")
+            .arg("-oBatchMode=yes")
+            .args(&self.config.ssh_options)
+            .arg(&self.config.host)
+            .arg(detached)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
             .map(|_| ())
+            .map_err(|_| AdapterError::ZjctlUnavailable)
+    }
+
+    fn run_remote_zjctl_command(
+        &self,
+        session_name: &str,
+        command: ZjctlCommand,
+    ) -> Result<Vec<u8>, AdapterError> {
+        let timeout = match &command {
+            ZjctlCommand::WaitIdle { timeout_seconds, .. } => timeout_seconds
+                .parse::<f64>()
+                .ok()
+                .map(Duration::from_secs_f64)
+                .unwrap_or(REMOTE_COMMAND_TIMEOUT)
+                + Duration::from_secs(2),
+            _ => REMOTE_COMMAND_TIMEOUT,
+        };
+        let remote_command = self.build_remote_exec_command(
+            &self.config.remote_zjctl_bin,
+            &self.remote_env_assignments(Some(session_name)),
+            &command.args(),
+        );
+        let output = run_remote_command_output_with_timeout(&self.config, &remote_command, timeout)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let message = if stderr.is_empty() {
+                format!("command exited with status {}", output.status)
+            } else {
+                stderr
+            };
+            return Err(AdapterError::CommandFailed(message));
+        }
+
+        Ok(output.stdout)
+    }
+
+    fn capture_via_zjctl(
+        &self,
+        session_name: &str,
+        selector: &str,
+        full: bool,
+    ) -> Result<CaptureSnapshot, AdapterError> {
+        let content = self.run_remote_zjctl_command(
+            session_name,
+            ZjctlCommand::Capture {
+                selector: selector.to_string(),
+                full,
+            },
+        )?;
+        Ok(CaptureSnapshot {
+            content: parse_capture_output(&content),
+            captured_at: Utc::now(),
+            truncated: false,
+        })
+    }
+
+    fn wait_via_zjctl(
+        &self,
+        session_name: &str,
+        selector: &str,
+        idle_ms: u64,
+        timeout_ms: u64,
+    ) -> Result<(), AdapterError> {
+        self.run_remote_zjctl_command(
+            session_name,
+            ZjctlCommand::WaitIdle {
+                selector: selector.to_string(),
+                idle_seconds: format_seconds(idle_ms),
+                timeout_seconds: format_seconds(timeout_ms),
+            },
+        )
+        .map(|_| ())
+    }
+
+    fn close_via_zjctl(
+        &self,
+        session_name: &str,
+        selector: &str,
+        force: bool,
+    ) -> Result<(), AdapterError> {
+        self.run_remote_zjctl_command(
+            session_name,
+            ZjctlCommand::Close {
+                selector: selector.to_string(),
+                force,
+            },
+        )
+        .map(|_| ())
+    }
+
+    fn rpc_call<P: Serialize>(
+        &self,
+        session_name: &str,
+        method: &str,
+        params: P,
+    ) -> Result<serde_json::Value, AdapterError> {
+        let request = RpcRequest::new(method)
+            .with_params(params)
+            .map_err(|error| AdapterError::ParseError(error.to_string()))?;
+        let request_json = format!(
+            "{}\n",
+            serde_json::to_string(&request)
+                .map_err(|error| AdapterError::ParseError(error.to_string()))?
+        );
+
+        let plugin_path = self.remote_plugin_path_expr();
+        let plugin_url = self.remote_plugin_url_expr();
+        let plugin_check = format!("[ -f \"{plugin_path}\" ]");
+        if run_remote_command_output(&self.config, &plugin_check)
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+            == false
+        {
+            return Err(AdapterError::CommandFailed(format!(
+                "zrpc plugin not found at {plugin_path}\n\nLoad it in Zellij:\n  {}",
+                plugin_launch_command(&plugin_url)
+            )));
+        }
+
+        let remote_command = format!(
+            "exec env {} {} pipe --plugin \"{}\" --plugin-configuration {} --name {}",
+            self.remote_env_assignments(Some(session_name))
+                .into_iter()
+                .map(|(key, value)| quote_posix_sh(&format!("{key}={value}")))
+                .collect::<Vec<_>>()
+                .join(" "),
+            quote_posix_sh(&self.config.remote_zellij_bin),
+            plugin_url,
+            quote_posix_sh(&pipe_plugin_configuration_for(session_name)),
+            quote_posix_sh(RPC_PIPE_NAME),
+        );
+        let output =
+            run_remote_command_with_stdin_timeout(
+                &self.config,
+                &remote_command,
+                request_json.as_bytes(),
+                REMOTE_PROBE_TIMEOUT,
+            )?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let message = if stderr.is_empty() {
+                format!("command exited with status {}", output.status)
+            } else {
+                stderr
+            };
+            return Err(AdapterError::CommandFailed(message));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_rpc_output(&stdout, request.id, &plugin_url)
+    }
+
+    fn list_panes_once(&self, session_name: &str) -> Result<Vec<PaneInfo>, AdapterError> {
+        let result = self.rpc_call(session_name, methods::PANES_LIST, serde_json::json!({}))?;
+        serde_json::from_value(result).map_err(|error| AdapterError::ParseError(error.to_string()))
     }
 
     fn list_targets_for_session(
         &self,
-        session_name: Option<&str>,
+        session_name: &str,
     ) -> Result<Vec<ResolvedTarget>, AdapterError> {
-        let stdout = self.run_command(session_name, ZjctlCommand::List)?;
-        let text = String::from_utf8_lossy(&stdout);
-        parse_list_output(&text, session_name)
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_millis(500);
+        let interval = Duration::from_millis(50);
+
+        let mut panes = self.list_panes_once(session_name)?;
+        let mut ids = pane_ids(&panes);
+
+        loop {
+            if start.elapsed() >= timeout {
+                return Ok(panes
+                    .into_iter()
+                    .map(|pane| pane_info_to_target(pane, Some(session_name)))
+                    .collect());
+            }
+
+            std::thread::sleep(interval);
+            let next = self.list_panes_once(session_name)?;
+            let next_ids = pane_ids(&next);
+            if next_ids == ids {
+                return Ok(next
+                    .into_iter()
+                    .map(|pane| pane_info_to_target(pane, Some(session_name)))
+                    .collect());
+            }
+            panes = next;
+            ids = next_ids;
+        }
     }
 
-    fn resolve_from_candidates(
+    fn resolved_target(
         &self,
-        request: &AttachRequest,
-        candidates: Vec<ResolvedTarget>,
+        session_name: &str,
+        selector: &str,
     ) -> Result<ResolvedTarget, AdapterError> {
-        let selector = request.selector.trim();
-        let filtered: Vec<_> = candidates
-            .into_iter()
-            .filter(|target| {
-                request
-                    .tab_name
-                    .as_ref()
-                    .is_none_or(|tab_name| target.tab_name.as_deref() == Some(tab_name.as_str()))
-            })
-            .filter(|target| matches_selector(selector, target))
-            .collect();
+        let request = AttachRequest {
+            target: None,
+            session_name: session_name.to_string(),
+            tab_name: None,
+            selector: selector.to_string(),
+            alias: None,
+        };
+        resolve_from_candidates(&request, self.list_targets_for_session(session_name)?)
+    }
 
-        match filtered.as_slice() {
-            [] => Err(AdapterError::CommandFailed(format!(
-                "no pane matched selector `{selector}`"
-            ))),
-            [target] => Ok(target.clone()),
-            _ => Err(AdapterError::CommandFailed(format!(
-                "selector `{selector}` matched multiple panes"
-            ))),
+    fn dump_screen(
+        &self,
+        session_name: &str,
+        selector: &str,
+        full: bool,
+    ) -> Result<Vec<u8>, AdapterError> {
+        let pane_id = selector_to_action_pane_id(selector).ok_or_else(|| {
+            AdapterError::CommandFailed(format!(
+                "selector `{selector}` could not be converted to a pane id"
+            ))
+        })?;
+        let remote_command = format!(
+            "tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; {} ; status=$?; cat \"$tmp\"; exit $status",
+            self.build_remote_exec_command(
+                &self.config.remote_zellij_bin,
+                &self.remote_env_assignments(Some(session_name)),
+                &{
+                    let mut args = vec![
+                        "action".to_string(),
+                        "dump-screen".to_string(),
+                        "--pane-id".to_string(),
+                        pane_id,
+                        "--path".to_string(),
+                        "$tmp".to_string(),
+                    ];
+                    if full {
+                        args.push("--full".to_string());
+                    }
+                    args
+                },
+            )
+            .replace("'$tmp'", "\"$tmp\"")
+        );
+        run_remote_command_string(&self.config, &remote_command)
+    }
+
+    fn focus_pane(&self, session_name: &str, selector: &str) -> Result<(), AdapterError> {
+        self.rpc_call(
+            session_name,
+            methods::PANE_FOCUS,
+            serde_json::json!({ "selector": selector }),
+        )
+        .map(|_| ())
+    }
+
+    fn dump_focused_screen(&self, session_name: &str, full: bool) -> Result<Vec<u8>, AdapterError> {
+        let remote_command = format!(
+            "tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; {} ; status=$?; cat \"$tmp\"; exit $status",
+            self.build_remote_exec_command(
+                &self.config.remote_zellij_bin,
+                &self.remote_env_assignments(Some(session_name)),
+                &{
+                    let mut args = vec![
+                        "action".to_string(),
+                        "dump-screen".to_string(),
+                        "$tmp".to_string(),
+                    ];
+                    if full {
+                        args.push("--full".to_string());
+                    }
+                    args
+                },
+            )
+            .replace("'$tmp'", "\"$tmp\"")
+        );
+        run_remote_command_string(&self.config, &remote_command)
+    }
+
+    fn wait_for_idle_via_focused_dump(
+        &self,
+        session_name: &str,
+        selector: &str,
+        idle_ms: u64,
+        timeout_ms: u64,
+    ) -> Result<(), AdapterError> {
+        self.focus_pane(session_name, selector)?;
+
+        let idle_duration = Duration::from_millis(idle_ms);
+        let timeout_duration = Duration::from_millis(timeout_ms);
+        let poll_interval =
+            Duration::from_millis(idle_ms.clamp(100, 1000) / 4).max(Duration::from_millis(100));
+        let start = std::time::Instant::now();
+        let mut last_change = std::time::Instant::now();
+        let mut last_hash = {
+            let content = self.dump_focused_screen(session_name, true)?;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash, Hasher};
+            content.hash(&mut hasher);
+            hasher.finish()
+        };
+
+        loop {
+            if last_change.elapsed() >= idle_duration {
+                return Ok(());
+            }
+            if start.elapsed() >= timeout_duration {
+                return Err(AdapterError::Timeout);
+            }
+
+            std::thread::sleep(poll_interval);
+            let content = self.dump_focused_screen(session_name, true)?;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash, Hasher};
+            content.hash(&mut hasher);
+            let current_hash = hasher.finish();
+            if current_hash != last_hash {
+                last_hash = current_hash;
+                last_change = std::time::Instant::now();
+            }
         }
+    }
+
+    fn close_focused_pane(&self, session_name: &str, selector: &str) -> Result<(), AdapterError> {
+        self.focus_pane(session_name, selector)?;
+        self.run_zellij_command(
+            Some(session_name),
+            &["action".to_string(), "close-pane".to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn wait_for_idle_via_dump(
+        &self,
+        session_name: &str,
+        selector: &str,
+        idle_ms: u64,
+        timeout_ms: u64,
+    ) -> Result<(), AdapterError> {
+        let target = self.resolved_target(session_name, selector)?;
+        let selector = target.selector;
+
+        (|| {
+            let idle_duration = Duration::from_millis(idle_ms);
+            let timeout_duration = Duration::from_millis(timeout_ms);
+            let poll_interval =
+                Duration::from_millis(idle_ms.clamp(100, 1000) / 4).max(Duration::from_millis(100));
+            let start = std::time::Instant::now();
+            let mut last_change = std::time::Instant::now();
+            let mut last_hash = {
+                let content = self.dump_screen(session_name, &selector, true)?;
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                use std::hash::{Hash, Hasher};
+                content.hash(&mut hasher);
+                hasher.finish()
+            };
+
+            loop {
+                if last_change.elapsed() >= idle_duration {
+                    return Ok(());
+                }
+                if start.elapsed() >= timeout_duration {
+                    return Err(AdapterError::Timeout);
+                }
+
+                std::thread::sleep(poll_interval);
+                let content = self.dump_screen(session_name, &selector, true)?;
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                use std::hash::{Hash, Hasher};
+                content.hash(&mut hasher);
+                let current_hash = hasher.finish();
+                if current_hash != last_hash {
+                    last_hash = current_hash;
+                    last_change = std::time::Instant::now();
+                }
+            }
+        })()
+    }
+
+    fn close_handle(
+        &self,
+        session_name: &str,
+        selector: &str,
+        force: bool,
+    ) -> Result<(), AdapterError> {
+        let target = self.resolved_target(session_name, selector)?;
+        if !force && target.focused {
+            return Err(AdapterError::CommandFailed(
+                "refusing to close focused pane (use --force)".to_string(),
+            ));
+        }
+        let pane_id = selector_to_action_pane_id(target.pane_id.as_deref().unwrap_or(selector))
+            .ok_or_else(|| {
+                AdapterError::CommandFailed(format!(
+                    "selector `{selector}` could not be converted to a pane id"
+                ))
+            })?;
+        self.run_zellij_command(
+            Some(session_name),
+            &[
+                "action".to_string(),
+                "close-pane".to_string(),
+                "--pane-id".to_string(),
+                pane_id,
+            ],
+        )?;
+        Ok(())
     }
 }
 
 impl ZjctlAdapter for SshZjctlClient {
     fn is_available(&self) -> bool {
-        self.run_command(None, ZjctlCommand::Availability).is_ok()
+        self.run_zellij_command(None, &["--help".to_string()])
+            .is_ok()
     }
 
     fn ensure_session_ready(&self, session_name: &str) -> Result<(), AdapterError> {
@@ -930,9 +1795,7 @@ impl ZjctlAdapter for SshZjctlClient {
             SshBackendReadiness::Ready(resolved) => {
                 let mut client = self.clone();
                 client.config = resolved;
-                client
-                    .run_command(Some(session_name), ZjctlCommand::List)
-                    .map(|_| ())
+                client.list_targets_for_session(session_name).map(|_| ())
             }
             SshBackendReadiness::AutoFixable(failure) => {
                 if attempt_safe_ssh_readiness_remediation(&self.config, session_name, &failure) {
@@ -940,9 +1803,7 @@ impl ZjctlAdapter for SshZjctlClient {
                         SshBackendReadiness::Ready(resolved) => {
                             let mut client = self.clone();
                             client.config = resolved;
-                            client
-                                .run_command(Some(session_name), ZjctlCommand::List)
-                                .map(|_| ())
+                            client.list_targets_for_session(session_name).map(|_| ())
                         }
                         SshBackendReadiness::AutoFixable(retry_failure)
                         | SshBackendReadiness::ManualActionRequired(retry_failure) => {
@@ -960,70 +1821,90 @@ impl ZjctlAdapter for SshZjctlClient {
     }
 
     fn spawn(&self, request: &SpawnRequest) -> Result<ResolvedTarget, AdapterError> {
-        let prepared = prepare_spawn(request)?;
-        let spawn_command = match &prepared.command {
-            ZjctlCommand::Spawn { command, .. } => command.clone(),
-            _ => unreachable!("prepared spawn must produce a spawn command"),
-        };
+        let spawn_command = resolve_spawn_command(request)?;
         let command_summary = spawn_command.join(" ");
 
-        if let Some(action_args) = prepared.action_args.as_ref() {
-            self.run_zellij_action(&request.session_name, action_args)?;
+        let before = self.list_targets_for_session(&request.session_name)?;
+        if let Some(action_args) = prepare_spawn_action_args(request) {
+            self.run_zellij_command(
+                Some(&request.session_name),
+                &std::iter::once("action".to_string())
+                    .chain(action_args.into_iter())
+                    .collect::<Vec<_>>(),
+            )?;
         }
 
-        if matches!(request.spawn_target, SpawnTarget::NewTab) {
-            let before = self.list_targets_for_session(Some(&request.session_name))?;
-            let mut run_args = Vec::new();
-            if let Some(cwd) = &request.cwd {
-                run_args.push("--cwd".to_string());
-                run_args.push(cwd.clone());
-            }
-            if let Some(title) = &request.title {
-                run_args.push("--name".to_string());
-                run_args.push(title.clone());
-            }
-            run_args.push("--".to_string());
-            run_args.extend(spawn_command);
-            self.run_zellij_command(&request.session_name, "run", &run_args)?;
-
-            let after = self.list_targets_for_session(Some(&request.session_name))?;
-            return resolve_new_tab_target(request, before, after, &command_summary);
+        let mut run_args = vec!["run".to_string()];
+        if let Some(cwd) = &request.cwd {
+            run_args.push("--cwd".to_string());
+            run_args.push(cwd.clone());
         }
-
-        let stdout = self.run_command(Some(&request.session_name), prepared.command)?;
-        let text = String::from_utf8_lossy(&stdout);
-        let spawned = parse_spawn_output(
-            &text,
-            &request.session_name,
-            request.tab_name.as_deref(),
-            request.title.as_deref(),
-        )?;
-
         if let Some(title) = &request.title {
-            let attach_request = AttachRequest {
-                target: None,
-                session_name: request.session_name.clone(),
-                tab_name: request.tab_name.clone(),
-                selector: format!("title:{title}"),
-                alias: None,
-            };
+            run_args.push("--name".to_string());
+            run_args.push(title.clone());
+        }
+        run_args.push("--".to_string());
+        run_args.extend(spawn_command);
+        let output = self.run_zellij_command(Some(&request.session_name), &run_args)?;
 
-            return self.resolve_selector(&attach_request).or(Ok(spawned));
+        let after = self.list_targets_for_session(&request.session_name)?;
+        resolve_spawned_target_from_run_output(
+            request,
+            before,
+            after,
+            &output,
+            &command_summary,
+        )
+    }
+
+    fn launch_spawn(&self, request: &SpawnRequest) -> Result<Option<ResolvedTarget>, AdapterError> {
+        let spawn_command = resolve_spawn_command(request)?;
+
+        if let Some(action_args) = prepare_spawn_action_args(request) {
+            let action_command = self.build_remote_exec_command(
+                &self.config.remote_zellij_bin,
+                &self.remote_env_assignments(Some(&request.session_name)),
+                &std::iter::once("action".to_string())
+                    .chain(action_args.into_iter())
+                    .collect::<Vec<_>>(),
+            );
+            self.run_remote_command_detached(&action_command)?;
+            std::thread::sleep(Duration::from_millis(200));
         }
 
-        Ok(spawned)
+        let mut run_args = vec!["run".to_string()];
+        if let Some(cwd) = &request.cwd {
+            run_args.push("--cwd".to_string());
+            run_args.push(cwd.clone());
+        }
+        if let Some(title) = &request.title {
+            run_args.push("--name".to_string());
+            run_args.push(title.clone());
+        }
+        run_args.push("--".to_string());
+        run_args.extend(spawn_command);
+
+        let remote_command = self.build_remote_exec_command(
+            &self.config.remote_zellij_bin,
+            &self.remote_env_assignments(Some(&request.session_name)),
+            &run_args,
+        );
+        self.run_remote_command_detached(&remote_command)?;
+        Ok(None)
     }
 
     fn resolve_selector(&self, request: &AttachRequest) -> Result<ResolvedTarget, AdapterError> {
-        let candidates = self.list_targets_for_session(Some(&request.session_name))?;
-        self.resolve_from_candidates(request, candidates)
+        resolve_from_candidates(
+            request,
+            self.list_targets_for_session(&request.session_name)?,
+        )
     }
 
     fn list_targets_in_session(
         &self,
         session_name: &str,
     ) -> Result<Vec<ResolvedTarget>, AdapterError> {
-        self.list_targets_for_session(Some(session_name))
+        self.list_targets_for_session(session_name)
     }
 
     fn send_input(
@@ -1038,12 +1919,10 @@ impl ZjctlAdapter for SshZjctlClient {
         } else {
             text.to_string()
         };
-        self.run_command(
-            Some(session_name),
-            ZjctlCommand::Send {
-                selector: handle.to_string(),
-                text: payload,
-            },
+        self.rpc_call(
+            session_name,
+            methods::PANE_SEND,
+            serde_json::json!({"selector": handle, "all": false, "text": payload}),
         )
         .map(|_| ())
     }
@@ -1055,21 +1934,21 @@ impl ZjctlAdapter for SshZjctlClient {
         idle_ms: u64,
         timeout_ms: u64,
     ) -> Result<(), AdapterError> {
-        let result = self.run_command(
-            Some(session_name),
-            ZjctlCommand::WaitIdle {
-                selector: handle.to_string(),
-                idle_seconds: format_seconds(idle_ms),
-                timeout_seconds: format_seconds(timeout_ms),
-            },
-        );
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(AdapterError::CommandFailed(message)) if message.contains("timed out after") => {
-                Err(AdapterError::Timeout)
+        if selector_to_action_pane_id(handle).is_none() {
+            return self.wait_via_zjctl(session_name, handle, idle_ms, timeout_ms);
+        }
+        match self.wait_for_idle_via_dump(session_name, handle, idle_ms, timeout_ms) {
+            Err(error) if is_unsupported_action_pane_target(&error) => {
+                let target = self.resolved_target(session_name, handle)?;
+                self.wait_for_idle_via_focused_dump(
+                    session_name,
+                    &target.selector,
+                    idle_ms,
+                    timeout_ms,
+                )
+                .or_else(|_| self.wait_via_zjctl(session_name, &target.selector, idle_ms, timeout_ms))
             }
-            Err(error) => Err(error),
+            other => other,
         }
     }
 
@@ -1078,111 +1957,105 @@ impl ZjctlAdapter for SshZjctlClient {
         session_name: &str,
         handle: &str,
     ) -> Result<CaptureSnapshot, AdapterError> {
-        let stdout = self.run_command(
-            Some(session_name),
-            ZjctlCommand::Capture {
-                selector: handle.to_string(),
-                full: true,
-            },
-        )?;
-
-        Ok(CaptureSnapshot {
-            content: parse_capture_output(&stdout),
-            captured_at: Utc::now(),
-            truncated: false,
-        })
+        if selector_to_action_pane_id(handle).is_none() {
+            return self.capture_via_zjctl(session_name, handle, true);
+        }
+        let target = self.resolved_target(session_name, handle)?;
+        match self.dump_screen(session_name, &target.selector, true) {
+            Ok(content) => Ok(CaptureSnapshot {
+                content: parse_capture_output(&content),
+                captured_at: Utc::now(),
+                truncated: false,
+            }),
+            Err(error) if is_unsupported_action_pane_target(&error) => {
+                self.focus_pane(session_name, &target.selector)
+                    .and_then(|_| self.dump_focused_screen(session_name, true))
+                    .map(|content| CaptureSnapshot {
+                        content: parse_capture_output(&content),
+                        captured_at: Utc::now(),
+                        truncated: false,
+                    })
+                    .or_else(|_| self.capture_via_zjctl(session_name, &target.selector, true))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn close(&self, session_name: &str, handle: &str, force: bool) -> Result<(), AdapterError> {
-        self.run_command(
-            Some(session_name),
-            ZjctlCommand::Close {
-                selector: handle.to_string(),
-                force,
-            },
-        )
-        .map(|_| ())
+        if selector_to_action_pane_id(handle).is_none() {
+            return self.close_via_zjctl(session_name, handle, force);
+        }
+        match self.close_handle(session_name, handle, force) {
+            Err(error) if is_unsupported_action_pane_target(&error) => {
+                let target = self.resolved_target(session_name, handle)?;
+                self.close_focused_pane(session_name, &target.selector)
+                    .or_else(|_| self.close_via_zjctl(session_name, &target.selector, force))
+            }
+            other => other,
+        }
     }
 
     fn list_targets(&self) -> Result<Vec<ResolvedTarget>, AdapterError> {
-        self.list_targets_for_session(None)
+        let session_name = std::env::var("ZELLIJ_SESSION_NAME")
+            .map_err(|_| AdapterError::ParseError("ZELLIJ_SESSION_NAME is not set".to_string()))?;
+        self.list_targets_for_session(&session_name)
     }
 }
 
 impl ZjctlAdapter for ZjctlClient {
     fn is_available(&self) -> bool {
-        self.run_command(None, ZjctlCommand::Availability).is_ok()
+        self.run_zellij_command(None, &["--help".to_string()])
+            .is_ok()
     }
 
     fn ensure_session_ready(&self, session_name: &str) -> Result<(), AdapterError> {
         self.list_targets_in_session(session_name).map(|_| ())
     }
 
-    fn spawn(&self, _request: &SpawnRequest) -> Result<ResolvedTarget, AdapterError> {
-        let prepared = prepare_spawn(_request)?;
-        let spawn_command = match &prepared.command {
-            ZjctlCommand::Spawn { command, .. } => command.clone(),
-            _ => unreachable!("prepared spawn must produce a spawn command"),
-        };
+    fn spawn(&self, request: &SpawnRequest) -> Result<ResolvedTarget, AdapterError> {
+        let spawn_command = resolve_spawn_command(request)?;
         let command_summary = spawn_command.join(" ");
 
-        if let Some(action_args) = prepared.action_args.as_ref() {
-            self.run_zellij_action(&_request.session_name, action_args)?;
+        let before = self.list_targets_for_session(&request.session_name)?;
+        if let Some(action_args) = prepare_spawn_action_args(request) {
+            self.run_zellij_action(&request.session_name, &action_args)?;
         }
 
-        if matches!(_request.spawn_target, SpawnTarget::NewTab) {
-            let before = self.list_targets_for_session(Some(&_request.session_name))?;
-            let mut run_args = Vec::new();
-            if let Some(cwd) = &_request.cwd {
-                run_args.push("--cwd".to_string());
-                run_args.push(cwd.clone());
-            }
-            if let Some(title) = &_request.title {
-                run_args.push("--name".to_string());
-                run_args.push(title.clone());
-            }
-            run_args.push("--".to_string());
-            run_args.extend(spawn_command);
-            self.run_zellij_command(&_request.session_name, "run", &run_args)?;
-
-            let after = self.list_targets_for_session(Some(&_request.session_name))?;
-            return resolve_new_tab_target(_request, before, after, &command_summary);
+        let mut run_args = vec!["run".to_string()];
+        if let Some(cwd) = &request.cwd {
+            run_args.push("--cwd".to_string());
+            run_args.push(cwd.clone());
         }
-
-        let stdout = self.run_command(Some(&_request.session_name), prepared.command)?;
-        let text = String::from_utf8_lossy(&stdout);
-        let spawned = parse_spawn_output(
-            &text,
-            &_request.session_name,
-            _request.tab_name.as_deref(),
-            _request.title.as_deref(),
-        )?;
-
-        if let Some(title) = &_request.title {
-            let attach_request = AttachRequest {
-                target: None,
-                session_name: _request.session_name.clone(),
-                tab_name: _request.tab_name.clone(),
-                selector: format!("title:{title}"),
-                alias: None,
-            };
-
-            return self.resolve_selector(&attach_request).or(Ok(spawned));
+        if let Some(title) = &request.title {
+            run_args.push("--name".to_string());
+            run_args.push(title.clone());
         }
+        run_args.push("--".to_string());
+        run_args.extend(spawn_command);
+        let output = self.run_zellij_command(Some(&request.session_name), &run_args)?;
 
-        Ok(spawned)
+        let after = self.list_targets_for_session(&request.session_name)?;
+        resolve_spawned_target_from_run_output(
+            request,
+            before,
+            after,
+            &output.stdout,
+            &command_summary,
+        )
     }
 
-    fn resolve_selector(&self, _request: &AttachRequest) -> Result<ResolvedTarget, AdapterError> {
-        let candidates = self.list_targets_for_session(Some(&_request.session_name))?;
-        self.resolve_from_candidates(_request, candidates)
+    fn resolve_selector(&self, request: &AttachRequest) -> Result<ResolvedTarget, AdapterError> {
+        resolve_from_candidates(
+            request,
+            self.list_targets_for_session(&request.session_name)?,
+        )
     }
 
     fn list_targets_in_session(
         &self,
         session_name: &str,
     ) -> Result<Vec<ResolvedTarget>, AdapterError> {
-        self.list_targets_for_session(Some(session_name))
+        self.list_targets_for_session(session_name)
     }
 
     fn send_input(
@@ -1197,16 +2070,12 @@ impl ZjctlAdapter for ZjctlClient {
         } else {
             text.to_string()
         };
-
-        self.run_command(
-            Some(session_name),
-            ZjctlCommand::Send {
-                selector: handle.to_string(),
-                text: payload,
-            },
-        )?;
-
-        Ok(())
+        self.rpc_call(
+            session_name,
+            methods::PANE_SEND,
+            serde_json::json!({"selector": handle, "all": false, "text": payload}),
+        )
+        .map(|_| ())
     }
 
     fn wait_idle(
@@ -1216,22 +2085,7 @@ impl ZjctlAdapter for ZjctlClient {
         idle_ms: u64,
         timeout_ms: u64,
     ) -> Result<(), AdapterError> {
-        let result = self.run_command(
-            Some(session_name),
-            ZjctlCommand::WaitIdle {
-                selector: handle.to_string(),
-                idle_seconds: format_seconds(idle_ms),
-                timeout_seconds: format_seconds(timeout_ms),
-            },
-        );
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(AdapterError::CommandFailed(message)) if message.contains("timed out after") => {
-                Err(AdapterError::Timeout)
-            }
-            Err(error) => Err(error),
-        }
+        self.wait_for_idle_via_dump(session_name, handle, idle_ms, timeout_ms)
     }
 
     fn capture_full(
@@ -1239,35 +2093,23 @@ impl ZjctlAdapter for ZjctlClient {
         session_name: &str,
         handle: &str,
     ) -> Result<CaptureSnapshot, AdapterError> {
-        let stdout = self.run_command(
-            Some(session_name),
-            ZjctlCommand::Capture {
-                selector: handle.to_string(),
-                full: true,
-            },
-        )?;
-
+        let target = self.resolved_target(session_name, handle)?;
+        let content = self.dump_screen(session_name, &target.selector, true)?;
         Ok(CaptureSnapshot {
-            content: parse_capture_output(&stdout),
+            content: parse_capture_output(&content),
             captured_at: Utc::now(),
             truncated: false,
         })
     }
 
     fn close(&self, session_name: &str, handle: &str, force: bool) -> Result<(), AdapterError> {
-        self.run_command(
-            Some(session_name),
-            ZjctlCommand::Close {
-                selector: handle.to_string(),
-                force,
-            },
-        )?;
-
-        Ok(())
+        self.close_handle(session_name, handle, force)
     }
 
     fn list_targets(&self) -> Result<Vec<ResolvedTarget>, AdapterError> {
-        self.list_targets_for_session(std::env::var("ZELLIJ_SESSION_NAME").ok().as_deref())
+        let session_name = std::env::var("ZELLIJ_SESSION_NAME")
+            .map_err(|_| AdapterError::ParseError("ZELLIJ_SESSION_NAME is not set".to_string()))?;
+        self.list_targets_for_session(&session_name)
     }
 }
 
@@ -1323,7 +2165,7 @@ fn is_terminal_target(target: &ResolvedTarget) -> bool {
         .is_some_and(|pane_id| pane_id.starts_with("terminal:"))
 }
 
-fn resolve_new_tab_target(
+fn resolve_spawned_target(
     request: &SpawnRequest,
     before: Vec<ResolvedTarget>,
     after: Vec<ResolvedTarget>,
@@ -1333,7 +2175,7 @@ fn resolve_new_tab_target(
         .iter()
         .filter_map(|target| target.pane_id.as_deref())
         .collect();
-    let mut candidates: Vec<ResolvedTarget> = after
+    let candidates: Vec<ResolvedTarget> = after
         .into_iter()
         .filter(is_terminal_target)
         .filter(|target| {
@@ -1344,8 +2186,17 @@ fn resolve_new_tab_target(
         })
         .collect();
 
+    let mut candidates = candidates.clone();
+
     if let Some(tab_name) = request.tab_name.as_ref() {
-        candidates.retain(|target| target.tab_name.as_deref() == Some(tab_name.as_str()));
+        let tab_matches: Vec<_> = candidates
+            .iter()
+            .filter(|target| target.tab_name.as_deref() == Some(tab_name.as_str()))
+            .cloned()
+            .collect();
+        if !tab_matches.is_empty() {
+            candidates = tab_matches;
+        }
     }
 
     if let Some(title) = request.title.as_ref() {
@@ -1378,13 +2229,42 @@ fn resolve_new_tab_target(
                 "no spawned pane could be resolved after creating a new tab".to_string(),
             )),
             _ => Err(AdapterError::CommandFailed(
-                "new tab spawn matched multiple candidate panes".to_string(),
+                "spawn matched multiple candidate panes".to_string(),
             )),
         },
         _ => Err(AdapterError::CommandFailed(
             "spawn command matched multiple candidate panes".to_string(),
         )),
     }
+}
+
+fn resolve_spawned_target_from_run_output(
+    request: &SpawnRequest,
+    before: Vec<ResolvedTarget>,
+    after: Vec<ResolvedTarget>,
+    run_stdout: &[u8],
+    command_summary: &str,
+) -> Result<ResolvedTarget, AdapterError> {
+    let stdout = String::from_utf8_lossy(run_stdout);
+    if let Ok(parsed) = parse_spawn_output(
+        &stdout,
+        &request.session_name,
+        request.tab_name.as_deref(),
+        request.title.as_deref(),
+    ) {
+        if let Some(pane_id) = parsed.pane_id.as_deref() {
+            if let Some(resolved) = after
+                .iter()
+                .find(|target| target.pane_id.as_deref() == Some(pane_id))
+            {
+                return Ok(resolved.clone());
+            }
+        }
+
+        return Ok(parsed);
+    }
+
+    resolve_spawned_target(request, before, after, command_summary)
 }
 
 fn parse_command(command: &str) -> Result<Vec<String>, AdapterError> {
@@ -1426,15 +2306,8 @@ fn resolve_spawn_command(request: &SpawnRequest) -> Result<Vec<String>, AdapterE
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PreparedSpawn {
-    action_args: Option<Vec<String>>,
-    command: ZjctlCommand,
-}
-
-fn prepare_spawn(request: &SpawnRequest) -> Result<PreparedSpawn, AdapterError> {
-    let command = resolve_spawn_command(request)?;
-    let action_args = match request.spawn_target {
+fn prepare_spawn_action_args(request: &SpawnRequest) -> Option<Vec<String>> {
+    match request.spawn_target {
         SpawnTarget::NewTab => {
             let mut args = vec!["new-tab".to_string()];
             if let Some(tab_name) = &request.tab_name {
@@ -1451,18 +2324,25 @@ fn prepare_spawn(request: &SpawnRequest) -> Result<PreparedSpawn, AdapterError> 
             .tab_name
             .as_ref()
             .map(|tab_name| vec!["go-to-tab-name".to_string(), tab_name.clone()]),
-    };
+    }
+}
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedSpawn {
+    action_args: Option<Vec<String>>,
+    command: Vec<String>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn prepare_spawn(request: &SpawnRequest) -> Result<PreparedSpawn, AdapterError> {
     Ok(PreparedSpawn {
-        action_args,
-        command: ZjctlCommand::Spawn {
-            cwd: request.cwd.clone(),
-            title: request.title.clone(),
-            command,
-        },
+        action_args: prepare_spawn_action_args(request),
+        command: resolve_spawn_command(request)?,
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn format_seconds(milliseconds: u64) -> String {
     let duration = Duration::from_millis(milliseconds);
     format!("{:.1}", duration.as_secs_f64())
@@ -1473,9 +2353,10 @@ mod tests {
     use std::cell::Cell;
     use std::cell::RefCell;
     use std::collections::{BTreeMap, HashMap};
+    use uuid::Uuid;
+    use zjctl_proto::{PROTOCOL_VERSION, RpcError, RpcErrorCode, RpcResponse};
 
     use crate::adapters::zjctl::AdapterError;
-    use crate::adapters::zjctl::ZjctlCommand;
 
     use crate::domain::requests::SpawnRequest;
     use crate::domain::status::SpawnTarget;
@@ -1483,9 +2364,12 @@ mod tests {
     use super::{
         PreparedSpawn, RemoteProbe, RemoteRemediationRunner, ResolvedTarget, SshBackendReadiness,
         SshReadinessFailure, SshTargetConfig,
+        augment_path_with_binary_dirs,
         attempt_safe_ssh_readiness_remediation_with_probe_and_runner,
-        classify_ssh_backend_readiness_with_probe, format_seconds, matches_selector, parse_command,
-        prepare_spawn, resolve_new_tab_target, resolve_spawn_command,
+        classify_ssh_backend_readiness_with_probe, format_seconds,
+        is_protocol_version_mismatch_message, matches_selector, parse_command, parse_rpc_output,
+        prepare_spawn, resolve_spawn_command, resolve_spawned_target,
+        resolve_spawned_target_from_run_output,
         resolve_ssh_runtime_config_with_probe,
     };
 
@@ -1818,11 +2702,7 @@ mod tests {
                     "--cwd".to_string(),
                     "/tmp".to_string(),
                 ]),
-                command: ZjctlCommand::Spawn {
-                    cwd: Some("/tmp".to_string()),
-                    title: Some("git-status".to_string()),
-                    command: vec!["git".to_string(), "status".to_string()],
-                },
+                command: vec!["git".to_string(), "status".to_string()],
             }
         );
     }
@@ -1876,7 +2756,7 @@ mod tests {
             },
         ];
 
-        let resolved = resolve_new_tab_target(
+        let resolved = resolve_spawned_target(
             &request,
             before,
             after,
@@ -1922,10 +2802,124 @@ mod tests {
             },
         ];
 
-        let resolved = resolve_new_tab_target(&request, before, after, "lazygit")
+        let resolved = resolve_spawned_target(&request, before, after, "lazygit")
             .expect("new tab target should resolve from command");
 
         assert_eq!(resolved.pane_id.as_deref(), Some("terminal:13"));
+    }
+
+    #[test]
+    fn resolve_new_tab_target_ignores_non_matching_requested_tab_name_when_command_is_unique() {
+        let request = SpawnRequest {
+            target: None,
+            session_name: "gpu".to_string(),
+            spawn_target: SpawnTarget::NewTab,
+            tab_name: Some("verify-live".to_string()),
+            cwd: None,
+            command: Some("bash -lc \"printf hello\\n; exec bash\"".to_string()),
+            argv: None,
+            title: Some("hello-live".to_string()),
+            wait_ready: false,
+        };
+        let before = vec![ResolvedTarget {
+            selector: "id:terminal:1".to_string(),
+            pane_id: Some("terminal:1".to_string()),
+            session_name: "gpu".to_string(),
+            tab_name: Some("Tab 1".to_string()),
+            title: Some("shell".to_string()),
+            command: Some("fish".to_string()),
+            focused: false,
+        }];
+        let after = vec![
+            before[0].clone(),
+            ResolvedTarget {
+                selector: "id:terminal:8".to_string(),
+                pane_id: Some("terminal:8".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("Tab 3".to_string()),
+                title: Some("Pane #1".to_string()),
+                command: None,
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:terminal:9".to_string(),
+                pane_id: Some("terminal:9".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("Tab 3".to_string()),
+                title: Some("shell".to_string()),
+                command: Some("bash -lc \"printf hello\\n; exec bash\"".to_string()),
+                focused: true,
+            },
+        ];
+
+        let resolved = resolve_spawned_target(
+            &request,
+            before,
+            after,
+            "bash -lc \"printf hello\\n; exec bash\"",
+        )
+        .expect("spawn should resolve even if the runtime tab name differs");
+
+        assert_eq!(resolved.pane_id.as_deref(), Some("terminal:9"));
+        assert_eq!(resolved.tab_name.as_deref(), Some("Tab 3"));
+    }
+
+    #[test]
+    fn resolve_spawn_target_prefers_exact_run_output_pane_id() {
+        let request = SpawnRequest {
+            target: None,
+            session_name: "gpu".to_string(),
+            spawn_target: SpawnTarget::NewTab,
+            tab_name: Some("verify-live".to_string()),
+            cwd: None,
+            command: Some("bash".to_string()),
+            argv: None,
+            title: Some("bash-live".to_string()),
+            wait_ready: false,
+        };
+        let before = vec![];
+        let after = vec![
+            ResolvedTarget {
+                selector: "id:terminal:14".to_string(),
+                pane_id: Some("terminal:14".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("Tab 6".to_string()),
+                title: Some("~/repo - fish".to_string()),
+                command: None,
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:terminal:15".to_string(),
+                pane_id: Some("terminal:15".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("Tab 6".to_string()),
+                title: Some("~/repo - fish".to_string()),
+                command: Some("bash".to_string()),
+                focused: true,
+            },
+        ];
+
+        let resolved = resolve_spawned_target_from_run_output(
+            &request,
+            before,
+            after,
+            b"terminal_15\n",
+            "bash",
+        )
+        .expect("spawn should resolve from zellij run output");
+
+        assert_eq!(resolved.pane_id.as_deref(), Some("terminal:15"));
+    }
+
+    #[test]
+    fn augment_path_with_binary_dirs_adds_explicit_binary_parents() {
+        let path = augment_path_with_binary_dirs(
+            Some("/usr/bin:/bin".to_string()),
+            &["/home/remote/.local/bin/zellij", "/home/remote/.local/bin/zjctl"],
+        )
+        .expect("path should be produced");
+
+        assert_eq!(path, "/home/remote/.local/bin:/usr/bin:/bin");
     }
 
     #[test]
@@ -2116,7 +3110,7 @@ mod tests {
             readiness,
             SshBackendReadiness::AutoFixable(SshReadinessFailure::MissingBinary {
                 host: "aws".to_string(),
-                binary: "zjctl".to_string(),
+                binary: "zellij".to_string(),
             })
         );
     }
@@ -2244,6 +3238,42 @@ mod tests {
     }
 
     #[test]
+    fn readiness_classifies_protocol_version_mismatch_distinctly() {
+        let config = SshTargetConfig {
+            host: "aws".to_string(),
+            remote_zjctl_bin: "/home/remote/.local/bin/zjctl".to_string(),
+            remote_zellij_bin: "/home/remote/.local/bin/zellij".to_string(),
+            remote_env: BTreeMap::new(),
+            ssh_options: Vec::new(),
+        };
+        let message = format!(
+            "zrpc protocol version mismatch: expected {}, got {}",
+            PROTOCOL_VERSION,
+            PROTOCOL_VERSION + 1
+        );
+        let probe = FakeProbe {
+            home: None,
+            path: None,
+            command_v: HashMap::new(),
+            executables: HashMap::new(),
+            rpc_readiness: Some(Err(AdapterError::CommandFailed(message.clone()))),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let readiness = classify_ssh_backend_readiness_with_probe(&config, "aws", &probe);
+
+        assert_eq!(
+            readiness,
+            SshBackendReadiness::ManualActionRequired(
+                SshReadinessFailure::ProtocolVersionMismatch {
+                    host: "aws".to_string(),
+                    detail: message,
+                }
+            )
+        );
+    }
+
+    #[test]
     fn readiness_auto_fix_starts_helper_client_when_missing() {
         let config = SshTargetConfig {
             host: "aws".to_string(),
@@ -2299,6 +3329,58 @@ mod tests {
                 .iter()
                 .any(|command| command.contains("new-session -d -s"))
         );
+        assert!(
+            runner
+                .commands
+                .borrow()
+                .iter()
+                .any(|command| command.contains("action") && command.contains("launch-plugin"))
+        );
+    }
+
+    #[test]
+    fn readiness_auto_fix_launches_repo_owned_plugin_before_retry() {
+        let config = SshTargetConfig {
+            host: "aws".to_string(),
+            remote_zjctl_bin: "zjctl".to_string(),
+            remote_zellij_bin: "zellij".to_string(),
+            remote_env: BTreeMap::new(),
+            ssh_options: Vec::new(),
+        };
+        let home = "/home/remote";
+        let probe = FakeProbe {
+            home: Some(home.to_string()),
+            path: Some("/usr/local/bin:/usr/bin:/bin".to_string()),
+            command_v: HashMap::from([
+                (
+                    "zellij".to_string(),
+                    Some(format!("{home}/.local/bin/zellij")),
+                ),
+                ("tmux".to_string(), Some("/usr/bin/tmux".to_string())),
+            ]),
+            executables: HashMap::new(),
+            rpc_readiness: None,
+            calls: RefCell::new(Vec::new()),
+        };
+        let runner = RecordingRemediationRunner::default();
+
+        let remediated = attempt_safe_ssh_readiness_remediation_with_probe_and_runner(
+            &config,
+            "aws",
+            &SshReadinessFailure::RpcNotReady {
+                host: "aws".to_string(),
+                detail: "zjctl RPC readiness check timed out".to_string(),
+            },
+            &probe,
+            &runner,
+        );
+
+        assert!(remediated);
+        assert!(runner.commands.borrow().iter().any(|command| {
+            command.contains("action")
+                && command.contains("launch-plugin")
+                && command.contains("/home/remote/.config/zellij/plugins/zrpc.wasm")
+        }));
     }
 
     #[test]
@@ -2359,6 +3441,97 @@ mod tests {
                 .borrow()
                 .iter()
                 .all(|command| !command.contains("Allow? (y/n)"))
+        );
+    }
+
+    #[test]
+    fn readiness_auto_fix_skips_protocol_version_mismatch() {
+        let config = SshTargetConfig {
+            host: "aws".to_string(),
+            remote_zjctl_bin: "zjctl".to_string(),
+            remote_zellij_bin: "zellij".to_string(),
+            remote_env: BTreeMap::new(),
+            ssh_options: Vec::new(),
+        };
+        let probe = FakeProbe::default();
+        let runner = RecordingRemediationRunner::default();
+
+        let remediated = attempt_safe_ssh_readiness_remediation_with_probe_and_runner(
+            &config,
+            "aws",
+            &SshReadinessFailure::ProtocolVersionMismatch {
+                host: "aws".to_string(),
+                detail: format!(
+                    "zrpc protocol version mismatch: expected {}, got {}",
+                    PROTOCOL_VERSION,
+                    PROTOCOL_VERSION + 1
+                ),
+            },
+            &probe,
+            &runner,
+        );
+
+        assert!(!remediated);
+        assert!(runner.commands.borrow().is_empty());
+    }
+
+    #[test]
+    fn detects_protocol_version_mismatch_messages() {
+        assert!(is_protocol_version_mismatch_message(
+            &format!(
+                "zrpc protocol version mismatch: expected {}, got {}",
+                PROTOCOL_VERSION,
+                PROTOCOL_VERSION + 1
+            )
+        ));
+        assert!(!is_protocol_version_mismatch_message(
+            "Error: no response from zrpc plugin"
+        ));
+    }
+
+    #[test]
+    fn parse_rpc_output_rejects_version_mismatch() {
+        let request_id = Uuid::new_v4();
+        let response = RpcResponse {
+            v: PROTOCOL_VERSION + 1,
+            id: request_id,
+            ok: true,
+            result: Some(serde_json::json!({"count": 1})),
+            error: None,
+        };
+        let stdout = serde_json::to_string(&response).expect("response should serialize");
+
+        let error = parse_rpc_output(&stdout, request_id, "file:/tmp/zrpc.wasm")
+            .expect_err("version mismatch should be rejected");
+
+        assert_eq!(
+            error,
+            AdapterError::CommandFailed(format!(
+                "zrpc protocol version mismatch: expected {}, got {}",
+                PROTOCOL_VERSION,
+                PROTOCOL_VERSION + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_rpc_output_preserves_plugin_error_message() {
+        let request_id = Uuid::new_v4();
+        let response = RpcResponse {
+            v: PROTOCOL_VERSION,
+            id: request_id,
+            ok: false,
+            result: None,
+            error: Some(RpcError::new(RpcErrorCode::NoMatch, "no panes found")),
+        };
+        let stdout = serde_json::to_string(&response).expect("response should serialize");
+
+        let error = parse_rpc_output(&stdout, request_id, "file:/tmp/zrpc.wasm")
+            .expect_err("rpc errors should surface");
+
+        assert_eq!(
+            error,
+            AdapterError::CommandFailed("no panes found".to_string())
         );
     }
 }

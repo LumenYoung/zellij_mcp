@@ -177,18 +177,6 @@ fn load_target_configs(raw_targets: Option<&str>) -> Result<TargetConfigs, serde
         .map(|configs| configs.unwrap_or_else(TargetConfigs::default))
 }
 
-fn persisted_remote_target_ids(registry_store: &RegistryStore) -> Result<Vec<String>, DomainError> {
-    let mut targets: Vec<String> = registry_store
-        .load()?
-        .into_iter()
-        .map(|binding| binding.target_id)
-        .filter(|target_id| target_id != "local")
-        .collect();
-    targets.sort();
-    targets.dedup();
-    Ok(targets)
-}
-
 fn build_remote_backend(
     target_id: String,
     config: &SshTargetConfig,
@@ -244,14 +232,13 @@ fn build_remote_backend(
 
 #[tokio::main]
 async fn main() {
-    let zjctl_binary = std::env::var("ZJCTL_BIN").unwrap_or_else(|_| "zjctl".to_string());
     let state_dir = std::env::var("ZELLIJ_MCP_STATE_DIR").unwrap_or_else(|_| "state".to_string());
     let registry_store = RegistryStore::new(format!("{state_dir}/registry.json"));
     let observation_store = ObservationStore::new(format!("{state_dir}/observations.json"));
 
     let local_service = Arc::new(TerminalService::new(
         "local",
-        ZjctlClient::new(zjctl_binary),
+        ZjctlClient::new(),
         registry_store.clone(),
         observation_store.clone(),
     ));
@@ -295,25 +282,6 @@ async fn main() {
         )
     };
 
-    for target_id in persisted_remote_target_ids(&registry_store).unwrap_or_default() {
-        match remote_backend_factory(&target_id) {
-            Ok(Some(backend)) => {
-                backends.insert(target_id, backend);
-            }
-            Ok(None) => {
-                eprintln!(
-                    "zellij_mcp startup skipped persisted target that is no longer configured"
-                );
-            }
-            Err(error) => {
-                eprintln!(
-                    "zellij_mcp startup failed to preload target `{}`: {} ({:?})",
-                    target_id, error.message, error.code
-                );
-            }
-        }
-    }
-
     let server = McpServer::new(Box::new(TargetRouter::new(
         registry_store,
         backends,
@@ -333,11 +301,8 @@ mod tests {
     use super::{
         SshTargetOverride, build_remote_backend, default_remote_zellij_bin,
         default_remote_zjctl_bin, load_target_configs, parse_target_configs,
-        persisted_remote_target_ids,
     };
     use zellij_mcp::adapters::zjctl::SshTargetConfig;
-    use zellij_mcp::domain::binding::TerminalBinding;
-    use zellij_mcp::domain::status::{BindingSource, TerminalStatus};
     use zellij_mcp::persistence::{ObservationStore, RegistryStore};
 
     #[test]
@@ -367,83 +332,6 @@ mod tests {
                 remote_env,
                 ssh_options: Some(vec!["-o".to_string(), "BatchMode=yes".to_string()]),
             })
-        );
-    }
-
-    #[test]
-    fn persisted_remote_target_ids_collects_unique_non_local_targets() {
-        let path = std::env::temp_dir().join(format!("zellij-mcp-test-{}", uuid::Uuid::new_v4()));
-        let registry = RegistryStore::new(path.join("registry.json"));
-        let now = chrono::Utc::now();
-
-        registry
-            .save(&[
-                TerminalBinding {
-                    handle: "zh_local".to_string(),
-                    target_id: "local".to_string(),
-                    alias: None,
-                    session_name: "gpu".to_string(),
-                    tab_name: None,
-                    selector: "id:terminal:1".to_string(),
-                    pane_id: Some("terminal:1".to_string()),
-                    cwd: None,
-                    launch_command: None,
-                    source: BindingSource::Attached,
-                    status: TerminalStatus::Ready,
-                    created_at: now,
-                    updated_at: now,
-                },
-                TerminalBinding {
-                    handle: "zh_a".to_string(),
-                    target_id: "ssh:a100".to_string(),
-                    alias: None,
-                    session_name: "gpu".to_string(),
-                    tab_name: None,
-                    selector: "id:terminal:2".to_string(),
-                    pane_id: Some("terminal:2".to_string()),
-                    cwd: None,
-                    launch_command: None,
-                    source: BindingSource::Attached,
-                    status: TerminalStatus::Ready,
-                    created_at: now,
-                    updated_at: now,
-                },
-                TerminalBinding {
-                    handle: "zh_b".to_string(),
-                    target_id: "ssh:a100".to_string(),
-                    alias: None,
-                    session_name: "gpu".to_string(),
-                    tab_name: None,
-                    selector: "id:terminal:3".to_string(),
-                    pane_id: Some("terminal:3".to_string()),
-                    cwd: None,
-                    launch_command: None,
-                    source: BindingSource::Attached,
-                    status: TerminalStatus::Busy,
-                    created_at: now,
-                    updated_at: now,
-                },
-                TerminalBinding {
-                    handle: "zh_c".to_string(),
-                    target_id: "ssh:aws".to_string(),
-                    alias: None,
-                    session_name: "gpu".to_string(),
-                    tab_name: None,
-                    selector: "id:terminal:4".to_string(),
-                    pane_id: Some("terminal:4".to_string()),
-                    cwd: None,
-                    launch_command: None,
-                    source: BindingSource::Attached,
-                    status: TerminalStatus::Ready,
-                    created_at: now,
-                    updated_at: now,
-                },
-            ])
-            .expect("registry should save");
-
-        assert_eq!(
-            persisted_remote_target_ids(&registry).expect("target ids should load"),
-            vec!["ssh:a100".to_string(), "ssh:aws".to_string()]
         );
     }
 

@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::domain::status::SpawnTarget;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TerminalObservation {
     pub handle: String,
@@ -14,6 +16,13 @@ pub struct TerminalObservation {
     pub interaction_started_at: Option<DateTime<Utc>>,
     pub interaction_completed_at: Option<DateTime<Utc>>,
     pub interaction_exit_code: Option<i32>,
+    #[serde(default)]
+    pub spawn_before_pane_ids: Vec<String>,
+    pub spawn_target: Option<SpawnTarget>,
+    pub spawn_tab_name: Option<String>,
+    pub spawn_title: Option<String>,
+    pub spawn_command: Option<String>,
+    pub spawn_launched_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,5 +74,31 @@ impl TerminalObservation {
         self.interaction_started_at = None;
         self.interaction_completed_at = None;
         self.interaction_exit_code = None;
+    }
+
+    pub fn set_spawn_hints(
+        &mut self,
+        before_pane_ids: Vec<String>,
+        spawn_target: SpawnTarget,
+        tab_name: Option<String>,
+        title: Option<String>,
+        command: Option<String>,
+        launched_at: DateTime<Utc>,
+    ) {
+        self.spawn_before_pane_ids = before_pane_ids;
+        self.spawn_target = Some(spawn_target);
+        self.spawn_tab_name = tab_name;
+        self.spawn_title = title;
+        self.spawn_command = command;
+        self.spawn_launched_at = Some(launched_at);
+    }
+
+    pub fn clear_spawn_hints(&mut self) {
+        self.spawn_before_pane_ids.clear();
+        self.spawn_target = None;
+        self.spawn_tab_name = None;
+        self.spawn_title = None;
+        self.spawn_command = None;
+        self.spawn_launched_at = None;
     }
 }

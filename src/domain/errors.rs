@@ -19,6 +19,7 @@ pub enum ErrorCode {
     CloseFailed,
     ZjctlUnavailable,
     PluginNotReady,
+    ProtocolVersionMismatch,
     PersistenceError,
 }
 

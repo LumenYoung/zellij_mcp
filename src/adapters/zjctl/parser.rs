@@ -1,7 +1,7 @@
 use serde::Deserialize;
 
-use crate::adapters::zjctl::AdapterError;
 use crate::adapters::zjctl::client::ResolvedTarget;
+use crate::adapters::zjctl::AdapterError;
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_single_selector(output: &str) -> Result<String, AdapterError> {
@@ -15,6 +15,7 @@ pub fn parse_single_selector(output: &str) -> Result<String, AdapterError> {
     Ok(selector.to_string())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_list_output(
     output: &str,
     session_name: Option<&str>,
@@ -40,6 +41,7 @@ pub fn parse_capture_output(output: &[u8]) -> String {
     String::from_utf8_lossy(output).into_owned()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_spawn_output(
     output: &str,
     session_name: &str,
@@ -50,7 +52,8 @@ pub fn parse_spawn_output(
     let pane_id = raw_selector
         .strip_prefix("id:")
         .unwrap_or(&raw_selector)
-        .to_string();
+        .replace("terminal_", "terminal:")
+        .replace("plugin_", "plugin:");
     let selector = format!("id:{pane_id}");
 
     Ok(ResolvedTarget {
@@ -65,6 +68,7 @@ pub fn parse_spawn_output(
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct PaneRecord {
     id: String,
     tab_name: Option<String>,
@@ -125,6 +129,15 @@ mod tests {
     #[test]
     fn canonicalizes_raw_spawn_output_to_id_selector() {
         let target = parse_spawn_output("terminal:9\n", "gpu", Some("editor"), Some("lg"))
+            .expect("spawn output should parse");
+
+        assert_eq!(target.selector, "id:terminal:9");
+        assert_eq!(target.pane_id.as_deref(), Some("terminal:9"));
+    }
+
+    #[test]
+    fn canonicalizes_underscore_spawn_output_to_id_selector() {
+        let target = parse_spawn_output("terminal_9\n", "gpu", Some("editor"), Some("lg"))
             .expect("spawn output should parse");
 
         assert_eq!(target.selector, "id:terminal:9");
