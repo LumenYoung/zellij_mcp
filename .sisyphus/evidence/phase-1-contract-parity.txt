@@ -1,0 +1,24 @@
+Phase 1 evidence: MCP contract parity
+
+Date: 2026-03-26
+
+Validation performed:
+- `cargo test` passed
+- `cargo build --release` passed
+- `mcp2cli --mcp-stdio "./target/release/zellij_mcp" --list` still exposed the same MCP tool surface:
+  - zellij-attach
+  - zellij-capture
+  - zellij-cleanup
+  - zellij-close
+  - zellij-discover
+  - zellij-layout
+  - zellij-list
+  - zellij-replace
+  - zellij-send
+  - zellij-spawn
+  - zellij-takeover
+  - zellij-wait
+
+Implementation note:
+- The Phase 1 change stayed behind `TerminalService` + `TargetRouter` + `ZjctlAdapter`.
+- Request/response behavior for MCP tools remained stable while the adapter internals switched from external `zjctl` CLI execution to in-repo protocol/transport logic.

@@ -1,0 +1,22 @@
+F4 Scope Fidelity Check
+Date: 2026-03-27
+Verdict: APPROVE
+
+Scope findings:
+- public MCP tool names remain stable
+- spawn semantics are interactive-first and fish-default
+- location intent hides low-level placement mechanics from agents
+- repo-owned logic covers protocol/plugin/readiness behavior directly
+- docs do not claim to absorb Zellij itself or detached remote transport
+- final remote-close fix is narrowly scoped to truthful/effective cleanup for the exercised remote shell flow
+
+Evidence used:
+- .sisyphus/plans/zjctl-absorption-phase-plan.md
+- src/server/mcp.rs
+- README.md
+- docs/architecture.md
+- docs/mcp-contract.md
+- src/services/terminal.rs
+
+Conclusion:
+Scope fidelity approved.

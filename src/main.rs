@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use zellij_mcp::adapters::zjctl::{
-    SshTargetConfig, SshZjctlClient, ZjctlClient, missing_binary_name, resolve_ssh_runtime_config,
+    LocalBackend, SshBackend, SshTargetConfig, missing_binary_name,
+    resolve_ssh_runtime_config,
 };
 use zellij_mcp::domain::errors::DomainError;
 use zellij_mcp::persistence::{ObservationStore, RegistryStore};
@@ -224,7 +225,7 @@ fn build_remote_backend(
 
     Ok(Arc::new(TerminalService::new(
         target_id,
-        SshZjctlClient::new(resolved_config),
+        SshBackend::new(resolved_config),
         registry_store.clone(),
         observation_store.clone(),
     )) as Arc<dyn TerminalManager>)
@@ -238,7 +239,7 @@ async fn main() {
 
     let local_service = Arc::new(TerminalService::new(
         "local",
-        ZjctlClient::new(),
+        LocalBackend::new(),
         registry_store.clone(),
         observation_store.clone(),
     ));

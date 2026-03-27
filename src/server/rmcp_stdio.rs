@@ -39,7 +39,7 @@ impl RmcpServer {
         self.execute("zellij_spawn", request)
     }
 
-    #[tool(description = "Attach one live pane by exact selector and return a daemon handle.")]
+    #[tool(description = "Attach one live pane by location intent and return a daemon handle.")]
     fn zellij_attach(
         &self,
         Parameters(request): Parameters<AttachRequest>,
@@ -63,7 +63,7 @@ impl RmcpServer {
         self.execute("zellij_discover", request)
     }
 
-    #[tool(description = "Send text or keys to a managed pane handle.")]
+    #[tool(description = "Send text or keys by managed handle or pane location intent.")]
     fn zellij_send(
         &self,
         Parameters(request): Parameters<SendRequest>,

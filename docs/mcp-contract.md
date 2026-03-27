@@ -3,7 +3,7 @@
 ## Principles
 
 - expose stable daemon-native tools rather than raw Zellij actions
-- identify terminals by daemon handle, not by raw pane id
+- prefer daemon handles for managed follow-up, while still allowing exact location intent where the tool explicitly supports it
 - keep phase 1 tool semantics small and explicit
 - document degraded behavior where the backend cannot provide exact semantics
 
@@ -61,12 +61,18 @@ Notes:
 - phase 1 does not replace existing processes in an existing pane
 - use either `command` or `argv`, not both
 - `command` is parsed with shell-style quoting, so inputs like `bash -lc 'echo hello world'` preserve the intended argv shape
-- `argv` bypasses shell parsing and is passed to `zjctl` as-is
+- `argv` bypasses shell parsing and is passed to the backend as-is
 - malformed shell quoting in `command`, blank `command`, empty `argv`, blank `argv[0]`, or mixed `command` + `argv` input fails early as an argument parse error instead of spawning a mangled command
 - `wait_ready=true` runs the same rendered-screen idle check as `zellij_wait`; it works for shell-like startup and was live-tested with `lazygit`, but redraw-heavy TUIs may still make it a noisy readiness proxy
 - when that bounded idle check times out after the pane is already real, `zellij_spawn` returns the new handle with `status="busy"` instead of failing the whole launch
 - `spawn_target="new_tab"` now creates the tab, launches the command with `zellij run`, then resolves the spawned pane from post-launch session state; this avoids the earlier fresh-tab RPC handoff stall where the pane could exist before the request returned
 - fatal post-launch errors that happen after early persistence now clean up the provisional binding instead of leaving an orphaned busy handle behind
+
+Remote readiness and bootstrap note:
+
+- repo-owned shell/bootstrap outputs use the same readiness vocabulary as MCP: `readiness_state`, `readiness_reason`, and `mcp_error_code`
+- `PLUGIN_NOT_READY` remains the umbrella MCP class for missing plugin artifacts, plugin approval, helper-client absence, and RPC-not-ready drift
+- `PROTOCOL_VERSION_MISMATCH` stays separate because repeating the same bounded remediation cannot fix daemon/plugin skew
 
 Response:
 
@@ -184,9 +190,9 @@ Response:
 
 ### `zellij_send`
 
-Send input to a managed pane.
+Send input to a managed pane handle or directly to one exact existing pane by location intent.
 
-Input:
+Handle-based input:
 
 ```json
 {
@@ -198,8 +204,25 @@ Input:
 }
 ```
 
+Location-intent input:
+
+```json
+{
+  "target": "a100",
+  "session_name": "gpu",
+  "tab_name": "editor",
+  "selector": "id:terminal:7",
+  "text": "printf 'ok'",
+  "submit": true
+}
+```
+
 Notes:
 
+- `zellij_send` accepts exactly one targeting mode: either `handle`, or location intent via `session_name` + `selector`
+- when `handle` is omitted, `session_name` and `selector` are required, `tab_name` is optional narrowing context, and `target` may be used to select a local or SSH backend directly
+- location-intent sends do not create or persist a managed handle; they resolve the target pane for that one request and return `accepted=true`
+- `submit` is still a required field in both handle and location-intent forms; omitting it is currently an argument-parse error rather than an implicit default
 - `input_mode` is optional: `raw` means direct terminal input, `submit_line` means explicit shell-style line submission, and omitting it preserves the legacy `submit` behavior
 - `submit=true` remains the backward-compatible way to request shell-style line submission and current-boundary reset when `input_mode` is omitted
 - `keys` is optional and supports named special inputs including `enter`, `tab`, `shift_tab`, `escape`/`esc`, arrows, `home`, `end`, `insert`, `delete`, `page_up`, `page_down`, `f1` through `f12`, and generic `ctrl_<letter>` chords such as `ctrl_c` or `ctrl_l`
@@ -319,7 +342,7 @@ Response:
 
 Notes:
 
-- `zellij_wait` uses `zjctl pane wait-idle`, so it observes rendered-screen stability rather than process completion
+- `zellij_wait` uses the backend idle-wait path, so it observes rendered-screen stability rather than process completion
 - for daemon-submitted shell interactions on supported shell-like panes, `zellij_wait` can additionally report `completion_basis="interaction_marker"` plus interaction completion metadata when the explicit end marker is visible in capture output
 - if the backend temporarily fails to resolve a freshly managed pane, the daemon retries and can fall back to capture-based stability polling before declaring the handle stale
 - this has been verified live for a spawned `lazygit` pane, but should still be read as an idle heuristic rather than an exact app-ready guarantee
@@ -446,7 +469,7 @@ Input:
 
 - `TARGET_NOT_FOUND`: either the configured target alias is missing or a previously known selector no longer resolves; check target config first, then revalidate session/pane existence
 - `CAPTURE_FAILED`: the daemon still has a routed handle, but capture could not complete; retry with the same handle and let `zellij_list` or `zellij_capture` revalidate before discarding the binding
-- `PLUGIN_NOT_READY`: SSH transport reached the host, but plugin approval, helper-client presence, or RPC readiness is still missing; distinguish those cases before escalating to transport debugging
+- `PLUGIN_NOT_READY`: SSH transport reached the host, but plugin/runtime preconditions are still missing; distinguish missing plugin artifacts, plugin approval, helper-client presence, and RPC readiness drift before escalating to transport debugging
 - `PROTOCOL_VERSION_MISMATCH`: the daemon reached the plugin but `response.v` does not match the daemon's expected protocol version; use matching daemon/plugin artifacts before retrying rather than repeating helper or plugin-launch remediation
 - `ZJCTL_UNAVAILABLE`: the daemon could not reach the binary or the SSH-backed execution path; verify SSH reachability, non-interactive PATH resolution, and native binary availability on the remote host
 

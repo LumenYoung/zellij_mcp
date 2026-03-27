@@ -1,0 +1,32 @@
+Phase 3 evidence: bounded remote spawn on aws and a100
+
+Date: 2026-03-26
+Repo: /home/yang/Documents/git/zellij-skill
+
+Code verification:
+- `cargo build --release` exited 0 after the Phase 3 detached launch, recovery-path, and SSH timeout changes.
+- `cargo test` exited 0 (`138` unit tests + `7` main tests).
+
+Remote host readiness notes:
+- `aws` had already been proven earlier to return bounded `busy` for both `new_tab` and `existing_tab` through fresh-daemon `zellij-spawn`.
+- `a100` initially regressed to `PLUGIN_NOT_READY` even with helper tmux sessions present.
+- Broader recovery on `a100` was an explicit bounded plugin launch:
+  - `ssh -oBatchMode=yes a100 'export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"; export ZELLIJ_SESSION_NAME=a100; timeout 15 zellij action launch-plugin "file:$HOME/.config/zellij/plugins/zrpc.wasm"; printf "exit=%s\n" "$?"'`
+  - result: `exit=0`
+- After that recovery, raw readiness was healthy again:
+  - `ssh -oBatchMode=yes a100 '...; export ZELLIJ_SESSION_NAME=a100; timeout 30 zjctl doctor; printf "exit=%s\n" "$?"'`
+  - observed: `rpc: ok`, `exit=0`
+  - `ssh -oBatchMode=yes a100 '...; export ZELLIJ_SESSION_NAME=a100; timeout 20 zjctl panes ls --json >/tmp/zjctl-a100.json; status=$?; printf "exit=%s\n" "$status"; if [ "$status" -eq 0 ]; then sed -n "1,80p" /tmp/zjctl-a100.json; fi'`
+  - observed: `exit=0`
+
+Fresh-daemon bounded spawn proof on `a100`:
+- `new_tab` repro:
+  - `zellij-spawn --session-name a100 --spawn-target new_tab --tab-name phase3-a100-proof --command 'bash -lc "printf phase3-a100-proof"' --title phase3-a100-proof --wait-ready --target a100`
+  - observed: returned in about `2.00s`, `status="busy"`, handle `zh_f80da347e6884a47955bfedfb1998a65`
+- `existing_tab` repro:
+  - `zellij-spawn --session-name a100 --spawn-target existing_tab --tab-name 'Tab #1' --command 'bash -lc "printf phase3-a100-existing"' --title phase3-a100-existing --wait-ready --target a100`
+  - observed: returned in about `1.99s`, `status="busy"`, handle `zh_a5a9a90196f94e5d869f21eb9d76d417`
+
+Interpretation:
+- Phase 3 detached launch is proven bounded on both `aws` and `a100`.
+- Immediate readiness unavailability now degrades to a recoverable `busy` handle rather than hanging the caller or collapsing to generic `SPAWN_FAILED`.

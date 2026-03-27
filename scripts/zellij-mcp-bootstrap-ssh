@@ -11,6 +11,8 @@ Options:
   --remote-home PATH         Remote home directory (default: query over ssh)
   --session NAME             Zellij session to prepare for RPC (default: same as ssh alias)
   --helper-session NAME      tmux session name for detached helper client
+  --helper-cols N            tmux helper width in columns (default: ZELLIJ_MCP_HELPER_COLS, COLUMNS, or 160)
+  --helper-rows N            tmux helper height in rows (default: ZELLIJ_MCP_HELPER_ROWS, LINES, or 48)
   --local-zjctl-repo PATH    Local zjctl repo path (default: /home/yang/Documents/git/zjctl)
   --ssh-option ARG           Extra ssh argument token (repeatable)
   --skip-helper-client       Skip detached tmux helper client setup
@@ -21,11 +23,16 @@ What it does:
   - ensures remote ~/.local/bin, state dir, and repo dirs exist
   - installs rustup in remote user space if needed
   - syncs this repo to the remote host and clones or updates zjctl
-  - builds zellij_mcp and zjctl natively on the remote host
+  - builds zellij_mcp, zjctl, and zrpc.wasm natively on the remote host
   - installs binaries into remote ~/.local/bin
   - optionally installs the repo-built zrpc.wasm and starts a detached tmux helper client
-  - runs zjctl doctor against the target session at the end
+  - finishes with a repo-owned readiness summary instead of raw doctor output
   - prepares the host for the current single-MCP daemon flow or helper-script fallback usage
+
+Final readiness summary fields:
+  - readiness_state=READY | AUTO_FIXABLE | MANUAL_ACTION_REQUIRED
+  - readiness_reason=missing_plugin | plugin_permission_prompt | helper_client_missing | rpc_not_ready | protocol_version_mismatch | ssh_unreachable
+  - mcp_error_code=PLUGIN_NOT_READY | PROTOCOL_VERSION_MISMATCH | ZJCTL_UNAVAILABLE
 EOF
 }
 
@@ -49,6 +56,28 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
 skip_helper_client=0
 skip_plugin_install=0
+helper_cols=160
+helper_rows=48
+
+parse_positive_int() {
+  local raw=${1-}
+  [[ $raw =~ ^[0-9]+$ ]] || return 1
+  (( raw > 0 )) || return 1
+  printf '%s' "$raw"
+}
+
+if parsed=$(parse_positive_int "${ZELLIJ_MCP_HELPER_COLS-}"); then
+  helper_cols=$parsed
+elif parsed=$(parse_positive_int "${COLUMNS-}"); then
+  helper_cols=$parsed
+fi
+
+if parsed=$(parse_positive_int "${ZELLIJ_MCP_HELPER_ROWS-}"); then
+  helper_rows=$parsed
+elif parsed=$(parse_positive_int "${LINES-}"); then
+  helper_rows=$parsed
+fi
+
 declare -a ssh_options=()
 
 while (($#)); do
@@ -70,6 +99,16 @@ while (($#)); do
     --helper-session)
       (($# >= 2)) || die "missing value for --helper-session"
       helper_session=$2
+      shift 2
+      ;;
+    --helper-cols)
+      (($# >= 2)) || die "missing value for --helper-cols"
+      helper_cols=$(parse_positive_int "$2") || die "--helper-cols must be a positive integer"
+      shift 2
+      ;;
+    --helper-rows)
+      (($# >= 2)) || die "missing value for --helper-rows"
+      helper_rows=$(parse_positive_int "$2") || die "--helper-rows must be a positive integer"
       shift 2
       ;;
     --local-zjctl-repo)
@@ -118,6 +157,68 @@ join_quoted_args() {
     result+=" $(quote_posix_sh "$arg")"
   done
   printf '%s' "$result"
+}
+
+classify_readiness_reason() {
+  local message=${1-}
+  local lower=${message,,}
+
+  if [[ $lower == *"zrpc plugin not found at"* ]] || [[ $lower == *"plugin not found at"* && $lower == *"zrpc"* ]]; then
+    printf '%s' "missing_plugin"
+    return
+  fi
+
+  if [[ ( $lower == *"plugin"* || $lower == *"zjctl"* ) && ( $lower == *"permission"* || $lower == *"approve"* || $lower == *"allow"* ) ]]; then
+    printf '%s' "plugin_permission_prompt"
+    return
+  fi
+
+  if [[ $lower == *"zrpc protocol version mismatch"* ]] || [[ $lower == *"protocol version mismatch"* && $lower == *"expected"* && $lower == *"got"* ]]; then
+    printf '%s' "protocol_version_mismatch"
+    return
+  fi
+
+  if [[ ( $lower == *"helper"* && $lower == *"client"* ) || $lower == *"not attached yet"* || $lower == *"no active clients"* || $lower == *"no active session"* ]]; then
+    printf '%s' "helper_client_missing"
+    return
+  fi
+
+  if [[ $lower == *"rpc"* || $lower == *"zrpc"* || $lower == *"no response from plugin"* || $lower == *"timed out"* || $lower == *"timeout"* || $lower == *"not ready"* ]]; then
+    printf '%s' "rpc_not_ready"
+    return
+  fi
+
+  printf '%s' "ssh_unreachable"
+}
+
+classify_readiness_state() {
+  local reason=${1-}
+  case "$reason" in
+    helper_client_missing|rpc_not_ready)
+      printf '%s' "AUTO_FIXABLE"
+      ;;
+    missing_plugin|plugin_permission_prompt|protocol_version_mismatch|ssh_unreachable)
+      printf '%s' "MANUAL_ACTION_REQUIRED"
+      ;;
+    *)
+      printf '%s' "MANUAL_ACTION_REQUIRED"
+      ;;
+  esac
+}
+
+classify_mcp_error_code() {
+  local reason=${1-}
+  case "$reason" in
+    protocol_version_mismatch)
+      printf '%s' "PROTOCOL_VERSION_MISMATCH"
+      ;;
+    ssh_unreachable)
+      printf '%s' "ZJCTL_UNAVAILABLE"
+      ;;
+    *)
+      printf '%s' "PLUGIN_NOT_READY"
+      ;;
+  esac
 }
 
 if [[ -z $remote_home ]]; then
@@ -173,10 +274,20 @@ if (( skip_plugin_install == 0 )); then
 fi
 
 if (( skip_helper_client == 0 )); then
-  run_ssh "export PATH=${quoted_remote_path}; tmux kill-session -t ${quoted_helper_session} >/dev/null 2>&1 || true; tmux new-session -d -s ${quoted_helper_session} ${quoted_attach_command}; sleep 2; if tmux capture-pane -pt ${quoted_helper_session} 2>/dev/null | grep -F 'Allow? (y/n)' >/dev/null; then tmux send-keys -t ${quoted_helper_session} y Enter; sleep 2; fi"
+  run_ssh "export PATH=${quoted_remote_path}; tmux kill-session -t ${quoted_helper_session} >/dev/null 2>&1 || true; tmux new-session -d -x ${helper_cols} -y ${helper_rows} -s ${quoted_helper_session} ${quoted_attach_command}; sleep 2; if tmux capture-pane -pt ${quoted_helper_session} 2>/dev/null | grep -F 'Allow? (y/n)' >/dev/null; then tmux send-keys -t ${quoted_helper_session} y Enter; sleep 2; fi"
 fi
 
-run_ssh "export PATH=${quoted_remote_path}; export ZELLIJ_SESSION_NAME=${quoted_session_name}; ${quoted_remote_bin_dir}/zjctl doctor"
+readiness_probe_command="export PATH=${quoted_remote_path}; export ZELLIJ_SESSION_NAME=${quoted_session_name}; ( ${quoted_remote_bin_dir}/zjctl panes ls --json >/dev/null ) & pid=\$!; ( sleep 20; if kill -0 \$pid >/dev/null 2>&1; then kill \$pid >/dev/null 2>&1; fi ) & watcher=\$!; wait \$pid; status=\$?; kill \$watcher >/dev/null 2>&1 || true; wait \$watcher >/dev/null 2>&1 || true; if [ \$status -eq 143 ]; then printf '%s\n' 'zjctl RPC readiness check timed out' >&2; exit 124; fi; exit \$status"
+
+if readiness_output=$(run_ssh "$readiness_probe_command" 2>&1); then
+  readiness_state="READY"
+  readiness_reason="ready"
+  mcp_error_code="READY"
+else
+  readiness_reason=$(classify_readiness_reason "$readiness_output")
+  readiness_state=$(classify_readiness_state "$readiness_reason")
+  mcp_error_code=$(classify_mcp_error_code "$readiness_reason")
+fi
 
 printf 'Remote bootstrap complete for %s\n' "$host" >&2
 printf 'remote_bin=%s\n' "$remote_bin_dir/zellij_mcp"
@@ -184,3 +295,11 @@ printf 'remote_zjctl=%s\n' "$remote_bin_dir/zjctl"
 printf 'remote_state_dir=%s\n' "$remote_state_dir"
 printf 'session_name=%s\n' "$session_name"
 printf 'helper_session=%s\n' "$helper_session"
+printf 'readiness_state=%s\n' "$readiness_state"
+printf 'readiness_reason=%s\n' "$readiness_reason"
+printf 'mcp_error_code=%s\n' "$mcp_error_code"
+
+if [[ -n ${readiness_output-} && $readiness_state != READY ]]; then
+  printf 'readiness_detail=%s\n' "$readiness_output" >&2
+  exit 70
+fi

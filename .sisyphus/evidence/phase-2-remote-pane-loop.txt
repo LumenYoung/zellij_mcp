@@ -1,0 +1,28 @@
+Phase 2 evidence: real-host steady-state pane loop
+
+Date: 2026-03-26
+Repo: /home/yang/Documents/git/zellij-skill
+
+Local proof:
+- Created a temporary local Zellij session via `script -q -c "zellij attach -c phase2-smoke" /dev/null`.
+- Ran fresh-daemon `discover -> attach -> send -> wait -> capture -> close` through `target/release/zellij_mcp` with `ZJCTL_BIN=/does/not/exist`.
+- Observed `phase2-local-ok` in `current` capture and a successful `close` response.
+
+Remote `aws` proof:
+- Fresh-daemon `zellij-discover --session-name aws --target aws` succeeded.
+- Fresh-daemon `zellij-attach --session-name aws --selector id:terminal:0 --target aws` succeeded.
+- Fresh-daemon `zellij-send`, `zellij-wait`, and `zellij-capture --mode current` on the returned handle succeeded.
+- Observed `phase2-aws-ok` in the captured output.
+
+Remote `a100` proof:
+- Fresh-daemon `zellij-discover --session-name a100 --target a100` succeeded.
+- Direct host inspection showed old remote `zellij action dump-screen/close-pane` lack pane targeting, so the repo now falls back to remote `zjctl pane capture|wait-idle|close` on such hosts.
+- Started a detached helper client on `a100` with `tmux new-session -d -s zellij-mcp-helper "... zellij attach a100"` and confirmed `zjctl doctor` reported `rpc: ok`.
+- Fresh-daemon `zellij-attach --session-name a100 --selector id:terminal:1 --target a100` succeeded.
+- Fresh-daemon `zellij-send`, `zellij-wait`, and `zellij-capture --mode current` on the returned handle succeeded.
+- Observed `phase2-a100-ok` in the captured output.
+
+Interpretation:
+- Local Phase 2 steady-state loop is proven with no local external `zjctl` runtime dependency.
+- Real-host `aws` and `a100` now both complete the remote steady-state `attach -> send -> wait -> capture` loop through the fresh daemon.
+- Older remote Zellij action surfaces required a repo-owned compatibility fallback through remote `zjctl pane *` commands for capture/wait/close.

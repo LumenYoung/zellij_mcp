@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use crate::adapters::zjctl::{
-    AdapterError, ZjctlAdapter, is_plugin_permission_prompt,
+    AdapterError, BackendAdapter, is_missing_plugin_message, is_plugin_permission_prompt,
     is_protocol_version_mismatch_message, is_rpc_not_ready_message, missing_binary_name,
 };
 use crate::domain::binding::TerminalBinding;
@@ -65,8 +65,117 @@ impl<A> TerminalService<A> {
 
 impl<A> TerminalService<A>
 where
-    A: ZjctlAdapter,
+    A: BackendAdapter,
 {
+    fn send_via_intent_request(
+        request: &SendRequest,
+    ) -> Result<Option<SendLocationIntent>, DomainError> {
+        if !request.handle.trim().is_empty() {
+            if request.session_name.is_some() || request.tab_name.is_some() || request.selector.is_some() {
+                return Err(DomainError::new(
+                    ErrorCode::InvalidArgument,
+                    "send accepts either `handle` or location intent, not both".to_string(),
+                    false,
+                ));
+            }
+            return Ok(None);
+        }
+
+        let session_name = request.session_name.clone().ok_or_else(|| {
+            DomainError::new(
+                ErrorCode::InvalidArgument,
+                "send location intent requires `session_name` when `handle` is omitted".to_string(),
+                false,
+            )
+        })?;
+
+        Ok(Some(SendLocationIntent {
+            session_name,
+            tab_name: request.tab_name.clone(),
+            selector: request.selector.clone(),
+        }))
+    }
+
+    fn target_matches_location_intent(
+        target: &crate::adapters::zjctl::ResolvedTarget,
+        intent: &LocationIntent<'_>,
+    ) -> bool {
+        if intent
+            .tab_name
+            .is_some_and(|tab| target.tab_name.as_deref() != Some(tab))
+        {
+            return false;
+        }
+
+        if intent
+            .focused
+            .is_some_and(|focused| target.focused != focused)
+        {
+            return false;
+        }
+
+        if intent
+            .selector
+            .is_some_and(|selector| !Self::discover_matches_selector(selector, target))
+        {
+            return false;
+        }
+
+        if intent.command_contains.is_some_and(|needle| {
+            !target
+                .command
+                .as_deref()
+                .is_some_and(|command| command.contains(needle))
+        }) {
+            return false;
+        }
+
+        true
+    }
+
+    fn resolve_unique_location_target(
+        &self,
+        intent: &LocationIntent<'_>,
+        operation_error_code: ErrorCode,
+        not_found_message: &'static str,
+        ambiguous_message: &'static str,
+    ) -> Result<crate::adapters::zjctl::ResolvedTarget, DomainError> {
+        self.ensure_session_ready(intent.session_name, operation_error_code.clone())?;
+        let candidates = self
+            .adapter
+            .list_targets_in_session(intent.session_name)
+            .map_err(|error| self.map_adapter_error(error, operation_error_code))?;
+        let matches: Vec<_> = candidates
+            .into_iter()
+            .filter(|target| Self::target_matches_location_intent(target, intent))
+            .collect();
+
+        if intent.selector.is_none() && matches.len() > 1 {
+            let terminal_matches: Vec<_> = matches
+                .iter()
+                .filter(|target| Self::is_terminal_target(target))
+                .cloned()
+                .collect();
+            if let [target] = terminal_matches.as_slice() {
+                return Ok(target.clone());
+            }
+        }
+
+        match matches.as_slice() {
+            [] => Err(DomainError::new(
+                ErrorCode::TargetNotFound,
+                not_found_message.to_string(),
+                false,
+            )),
+            [target] => Ok(target.clone()),
+            _ => Err(DomainError::new(
+                ErrorCode::SelectorNotUnique,
+                ambiguous_message.to_string(),
+                false,
+            )),
+        }
+    }
+
     fn next_handle() -> String {
         format!("zh_{}", uuid::Uuid::new_v4().simple())
     }
@@ -87,6 +196,61 @@ where
         self.observation_store.load()
     }
 
+    fn binding_matches_target(
+        binding: &TerminalBinding,
+        target: &crate::adapters::zjctl::ResolvedTarget,
+    ) -> bool {
+        binding.pane_id.as_deref().is_some_and(|pane_id| {
+            target.pane_id.as_deref() == Some(pane_id)
+        }) || Self::discover_matches_selector(&binding.selector, target)
+    }
+
+    fn verify_binding_closed(&self, binding: &TerminalBinding) -> Result<(), DomainError> {
+        let start = Instant::now();
+        let timeout = if self.is_remote_target() {
+            Duration::from_millis(1000)
+        } else {
+            Duration::from_millis(250)
+        };
+        let interval = Duration::from_millis(50);
+
+        loop {
+            let still_present = self
+                .adapter
+                .list_targets_in_session(&binding.session_name)
+                .map_err(|error| self.map_adapter_error(error, ErrorCode::CloseFailed))?
+                .into_iter()
+                .any(|target| Self::binding_matches_target(binding, &target));
+            if !still_present {
+                return Ok(());
+            }
+
+            if start.elapsed() >= timeout {
+                return Err(DomainError::new(
+                    ErrorCode::CloseFailed,
+                    format!(
+                        "close reported success but selector `{}` is still present",
+                        binding.selector
+                    ),
+                    true,
+                ));
+            }
+
+            std::thread::sleep(interval);
+        }
+    }
+
+    fn should_attempt_shell_exit_close(binding: &TerminalBinding, force: bool) -> bool {
+        force && Self::supports_explicit_interaction_markers(binding)
+    }
+
+    fn attempt_shell_exit_close(&self, binding: &TerminalBinding) -> Result<(), DomainError> {
+        self.adapter
+            .send_input(&binding.session_name, &binding.selector, "exit", true)
+            .map_err(|error| self.map_adapter_error(error, ErrorCode::CloseFailed))?;
+        self.verify_binding_closed(binding)
+    }
+
     fn write_observations(&self, observations: &[TerminalObservation]) -> Result<(), DomainError> {
         self.observation_store.save(observations)
     }
@@ -97,7 +261,7 @@ where
         } else {
             Err(DomainError::new(
                 ErrorCode::ZjctlUnavailable,
-                "zjctl is not available on PATH",
+                "required backend binaries are not available on PATH",
                 true,
             ))
         }
@@ -219,6 +383,9 @@ where
             }
             AdapterError::CommandFailed(message) if missing_binary_name(&message).is_some() => {
                 DomainError::new(ErrorCode::ZjctlUnavailable, message, true)
+            }
+            AdapterError::CommandFailed(message) if is_missing_plugin_message(&message) => {
+                DomainError::new(ErrorCode::PluginNotReady, message, false)
             }
             AdapterError::CommandFailed(message) if is_plugin_permission_prompt(&message) => {
                 DomainError::new(ErrorCode::PluginNotReady, message, false)
@@ -623,13 +790,10 @@ where
         resolved: crate::adapters::zjctl::ResolvedTarget,
         alias: Option<String>,
     ) -> Result<AttachResponse, DomainError> {
-        let snapshot = self
-            .adapter
-            .capture_full(&resolved.session_name, &resolved.selector)
-            .map_err(|error| self.map_adapter_error(error, ErrorCode::CaptureFailed))?;
-
         let handle = Self::next_handle();
-        let now = snapshot.captured_at;
+        let now = Utc::now();
+        let session_name = resolved.session_name.clone();
+        let selector = resolved.selector.clone();
         let mut bindings = self.read_bindings()?;
         bindings.push(TerminalBinding {
             handle: handle.clone(),
@@ -642,69 +806,50 @@ where
             cwd: None,
             launch_command: resolved.command,
             source: BindingSource::Attached,
-            status: TerminalStatus::Ready,
+            status: TerminalStatus::Busy,
             created_at: now,
             updated_at: now,
         });
         self.write_bindings(&bindings)?;
 
-        let hash = Self::hash_content(&snapshot.content);
         let mut observations = self.read_observations()?;
-        let mut observation = TerminalObservation {
+        observations.retain(|item| item.handle != handle);
+        observations.push(TerminalObservation {
             handle: handle.clone(),
             ..TerminalObservation::default()
-        };
-        observation.update_full_snapshot(snapshot.content, hash, now);
-        observation.reset_command_boundary();
-        observations.retain(|item| item.handle != handle);
-        observations.push(observation);
+        });
         self.write_observations(&observations)?;
+
+        let baseline_established = match self
+            .adapter
+            .capture_full(&session_name, &selector)
+        {
+            Ok(snapshot) => {
+                let hash = Self::hash_content(&snapshot.content);
+                let mut observations = self.read_observations()?;
+                let index = Self::ensure_observation_slot(&mut observations, &handle);
+                let observation = &mut observations[index];
+                observation.update_full_snapshot(snapshot.content, hash, snapshot.captured_at);
+                observation.reset_command_boundary();
+                self.write_observations(&observations)?;
+
+                let mut bindings = self.read_bindings()?;
+                if let Some(binding) = bindings.iter_mut().find(|binding| binding.handle == handle) {
+                    binding.status = TerminalStatus::Ready;
+                    binding.updated_at = snapshot.captured_at;
+                }
+                self.write_bindings(&bindings)?;
+                true
+            }
+            Err(_) => false,
+        };
 
         Ok(AttachResponse {
             handle,
             target_id: self.target_id.clone(),
             attached: true,
-            baseline_established: true,
+            baseline_established,
         })
-    }
-
-    fn takeover_target_matches(
-        request: &TakeoverRequest,
-        target: &crate::adapters::zjctl::ResolvedTarget,
-    ) -> bool {
-        if request
-            .tab_name
-            .as_ref()
-            .is_some_and(|tab| target.tab_name.as_deref() != Some(tab.as_str()))
-        {
-            return false;
-        }
-
-        if request
-            .focused
-            .is_some_and(|focused| target.focused != focused)
-        {
-            return false;
-        }
-
-        if request
-            .selector
-            .as_deref()
-            .is_some_and(|selector| !Self::discover_matches_selector(selector, target))
-        {
-            return false;
-        }
-
-        if request.command_contains.as_deref().is_some_and(|needle| {
-            !target
-                .command
-                .as_deref()
-                .is_some_and(|command| command.contains(needle))
-        }) {
-            return false;
-        }
-
-        true
     }
 
     fn refresh_binding_target(&self, handle: &str) -> Result<TerminalBinding, DomainError> {
@@ -926,10 +1071,7 @@ where
     }
 
     fn launch_command_summary(request: &SpawnRequest) -> Option<String> {
-        request
-            .command
-            .clone()
-            .or_else(|| request.argv.as_ref().map(|argv| argv.join(" ")))
+        request.launch_command_summary()
     }
 
     fn validate_positive_lines(
@@ -1275,7 +1417,7 @@ where
 
 impl<A> TerminalManager for TerminalService<A>
 where
-    A: ZjctlAdapter + Send + Sync,
+    A: BackendAdapter + Send + Sync,
 {
     fn spawn(&self, request: SpawnRequest) -> Result<SpawnResponse, DomainError> {
         let detached_remote_launch = self.target_id.starts_with("ssh:");
@@ -1431,45 +1573,36 @@ where
 
     fn attach(&self, request: AttachRequest) -> Result<AttachResponse, DomainError> {
         self.ensure_available()?;
-        self.ensure_session_ready(&request.session_name, ErrorCode::AttachFailed)?;
-
-        let resolved = self
-            .adapter
-            .resolve_selector(&request)
-            .map_err(|error| self.map_adapter_error(error, ErrorCode::AttachFailed))?;
+        let selector = request.selector.trim();
+        let resolved = self.resolve_unique_location_target(
+            &LocationIntent {
+                session_name: &request.session_name,
+                tab_name: request.tab_name.as_deref(),
+                selector: (!selector.is_empty()).then_some(selector),
+                command_contains: None,
+                focused: None,
+            },
+            ErrorCode::AttachFailed,
+            "attach request did not match any pane",
+            "attach request matched multiple panes",
+        )?;
         self.attach_resolved_target(resolved, request.alias)
     }
 
     fn takeover(&self, request: TakeoverRequest) -> Result<TakeoverResponse, DomainError> {
         self.ensure_available()?;
-        self.ensure_session_ready(&request.session_name, ErrorCode::AttachFailed)?;
-
-        let candidates = self
-            .adapter
-            .list_targets_in_session(&request.session_name)
-            .map_err(|error| self.map_adapter_error(error, ErrorCode::AttachFailed))?;
-        let matches: Vec<_> = candidates
-            .into_iter()
-            .filter(|target| Self::takeover_target_matches(&request, target))
-            .collect();
-
-        let matched = match matches.as_slice() {
-            [] => {
-                return Err(DomainError::new(
-                    ErrorCode::TargetNotFound,
-                    "takeover request did not match any pane".to_string(),
-                    false,
-                ));
-            }
-            [target] => target.clone(),
-            _ => {
-                return Err(DomainError::new(
-                    ErrorCode::SelectorNotUnique,
-                    "takeover request matched multiple panes".to_string(),
-                    false,
-                ));
-            }
-        };
+        let matched = self.resolve_unique_location_target(
+            &LocationIntent {
+                session_name: &request.session_name,
+                tab_name: request.tab_name.as_deref(),
+                selector: request.selector.as_deref(),
+                command_contains: request.command_contains.as_deref(),
+                focused: request.focused,
+            },
+            ErrorCode::AttachFailed,
+            "takeover request did not match any pane",
+            "takeover request matched multiple panes",
+        )?;
 
         let matched_selector = matched.selector.clone();
         let response = self.attach_resolved_target(matched, request.alias)?;
@@ -1677,6 +1810,31 @@ where
     fn send(&self, request: SendRequest) -> Result<SendResponse, DomainError> {
         self.ensure_available()?;
 
+        if let Some(intent) = Self::send_via_intent_request(&request)? {
+            let resolved = self.resolve_unique_location_target(
+                &LocationIntent {
+                    session_name: &intent.session_name,
+                    tab_name: intent.tab_name.as_deref(),
+                    selector: intent.selector.as_deref(),
+                    command_contains: None,
+                    focused: None,
+                },
+                ErrorCode::SendFailed,
+                "send location intent did not match any pane",
+                "send location intent matched multiple panes",
+            )?;
+            let send_mode = Self::resolve_send_mode(&request)?;
+            let (payload, submit) = Self::build_send_payload(&request, send_mode)?;
+            self.adapter
+                .send_input(&resolved.session_name, &resolved.selector, &payload, submit)
+                .map_err(|error| self.map_adapter_error(error, ErrorCode::SendFailed))?;
+
+            return Ok(SendResponse {
+                handle: String::new(),
+                accepted: true,
+            });
+        }
+
         let binding = self.ensure_handle_revalidated(&request.handle)?;
         let send_mode = Self::resolve_send_mode(&request)?;
         let clear_attached_input = Self::should_clear_attached_input(&binding, &request, send_mode);
@@ -1776,7 +1934,11 @@ where
         }
 
         self.send(SendRequest {
+            target: None,
             handle: request.handle.clone(),
+            session_name: None,
+            tab_name: None,
+            selector: None,
             text: request.command,
             keys: Vec::new(),
             input_mode: Some(InputMode::SubmitLine),
@@ -2033,7 +2195,7 @@ where
         }
         Self::ensure_binding_active(&bindings[index])?;
 
-        self.run_binding_operation_with_retry(
+        let close_result = self.run_binding_operation_with_retry(
             &request.handle,
             &bindings[index],
             ErrorCode::CloseFailed,
@@ -2041,7 +2203,30 @@ where
                 self.adapter
                     .close(&binding.session_name, &binding.selector, request.force)
             },
-        )?;
+        );
+
+        match close_result {
+            Ok(()) => {
+                if let Err(error) = self.verify_binding_closed(&bindings[index]) {
+                    if self.is_remote_target()
+                        && Self::should_attempt_shell_exit_close(&bindings[index], request.force)
+                    {
+                        self.attempt_shell_exit_close(&bindings[index])?;
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) => {
+                if self.is_remote_target()
+                    && Self::should_attempt_shell_exit_close(&bindings[index], request.force)
+                {
+                    self.attempt_shell_exit_close(&bindings[index])?;
+                } else {
+                    return Err(error);
+                }
+            }
+        }
 
         bindings[index].status = TerminalStatus::Closed;
         bindings[index].updated_at = Utc::now();
@@ -2063,6 +2248,22 @@ enum ResolvedSendMode {
     Raw,
     SubmitLine,
     Legacy,
+}
+
+#[derive(Debug, Clone)]
+struct SendLocationIntent {
+    session_name: String,
+    tab_name: Option<String>,
+    selector: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocationIntent<'a> {
+    session_name: &'a str,
+    tab_name: Option<&'a str>,
+    selector: Option<&'a str>,
+    command_contains: Option<&'a str>,
+    focused: Option<bool>,
 }
 
 fn map_key_sequence(key: &str) -> Result<String, DomainError> {
@@ -2121,7 +2322,7 @@ fn map_key_sequence(key: &str) -> Result<String, DomainError> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use crate::adapters::zjctl::{CaptureSnapshot, ResolvedTarget, ZjctlAdapter};
+    use crate::adapters::zjctl::{BackendAdapter, CaptureSnapshot, ResolvedTarget};
     use crate::domain::requests::{
         AttachRequest, CleanupRequest, CloseRequest, InputMode, LayoutRequest, ListRequest,
         ReplaceRequest, SendRequest, SpawnRequest, TakeoverRequest, WaitRequest,
@@ -2136,6 +2337,7 @@ mod tests {
         detached_launch: bool,
         target: ResolvedTarget,
         list_targets: Vec<ResolvedTarget>,
+        closed_targets: Arc<Mutex<Vec<String>>>,
         captures: Vec<String>,
         capture_index: Arc<Mutex<usize>>,
         sent_inputs: Arc<Mutex<Vec<(String, bool)>>>,
@@ -2151,6 +2353,9 @@ mod tests {
         wait_fails: bool,
         capture_missing_target: bool,
         capture_fails: bool,
+        close_fails: bool,
+        close_leaves_target: bool,
+        send_exit_closes_target: bool,
     }
 
     impl MockAdapter {
@@ -2176,6 +2381,7 @@ mod tests {
                     command: Some("fish".to_string()),
                     focused: false,
                 }],
+                closed_targets: Arc::new(Mutex::new(Vec::new())),
                 captures: vec![content.to_string()],
                 capture_index: Arc::new(Mutex::new(0)),
                 sent_inputs: Arc::new(Mutex::new(Vec::new())),
@@ -2191,6 +2397,9 @@ mod tests {
                 wait_fails: false,
                 capture_missing_target: false,
                 capture_fails: false,
+                close_fails: false,
+                close_leaves_target: false,
+                send_exit_closes_target: false,
             }
         }
 
@@ -2218,7 +2427,7 @@ mod tests {
         }
     }
 
-    impl ZjctlAdapter for MockAdapter {
+    impl BackendAdapter for MockAdapter {
         fn is_available(&self) -> bool {
             self.available
         }
@@ -2286,10 +2495,20 @@ mod tests {
             &self,
             session_name: &str,
         ) -> Result<Vec<ResolvedTarget>, AdapterError> {
+            let closed_targets = self
+                .closed_targets
+                .lock()
+                .expect("closed targets lock should succeed")
+                .clone();
             Ok(self
                 .list_targets
                 .iter()
                 .filter(|target| target.session_name == session_name)
+                .filter(|target| {
+                    !closed_targets
+                        .iter()
+                        .any(|selector| mock_matches_selector(selector, target))
+                })
                 .cloned()
                 .collect())
         }
@@ -2297,7 +2516,7 @@ mod tests {
         fn send_input(
             &self,
             _session_name: &str,
-            _handle: &str,
+            handle: &str,
             text: &str,
             submit: bool,
         ) -> Result<(), AdapterError> {
@@ -2321,6 +2540,12 @@ mod tests {
                 .lock()
                 .expect("sent inputs lock should succeed")
                 .push((text.to_string(), submit));
+            if self.send_exit_closes_target && text == "exit" && submit {
+                self.closed_targets
+                    .lock()
+                    .expect("closed targets lock should succeed")
+                    .push(handle.to_string());
+            }
             Ok(())
         }
 
@@ -2410,9 +2635,21 @@ mod tests {
         fn close(
             &self,
             _session_name: &str,
-            _handle: &str,
+            handle: &str,
             _force: bool,
         ) -> Result<(), AdapterError> {
+            if self.close_fails {
+                return Err(AdapterError::CommandFailed(
+                    "close backend failed".to_string(),
+                ));
+            }
+
+            if !self.close_leaves_target {
+                self.closed_targets
+                    .lock()
+                    .expect("closed targets lock should succeed")
+                    .push(handle.to_string());
+            }
             Ok(())
         }
 
@@ -2498,6 +2735,231 @@ mod tests {
             observations[0].command_boundary_content.as_deref(),
             Some("baseline")
         );
+    }
+
+    #[test]
+    fn attach_resolves_unique_location_intent_without_exact_selector() {
+        let targets = vec![
+            ResolvedTarget {
+                selector: "id:terminal:7".to_string(),
+                pane_id: Some("terminal:7".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("logs".to_string()),
+                title: Some("logs".to_string()),
+                command: Some("tail -f app.log".to_string()),
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:terminal:8".to_string(),
+                pane_id: Some("terminal:8".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("editor".to_string()),
+                command: Some("fish".to_string()),
+                focused: false,
+            },
+        ];
+        let service = make_service(MockAdapter::with_targets_and_captures(targets, vec!["baseline"]));
+
+        let response = service
+            .attach(AttachRequest {
+                target: None,
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: String::new(),
+                alias: Some("main-editor".to_string()),
+            })
+            .expect("attach should resolve a unique pane from location intent");
+
+        let bindings = service.registry_store.load().expect("bindings should load");
+        assert!(response.attached);
+        assert_eq!(bindings[0].selector, "id:terminal:8");
+        assert_eq!(bindings[0].tab_name.as_deref(), Some("editor"));
+    }
+
+    #[test]
+    fn attach_ignores_plugin_panes_when_one_terminal_matches_location_intent() {
+        let targets = vec![
+            ResolvedTarget {
+                selector: "id:terminal:8".to_string(),
+                pane_id: Some("terminal:8".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("editor".to_string()),
+                command: Some("fish".to_string()),
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:plugin:1".to_string(),
+                pane_id: Some("plugin:1".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("zrpc".to_string()),
+                command: Some("zrpc.wasm".to_string()),
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:plugin:2".to_string(),
+                pane_id: Some("plugin:2".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("status-bar".to_string()),
+                command: Some("status-bar.wasm".to_string()),
+                focused: false,
+            },
+        ];
+        let service = make_service(MockAdapter::with_targets_and_captures(targets, vec!["baseline"]));
+
+        let response = service
+            .attach(AttachRequest {
+                target: None,
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: String::new(),
+                alias: Some("main-editor".to_string()),
+            })
+            .expect("attach should ignore plugin panes when one terminal matches");
+
+        let bindings = service.registry_store.load().expect("bindings should load");
+        assert!(response.attached);
+        assert_eq!(bindings[0].selector, "id:terminal:8");
+    }
+
+    #[test]
+    fn attach_exact_selector_still_allows_plugin_pane_targets() {
+        let targets = vec![
+            ResolvedTarget {
+                selector: "id:terminal:8".to_string(),
+                pane_id: Some("terminal:8".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("editor".to_string()),
+                command: Some("fish".to_string()),
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:plugin:1".to_string(),
+                pane_id: Some("plugin:1".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("zrpc".to_string()),
+                command: Some("zrpc.wasm".to_string()),
+                focused: false,
+            },
+        ];
+        let service = make_service(MockAdapter::with_targets_and_captures(targets, vec!["baseline"]));
+
+        let response = service
+            .attach(AttachRequest {
+                target: None,
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:plugin:1".to_string(),
+                alias: Some("plugin-pane".to_string()),
+            })
+            .expect("explicit selector attach should still work for plugin panes");
+
+        let bindings = service.registry_store.load().expect("bindings should load");
+        assert!(response.attached);
+        assert_eq!(bindings[0].selector, "id:plugin:1");
+        assert_eq!(bindings[0].pane_id.as_deref(), Some("plugin:1"));
+    }
+
+    #[test]
+    fn attach_rejects_ambiguous_location_intent() {
+        let targets = vec![
+            ResolvedTarget {
+                selector: "id:terminal:7".to_string(),
+                pane_id: Some("terminal:7".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("editor-1".to_string()),
+                command: Some("fish".to_string()),
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:terminal:8".to_string(),
+                pane_id: Some("terminal:8".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("editor-2".to_string()),
+                command: Some("fish".to_string()),
+                focused: false,
+            },
+        ];
+        let service = make_service(MockAdapter::with_targets_and_captures(targets, vec!["baseline"]));
+
+        let error = service
+            .attach(AttachRequest {
+                target: None,
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: String::new(),
+                alias: None,
+            })
+            .expect_err("attach should reject ambiguous location intent");
+
+        assert_eq!(error.code, ErrorCode::SelectorNotUnique);
+        assert_eq!(error.message, "attach request matched multiple panes");
+    }
+
+    #[test]
+    fn attach_persists_busy_handle_when_initial_baseline_capture_fails() {
+        let adapter = MockAdapter::capture_sequence(&["recovered baseline"]);
+        let capture_failures_remaining = adapter.capture_failures_remaining.clone();
+        *capture_failures_remaining
+            .lock()
+            .expect("capture failures lock should succeed") = 1;
+        let service = make_service(adapter);
+
+        let response = service
+            .attach(AttachRequest {
+                target: None,
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: Some("main-editor".to_string()),
+            })
+            .expect("attach should still succeed without an initial baseline");
+
+        assert!(response.attached);
+        assert!(!response.baseline_established);
+
+        let bindings = service.registry_store.load().expect("bindings should load");
+        let observations = service
+            .observation_store
+            .load()
+            .expect("observations should load");
+
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].handle, response.handle);
+        assert_eq!(bindings[0].status, TerminalStatus::Busy);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].handle, response.handle);
+        assert_eq!(observations[0].last_full_content, None);
+
+        let capture = service
+            .capture(CaptureRequest {
+                handle: response.handle.clone(),
+                mode: CaptureMode::Full,
+                tail_lines: None,
+                line_offset: None,
+                line_limit: None,
+                cursor: None,
+                normalize_ansi: false,
+            })
+            .expect("follow-up capture should recover the attached handle");
+
+        assert_eq!(capture.capture.content, "recovered baseline");
+
+        let bindings = service.registry_store.load().expect("bindings should load");
+        let observations = service
+            .observation_store
+            .load()
+            .expect("observations should load");
+
+        assert_eq!(bindings[0].status, TerminalStatus::Ready);
+        assert_eq!(observations[0].last_full_content.as_deref(), Some("recovered baseline"));
     }
 
     #[test]
@@ -3365,16 +3827,282 @@ mod tests {
             .expect("attach should succeed");
 
         let response = service
+            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: "printf 'ok'".to_string(), keys: vec![], input_mode: None, submit: true })
+            .expect("send should succeed");
+
+        assert!(response.accepted);
+    }
+
+    #[test]
+    fn send_location_intent_resolves_selector_without_persisting_handle() {
+        let adapter = MockAdapter::single_capture("baseline");
+        let sent_inputs = adapter.sent_inputs.clone();
+        let service = make_service(adapter);
+
+        let response = service
             .send(SendRequest {
-                handle: attach.handle,
+                target: None,
+                handle: String::new(),
+                session_name: Some("gpu".to_string()),
+                tab_name: Some("editor".to_string()),
+                selector: Some("id:terminal:7".to_string()),
                 text: "printf 'ok'".to_string(),
                 keys: vec![],
                 input_mode: None,
                 submit: true,
             })
-            .expect("send should succeed");
+            .expect("location-intent send should succeed");
 
         assert!(response.accepted);
+        assert!(response.handle.is_empty());
+
+        let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "printf 'ok'");
+        assert!(sent[0].1);
+        assert!(service
+            .registry_store
+            .load()
+            .expect("bindings should load")
+            .is_empty());
+        assert!(service
+            .observation_store
+            .load()
+            .expect("observations should load")
+            .is_empty());
+    }
+
+    #[test]
+    fn send_location_intent_supports_selector_grammar_via_service_planner() {
+        let targets = vec![
+            ResolvedTarget {
+                selector: "id:terminal:7".to_string(),
+                pane_id: Some("terminal:7".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("shell".to_string()),
+                command: Some("fish".to_string()),
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:terminal:8".to_string(),
+                pane_id: Some("terminal:8".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("ops".to_string()),
+                title: Some("logs".to_string()),
+                command: Some("tail -f app.log".to_string()),
+                focused: true,
+            },
+        ];
+        let adapter = MockAdapter::with_targets_and_captures(targets, vec!["baseline"]);
+        let sent_inputs = adapter.sent_inputs.clone();
+        let service = make_service(adapter);
+
+        let response = service
+            .send(SendRequest {
+                target: None,
+                handle: String::new(),
+                session_name: Some("gpu".to_string()),
+                tab_name: None,
+                selector: Some("focused".to_string()),
+                text: "printf 'ok'".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: true,
+            })
+            .expect("focused selector grammar should resolve through service planner");
+
+        assert!(response.accepted);
+        assert!(response.handle.is_empty());
+        let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "printf 'ok'");
+        assert!(sent[0].1);
+    }
+
+    #[test]
+    fn send_location_intent_resolves_session_and_tab_without_selector() {
+        let targets = vec![
+            ResolvedTarget {
+                selector: "id:terminal:8".to_string(),
+                pane_id: Some("terminal:8".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("editor".to_string()),
+                command: Some("fish".to_string()),
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:plugin:1".to_string(),
+                pane_id: Some("plugin:1".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("zrpc".to_string()),
+                command: Some("zrpc.wasm".to_string()),
+                focused: false,
+            },
+        ];
+        let adapter = MockAdapter::with_targets_and_captures(targets, vec!["baseline"]);
+        let sent_inputs = adapter.sent_inputs.clone();
+        let service = make_service(adapter);
+
+        let response = service
+            .send(SendRequest {
+                target: None,
+                handle: String::new(),
+                session_name: Some("gpu".to_string()),
+                tab_name: Some("editor".to_string()),
+                selector: None,
+                text: "printf 'ok'".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: true,
+            })
+            .expect("location-intent send should resolve session and tab without selector");
+
+        assert!(response.accepted);
+        assert!(response.handle.is_empty());
+        let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "printf 'ok'");
+        assert!(sent[0].1);
+    }
+
+    #[test]
+    fn send_location_intent_rejects_ambiguous_selector_matches() {
+        let targets = vec![
+            ResolvedTarget {
+                selector: "id:terminal:7".to_string(),
+                pane_id: Some("terminal:7".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor-main".to_string()),
+                title: Some("shell-a".to_string()),
+                command: Some("fish".to_string()),
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:terminal:8".to_string(),
+                pane_id: Some("terminal:8".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor-side".to_string()),
+                title: Some("shell-b".to_string()),
+                command: Some("fish".to_string()),
+                focused: true,
+            },
+        ];
+        let service = make_service(MockAdapter::with_targets_and_captures(targets, vec!["baseline"]));
+
+        let error = service
+            .send(SendRequest {
+                target: None,
+                handle: String::new(),
+                session_name: Some("gpu".to_string()),
+                tab_name: None,
+                selector: Some("command:fish".to_string()),
+                text: "printf 'ok'".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: true,
+            })
+            .expect_err("ambiguous selector grammar should fail");
+
+        assert_eq!(error.code, ErrorCode::SelectorNotUnique);
+        assert!(error.message.contains("matched multiple panes"));
+    }
+
+    #[test]
+    fn send_rejects_mixed_handle_and_location_intent() {
+        let service = make_service(MockAdapter::single_capture("baseline"));
+        let attach = service
+            .attach(AttachRequest {
+                target: None,
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        let error = service
+            .send(SendRequest {
+                target: None,
+                handle: attach.handle,
+                session_name: Some("gpu".to_string()),
+                tab_name: Some("editor".to_string()),
+                selector: Some("id:terminal:7".to_string()),
+                text: "printf 'ok'".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: true,
+            })
+            .expect_err("mixed handle and location intent should fail");
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert!(error.message.contains("either `handle` or location intent"));
+    }
+
+    #[test]
+    fn send_location_intent_requires_session_name() {
+        let service = make_service(MockAdapter::single_capture("baseline"));
+
+        let error = service
+            .send(SendRequest {
+                target: None,
+                handle: String::new(),
+                session_name: None,
+                tab_name: Some("editor".to_string()),
+                selector: Some("id:terminal:7".to_string()),
+                text: "printf 'ok'".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: true,
+            })
+            .expect_err("location-intent send should require session_name");
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert!(error.message.contains("requires `session_name`"));
+    }
+
+    #[test]
+    fn send_location_intent_requires_unique_match_when_selector_is_omitted() {
+        let targets = vec![
+            ResolvedTarget {
+                selector: "id:terminal:7".to_string(),
+                pane_id: Some("terminal:7".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("editor-a".to_string()),
+                command: Some("fish".to_string()),
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:terminal:8".to_string(),
+                pane_id: Some("terminal:8".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("editor-b".to_string()),
+                command: Some("fish".to_string()),
+                focused: false,
+            },
+        ];
+        let service = make_service(MockAdapter::with_targets_and_captures(targets, vec!["baseline"]));
+
+        let error = service
+            .send(SendRequest {
+                target: None,
+                handle: String::new(),
+                session_name: Some("gpu".to_string()),
+                tab_name: Some("editor".to_string()),
+                selector: None,
+                text: "printf 'ok'".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: true,
+            })
+            .expect_err("location-intent send should fail when selector-less intent is not unique");
+
+        assert_eq!(error.code, ErrorCode::SelectorNotUnique);
+        assert!(error.message.contains("matched multiple panes"));
     }
 
     #[test]
@@ -3393,13 +4121,7 @@ mod tests {
             .expect("attach should succeed");
 
         service
-            .send(SendRequest {
-                handle: attach.handle,
-                text: String::new(),
-                keys: vec!["up".to_string(), "escape".to_string(), "tab".to_string()],
-                input_mode: None,
-                submit: false,
-            })
+            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: String::new(), keys: vec!["up".to_string(), "escape".to_string(), "tab".to_string()], input_mode: None, submit: false })
             .expect("send should succeed");
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
@@ -3423,19 +4145,13 @@ mod tests {
             .expect("attach should succeed");
 
         service
-            .send(SendRequest {
-                handle: attach.handle,
-                text: String::new(),
-                keys: vec![
-                    "home".to_string(),
-                    "end".to_string(),
-                    "page_up".to_string(),
-                    "f5".to_string(),
-                    "shift_tab".to_string(),
-                ],
-                input_mode: Some(InputMode::Raw),
-                submit: false,
-            })
+            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: String::new(), keys: vec![
+                "home".to_string(),
+                "end".to_string(),
+                "page_up".to_string(),
+                "f5".to_string(),
+                "shift_tab".to_string(),
+            ], input_mode: Some(InputMode::Raw), submit: false })
             .expect("send should succeed");
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
@@ -3459,13 +4175,7 @@ mod tests {
             .expect("attach should succeed");
 
         service
-            .send(SendRequest {
-                handle: attach.handle,
-                text: String::new(),
-                keys: vec!["ctrl_a".to_string(), "ctrl_z".to_string()],
-                input_mode: Some(InputMode::Raw),
-                submit: false,
-            })
+            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: String::new(), keys: vec!["ctrl_a".to_string(), "ctrl_z".to_string()], input_mode: Some(InputMode::Raw), submit: false })
             .expect("send should succeed");
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
@@ -3487,13 +4197,7 @@ mod tests {
             .expect("attach should succeed");
 
         let error = service
-            .send(SendRequest {
-                handle: attach.handle,
-                text: String::new(),
-                keys: vec!["hyperjump".to_string()],
-                input_mode: None,
-                submit: false,
-            })
+            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: String::new(), keys: vec!["hyperjump".to_string()], input_mode: None, submit: false })
             .expect_err("unknown key should fail");
 
         assert_eq!(error.code, ErrorCode::InvalidArgument);
@@ -3513,13 +4217,7 @@ mod tests {
             .expect("attach should succeed");
 
         let error = service
-            .send(SendRequest {
-                handle: attach.handle,
-                text: "q".to_string(),
-                keys: Vec::new(),
-                input_mode: Some(InputMode::Raw),
-                submit: true,
-            })
+            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: "q".to_string(), keys: Vec::new(), input_mode: Some(InputMode::Raw), submit: true })
             .expect_err("raw mode should reject submit");
 
         assert_eq!(error.code, ErrorCode::InvalidArgument);
@@ -3539,13 +4237,7 @@ mod tests {
             .expect("attach should succeed");
 
         let error = service
-            .send(SendRequest {
-                handle: attach.handle,
-                text: "ls".to_string(),
-                keys: vec!["enter".to_string()],
-                input_mode: Some(InputMode::SubmitLine),
-                submit: false,
-            })
+            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: "ls".to_string(), keys: vec!["enter".to_string()], input_mode: Some(InputMode::SubmitLine), submit: false })
             .expect_err("submit_line mode should reject named keys");
 
         assert_eq!(error.code, ErrorCode::InvalidArgument);
@@ -3567,13 +4259,7 @@ mod tests {
             .expect("attach should succeed");
 
         service
-            .send(SendRequest {
-                handle: attach.handle,
-                text: "echo ok".to_string(),
-                keys: Vec::new(),
-                input_mode: Some(InputMode::SubmitLine),
-                submit: false,
-            })
+            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: "echo ok".to_string(), keys: Vec::new(), input_mode: Some(InputMode::SubmitLine), submit: false })
             .expect("submit_line mode should succeed");
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
@@ -3618,13 +4304,7 @@ mod tests {
         }
 
         service
-            .send(SendRequest {
-                handle: spawn.handle.clone(),
-                text: "run".to_string(),
-                keys: vec![],
-                input_mode: None,
-                submit: true,
-            })
+            .send(SendRequest { target: None, handle: spawn.handle.clone(), session_name: None, tab_name: None, selector: None, text: "run".to_string(), keys: vec![], input_mode: None, submit: true })
             .expect("send should succeed");
 
         let observations = service
@@ -3653,13 +4333,7 @@ mod tests {
             .expect("attach should succeed");
 
         service
-            .send(SendRequest {
-                handle: attach.handle.clone(),
-                text: "echo hello".to_string(),
-                keys: vec![],
-                input_mode: None,
-                submit: true,
-            })
+            .send(SendRequest { target: None, handle: attach.handle.clone(), session_name: None, tab_name: None, selector: None, text: "echo hello".to_string(), keys: vec![], input_mode: None, submit: true })
             .expect("send should succeed");
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
@@ -3703,13 +4377,7 @@ mod tests {
             .expect("spawn should succeed");
 
         service
-            .send(SendRequest {
-                handle: spawn.handle,
-                text: "echo hello".to_string(),
-                keys: vec![],
-                input_mode: None,
-                submit: true,
-            })
+            .send(SendRequest { target: None, handle: spawn.handle, session_name: None, tab_name: None, selector: None, text: "echo hello".to_string(), keys: vec![], input_mode: None, submit: true })
             .expect("send should succeed");
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
@@ -3721,6 +4389,35 @@ mod tests {
         );
         assert!(sent[0].0.contains("echo hello"));
         assert!(sent[0].0.contains("__ZELLIJ_MCP_INTERACTION__:end:"));
+        assert!(sent[0].1);
+    }
+
+    #[test]
+    fn spawn_without_command_defaults_binding_to_shell_like_fish_behavior() {
+        let adapter = MockAdapter::capture_sequence(&["ready"]);
+        let sent_inputs = adapter.sent_inputs.clone();
+        let service = make_service(adapter);
+        let spawn = service
+            .spawn(SpawnRequest {
+                target: None,
+                session_name: "gpu".to_string(),
+                spawn_target: SpawnTarget::ExistingTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: None,
+                argv: None,
+                title: None,
+                wait_ready: false,
+            })
+            .expect("spawn should default to interactive fish");
+
+        service
+            .send(SendRequest { target: None, handle: spawn.handle, session_name: None, tab_name: None, selector: None, text: "echo hello".to_string(), keys: vec![], input_mode: None, submit: true })
+            .expect("default fish spawn should behave like a shell for follow-up send");
+
+        let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].0.starts_with("printf '__ZELLIJ_MCP_INTERACTION__:start:"));
         assert!(sent[0].1);
     }
 
@@ -3740,13 +4437,7 @@ mod tests {
             .expect("attach should succeed");
 
         service
-            .send(SendRequest {
-                handle: attach.handle,
-                text: String::new(),
-                keys: vec!["up".to_string()],
-                input_mode: None,
-                submit: false,
-            })
+            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: String::new(), keys: vec!["up".to_string()], input_mode: None, submit: false })
             .expect("send should succeed");
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
@@ -4376,13 +5067,7 @@ mod tests {
             .expect("observations should save");
 
         service
-            .send(SendRequest {
-                handle: attach.handle.clone(),
-                text: "echo hello".to_string(),
-                keys: vec![],
-                input_mode: Some(InputMode::SubmitLine),
-                submit: false,
-            })
+            .send(SendRequest { target: None, handle: attach.handle.clone(), session_name: None, tab_name: None, selector: None, text: "echo hello".to_string(), keys: vec![], input_mode: Some(InputMode::SubmitLine), submit: false })
             .expect("send should recreate observation state");
 
         let observations = service
@@ -4420,6 +5105,67 @@ mod tests {
     }
 
     #[test]
+    fn close_rejects_false_positive_when_target_still_present() {
+        let mut adapter = MockAdapter::single_capture("baseline");
+        adapter.close_leaves_target = true;
+        let service = make_remote_service("ssh:a100", adapter);
+        let attach = service
+            .attach(AttachRequest {
+                target: None,
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        let error = service
+            .close(CloseRequest {
+                handle: attach.handle.clone(),
+                force: true,
+            })
+            .expect_err("close should fail when target remains present");
+
+        assert_eq!(error.code, ErrorCode::CloseFailed);
+        assert!(error.message.contains("still present"));
+
+        let bindings = service.registry_store.load().expect("bindings should load");
+        assert_eq!(bindings[0].status, TerminalStatus::Ready);
+    }
+
+    #[test]
+    fn remote_force_close_falls_back_to_shell_exit_when_close_is_noop() {
+        let mut adapter = MockAdapter::single_capture("baseline");
+        adapter.close_leaves_target = true;
+        adapter.send_exit_closes_target = true;
+        let sent_inputs = adapter.sent_inputs.clone();
+        let service = make_remote_service("ssh:a100", adapter);
+        let attach = service
+            .attach(AttachRequest {
+                target: None,
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                selector: "id:terminal:7".to_string(),
+                alias: None,
+            })
+            .expect("attach should succeed");
+
+        let response = service
+            .close(CloseRequest {
+                handle: attach.handle.clone(),
+                force: true,
+            })
+            .expect("close should succeed via shell-exit fallback");
+
+        assert!(response.closed);
+        let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
+        assert!(sent.iter().any(|(text, submit)| text == "exit" && *submit));
+
+        let bindings = service.registry_store.load().expect("bindings should load");
+        assert_eq!(bindings[0].status, TerminalStatus::Closed);
+    }
+
+    #[test]
     fn send_rejects_closed_handle() {
         let service = make_service(MockAdapter::single_capture("baseline"));
         let attach = service
@@ -4439,13 +5185,7 @@ mod tests {
             .expect("close should succeed");
 
         let error = service
-            .send(SendRequest {
-                handle: attach.handle,
-                text: "run".to_string(),
-                keys: vec![],
-                input_mode: None,
-                submit: false,
-            })
+            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: "run".to_string(), keys: vec![], input_mode: None, submit: false })
             .expect_err("send should reject closed handle");
         assert_eq!(error.code, ErrorCode::TargetStale);
     }
@@ -4466,13 +5206,7 @@ mod tests {
             .expect("attach should succeed");
 
         let error = service
-            .send(SendRequest {
-                handle: attach.handle.clone(),
-                text: "run".to_string(),
-                keys: vec![],
-                input_mode: None,
-                submit: false,
-            })
+            .send(SendRequest { target: None, handle: attach.handle.clone(), session_name: None, tab_name: None, selector: None, text: "run".to_string(), keys: vec![], input_mode: None, submit: false })
             .expect_err("send should fail on missing target");
         assert_eq!(error.code, ErrorCode::TargetStale);
 
@@ -4504,13 +5238,7 @@ mod tests {
             .expect("spawn should succeed");
 
         let response = service
-            .send(SendRequest {
-                handle: spawn.handle.clone(),
-                text: "echo retry".to_string(),
-                keys: vec![],
-                input_mode: None,
-                submit: true,
-            })
+            .send(SendRequest { target: None, handle: spawn.handle.clone(), session_name: None, tab_name: None, selector: None, text: "echo retry".to_string(), keys: vec![], input_mode: None, submit: true })
             .expect("send should retry and succeed");
 
         assert!(response.accepted);
@@ -4956,6 +5684,21 @@ mod tests {
         );
 
         assert_eq!(error.code, ErrorCode::ProtocolVersionMismatch);
+        assert_eq!(error.message, message);
+        assert!(!error.retryable);
+    }
+
+    #[test]
+    fn map_adapter_error_preserves_missing_plugin_as_plugin_not_ready() {
+        let service = make_service(MockAdapter::single_capture("baseline"));
+        let message = "zrpc plugin not found at /tmp/zrpc.wasm";
+
+        let error = service.map_adapter_error(
+            AdapterError::CommandFailed(message.to_string()),
+            ErrorCode::AttachFailed,
+        );
+
+        assert_eq!(error.code, ErrorCode::PluginNotReady);
         assert_eq!(error.message, message);
         assert!(!error.retryable);
     }

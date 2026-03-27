@@ -1,0 +1,33 @@
+Phase 1 evidence: no external zjctl runtime dependency on local steady-state path
+
+Date: 2026-03-26
+Repo: /home/yang/Documents/git/zellij-skill
+
+Commands run:
+- cargo build --release
+- cargo test
+- which zellij
+- zellij list-sessions
+- script -q -c "zellij attach -c phase1-smoke" /dev/null >/tmp/zellij-phase1-client.log 2>&1 &
+- zellij list-sessions
+- mcp2cli --mcp-stdio "./target/release/zellij_mcp" --env ZJCTL_BIN=/does/not/exist zellij-discover --session-name phase1-smoke
+- mcp2cli --mcp-stdio "./target/release/zellij_mcp" --env ZJCTL_BIN=/does/not/exist zellij-layout --session-name phase1-smoke
+- mcp2cli --mcp-stdio "./target/release/zellij_mcp" --env ZJCTL_BIN=/does/not/exist zellij-spawn --stdin
+- mcp2cli --mcp-stdio "./target/release/zellij_mcp" --env ZJCTL_BIN=/does/not/exist zellij-attach --session-name phase1-smoke --selector id:terminal:0
+- mcp2cli --mcp-stdio "./target/release/zellij_mcp" --env ZJCTL_BIN=/does/not/exist zellij-send --handle zh_e8a394f27e0a405ca2f6fbe04f8b833e --input-mode submit_line --submit --text "printf 'phase1-send-ok\n'"
+- mcp2cli --mcp-stdio "./target/release/zellij_mcp" --env ZJCTL_BIN=/does/not/exist zellij-wait --stdin
+- mcp2cli --mcp-stdio "./target/release/zellij_mcp" --env ZJCTL_BIN=/does/not/exist zellij-capture --stdin
+- mcp2cli --mcp-stdio "./target/release/zellij_mcp" --env ZJCTL_BIN=/does/not/exist zellij-close --stdin
+- zellij kill-session phase1-smoke
+
+Observed results:
+- `zellij-discover` succeeded with `ZJCTL_BIN=/does/not/exist`.
+- `zellij-layout` succeeded with `ZJCTL_BIN=/does/not/exist`.
+- `zellij-spawn` succeeded and returned a managed handle with `ZJCTL_BIN=/does/not/exist`.
+- `zellij-attach` succeeded against `id:terminal:0` with `ZJCTL_BIN=/does/not/exist`.
+- `zellij-send`, `zellij-wait`, `zellij-capture`, and `zellij-close` all succeeded on the spawned handle with `ZJCTL_BIN=/does/not/exist`.
+
+Interpretation:
+- Local steady-state runtime paths no longer depend on the external `zjctl` binary.
+- The daemon talks to the plugin directly through in-repo RPC transport plus `zellij action` commands.
+- `zellij` itself remains an external dependency, which is still in scope by design.

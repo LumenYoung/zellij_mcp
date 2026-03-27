@@ -1,0 +1,50 @@
+Phase 4 version-handshake evidence
+Timestamp: 2026-03-27T01:49:30Z
+
+What changed in this slice
+- Rewrote the SSH bootstrap helper to finish with repo-owned readiness summary fields (`readiness_state`, `readiness_reason`, `mcp_error_code`) instead of ending on raw `zjctl doctor` text.
+- Added shell/bootstrap coverage that proves protocol/version mismatch is surfaced as a distinct readiness outcome (`PROTOCOL_VERSION_MISMATCH`) rather than being flattened into generic plugin drift.
+- Updated README.md, docs/architecture.md, docs/mcp-contract.md, and docs/ssh-remote-design.md so the published bootstrap/readiness guidance matches the daemon's repo-owned readiness model.
+
+Verification commands and outcomes
+1. bash tests/zellij-mcp-bootstrap-ssh.sh
+   - result: PASS
+   - outcome: bootstrap helper shell coverage now proves:
+     - success path emits repo-owned readiness summary fields
+     - repo-owned plugin build/install flow is invoked
+     - protocol/version mismatch is surfaced as:
+       - `readiness_state=MANUAL_ACTION_REQUIRED`
+       - `readiness_reason=protocol_version_mismatch`
+       - `mcp_error_code=PROTOCOL_VERSION_MISMATCH`
+
+2. cargo test
+   - result: PASS
+   - outcome: 175 lib tests passed, 7 main tests passed, 0 failures
+
+3. cargo build --release
+   - result: PASS
+   - outcome: release daemon binary built successfully after bootstrap/doc/evidence updates
+
+4. cargo build-plugin
+   - result: BLOCKED IN ENVIRONMENT
+   - stderr included:
+     - `error[E0463]: can't find crate for \`core\``
+     - `error[E0463]: can't find crate for \`std\``
+     - `note: the wasm32-wasip1 target may not be installed`
+   - interpretation: the repo-owned plugin build workflow is wired and exercised in shell/bootstrap coverage, but this local machine still lacks the `wasm32-wasip1` standard library and does not expose `rustup` for installing it in-session
+
+Version-handshake proof points from Rust tests
+- adapters::zjctl::client::tests::parse_rpc_output_rejects_version_mismatch
+- adapters::zjctl::client::tests::readiness_classifies_protocol_version_mismatch_distinctly
+- adapters::zjctl::client::tests::readiness_auto_fix_skips_protocol_version_mismatch
+- services::terminal::tests::map_adapter_error_preserves_protocol_version_mismatch_code
+
+Version-handshake proof points from shell/bootstrap coverage
+- tests/zellij-mcp-bootstrap-ssh.sh
+  - help text now documents repo-owned readiness outputs
+  - protocol mismatch path now proves bootstrap emits `PROTOCOL_VERSION_MISMATCH` rather than generic `PLUGIN_NOT_READY`
+
+Current checkpoint status
+- Distinct protocol mismatch handling in adapter/service/runtime: implemented and verified
+- Distinct protocol mismatch handling in bootstrap/operator guidance: implemented and verified
+- Repo-owned plugin build workflow: present in workspace and bootstrap helper; direct local `cargo build-plugin` remains blocked only by missing `wasm32-wasip1` target support on this machine

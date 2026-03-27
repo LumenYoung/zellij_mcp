@@ -1,0 +1,28 @@
+Phase 5 Final Cleanup Evidence
+Date: 2026-03-27
+
+Scope verified:
+- core runtime paths no longer require ZJCTL_BIN for normal operation
+- backend abstraction names are neutral and reflect owned implementation
+- docs no longer describe external zjctl as a normal prerequisite
+
+Files checked:
+- README.md
+- docs/architecture.md
+- src/main.rs
+- src/adapters/zjctl/client.rs
+- src/adapters/zjctl/mod.rs
+
+Verification commands:
+- cargo test
+- cargo build --release
+- grep repo for legacy normal-operation dependency language
+
+Observed result:
+- tests passed
+- release build passed
+- docs describe in-repo backend ownership for normal operation
+- remaining zjctl references are compatibility/runtime internals or wrapper-only operational notes, not a normal-operation prerequisite
+
+Conclusion:
+Phase 5 cleanup checkpoint satisfied.

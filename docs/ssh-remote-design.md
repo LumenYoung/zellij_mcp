@@ -47,9 +47,8 @@ Add optional `target` only to the tools that select a live environment:
 - `zellij_discover`
 - `zellij_list`
 
-Do not add `target` to:
+Do not add `target` to purely handle-routed follow-up tools such as:
 
-- `zellij_send`
 - `zellij_wait`
 - `zellij_capture`
 - `zellij_close`
@@ -58,6 +57,13 @@ Reason:
 
 - once a handle exists, the daemon should already know which backend owns it
 - follow-up calls should stay compact and avoid repeated tokens
+
+Current exception:
+
+- `zellij_send` now supports two forms:
+  - handle-based follow-up using the persisted binding target
+  - handle-less location intent using `target` + `session_name` + `selector` (and optional `tab_name`) for one-off input into an existing pane
+- that exception is intentional because the real task can be "send this text to that pane" without first creating daemon-owned state
 
 Example local request:
 
@@ -118,8 +124,8 @@ Observation records can remain keyed by local daemon handle. The local daemon st
 
 Use one local daemon with per-target backends.
 
-- local backend: direct local `zjctl` / `zellij`
-- remote backend: SSH-backed command execution for `zjctl` / `zellij`
+- local backend: direct local daemon-owned control over `zellij`
+- remote backend: SSH-backed command execution for the daemon-owned backend plus `zellij`
 
 This means remote operations are executed over SSH directly by the local daemon.
 
@@ -147,7 +153,8 @@ Replace the single-backend startup in `src/main.rs` with a target-aware router m
 That router should:
 
 - resolve `request.target` for `spawn`, `attach`, `discover`, and `list`
-- resolve persisted `binding.target_id` for `send`, `wait`, `capture`, and `close`
+- resolve persisted `binding.target_id` for `wait`, `capture`, and `close`
+- resolve `send` by persisted binding target when `handle` is present, or by request `target` when the request uses handle-less location intent
 - route the operation to the correct backend implementation
 
 ### Target Resolution Rules
@@ -169,7 +176,7 @@ The request should only say:
 The daemon-side target config owns things like:
 
 - SSH alias or host
-- remote `zjctl` path
+- optional compatibility-binary path
 - remote `zellij` path
 - readiness/bootstrap policy
 
@@ -214,7 +221,7 @@ Current code parses that shape into `SshTargetConfig` with these fields:
 - `remote_env`
 - `ssh_options`
 
-The local backend is configured separately through the normal local daemon env such as `ZJCTL_BIN` and `ZELLIJ_MCP_STATE_DIR`.
+The local backend is configured separately through the normal local daemon environment such as `ZELLIJ_MCP_STATE_DIR`.
 
 ## Readiness And Bootstrap
 
@@ -228,21 +235,31 @@ The readiness model is intentionally narrow and bounded:
 
 In operator-facing language, that last state is the manual-action-required path.
 
-Remote probing and execution already normalize the remote HOME and PATH. When non-interactive SSH is missing it, the daemon prepends `$HOME/.local/bin` before concluding that `zellij` or `zjctl` are unavailable.
+Remote probing and execution already normalize the remote HOME and PATH. When non-interactive SSH is missing it, the daemon prepends `$HOME/.local/bin` before concluding that the required remote binaries are unavailable.
 
-Auto-fix stays safe and bounded. It can install the repo-built `zrpc.wasm` into the standard plugin directory, start a detached helper client when that is the missing precondition, and retry readiness exactly once.
+Auto-fix stays safe and bounded. It can relaunch the repo-built plugin when the artifact is already present, start a detached helper client when that is the missing precondition, and retry readiness exactly once.
+
+Missing plugin artifacts are intentionally reported distinctly from those retryable states. If the expected `zrpc.wasm` is not installed on the host, the daemon reports that directly instead of treating it like transient helper or RPC drift.
 
 Protocol/version mismatch is intentionally not part of that auto-fix bucket. Once the daemon can talk to the plugin well enough to learn that their protocol versions differ, retrying the same helper or plugin-launch flow is not enough; the operator needs matching artifacts loaded on the host.
 
 The daemon does not try to force through unmanaged interactive approval prompts. Those stay in `ManualActionRequired` until a person approves them in the remote Zellij session.
 
-Remote `zjctl` RPC still depends on a connected Zellij client. If the host is otherwise healthy but still needs a helper client, the daemon treats that as a bounded auto-fixable condition. If the host needs unmanaged plugin approval, the daemon stops at `ManualActionRequired` instead of guessing.
+The plugin RPC path still depends on a connected Zellij client. If the host is otherwise healthy but still needs a helper client, the daemon treats that as a bounded auto-fixable condition. If the host needs unmanaged plugin approval, the daemon stops at `ManualActionRequired` instead of guessing.
 
 The practical meaning of the states is:
 
 - `Ready`: proceed with the routed SSH request
 - `AutoFixable`: apply safe remediation, then retry the same bounded probe or request
 - `ManualActionRequired`: stop and tell the user what still needs human input or compatibility repair
+
+The repo-owned SSH bootstrap helper now emits those same semantics directly after installation/setup work:
+
+- `readiness_state=READY | AUTO_FIXABLE | MANUAL_ACTION_REQUIRED`
+- `readiness_reason=missing_plugin | plugin_permission_prompt | helper_client_missing | rpc_not_ready | protocol_version_mismatch | ssh_unreachable`
+- `mcp_error_code=PLUGIN_NOT_READY | PROTOCOL_VERSION_MISMATCH | ZJCTL_UNAVAILABLE`
+
+That shell output is intentionally aligned with the daemon's runtime error model so local docs, bootstrap logs, and MCP failures all describe the same readiness boundary instead of falling back to raw `zjctl doctor` text.
 
 The daemon now also surfaces freshness metadata in two places that matter operationally:
 
@@ -257,7 +274,7 @@ Validated facts from the current real-host experiments:
 - copied local Linux binaries can fail on remote glibc mismatch
 - native user-space rebuild on the remote host solves that compatibility issue
 - `~/.local/bin` is a useful remote install location because the daemon now prepends it for non-interactive SSH probing and execution when it is otherwise missing from `PATH`
-- `zjctl` plugin RPC can require a connected Zellij client on a headless host
+- the plugin RPC path can require a connected Zellij client on a headless host
 - a detached user-space `tmux` helper client was sufficient to make RPC healthy on `a100`
 - once the remote host was ready, alias-only remote MCP operations succeeded
 - preview-enabled discover now degrades cleanly instead of failing the whole tool on pane capture issues
@@ -270,8 +287,8 @@ These findings affect backend readiness and bootstrap design, but they do not ch
 
 - one MCP server keeps token footprint down
 - local default keeps existing workflows unchanged
-- only four tools gain one optional field
-- handle-based follow-up flow stays compact
+- only the selection tools plus handle-less `zellij_send` intent gain an optional `target` field
+- handle-based follow-up flow stays compact, while one-off send-to-existing-pane requests can skip handle creation when that is the clearer intent
 - the daemon remains the single owner of state and lifecycle
 
 ### Known Costs
@@ -322,7 +339,7 @@ Still manual when the host needs it:
 1. Start the local daemon with `ZELLIJ_MCP_TARGETS` configured using `defaults` and any alias overrides you need.
 2. Call one of the selection tools with `target: "<alias>"`, for example `zellij_discover` or `zellij_attach`.
 3. Confirm the response carries `target_id: "ssh:<alias>"`.
-4. Follow with `zellij_capture`, `zellij_wait`, `zellij_send`, or `zellij_close` using only the returned handle.
+4. Follow with `zellij_capture`, `zellij_wait`, or `zellij_close` using the returned handle. Use `zellij_send` either with that handle or as a one-off location-intent request when you need to send input to an existing pane without persisting daemon state first.
 
 Example remote discover request:
 

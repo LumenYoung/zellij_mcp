@@ -22,7 +22,7 @@ pub const TOOL_DEFINITIONS: [ToolDefinition; 12] = [
     },
     ToolDefinition {
         name: "zellij_attach",
-        description: "Attach one live pane by exact selector and return a daemon handle.",
+        description: "Attach one live pane by location intent and return a daemon handle.",
     },
     ToolDefinition {
         name: "zellij_takeover",
@@ -34,7 +34,7 @@ pub const TOOL_DEFINITIONS: [ToolDefinition; 12] = [
     },
     ToolDefinition {
         name: "zellij_send",
-        description: "Send text or keys to a managed pane handle.",
+        description: "Send text or keys by managed handle or pane location intent.",
     },
     ToolDefinition {
         name: "zellij_replace",
@@ -58,7 +58,8 @@ pub const TOOL_DEFINITIONS: [ToolDefinition; 12] = [
     },
     ToolDefinition {
         name: "zellij_layout",
-        description: "Inspect tabs and panes in a session on the local backend or selected SSH target.",
+        description:
+            "Inspect tabs and panes in a session on the local backend or selected SSH target.",
     },
     ToolDefinition {
         name: "zellij_cleanup",
@@ -606,6 +607,37 @@ mod tests {
     }
 
     #[test]
+    fn executes_attach_tool_with_location_intent() {
+        let server = McpServer::new(Box::new(MockTerminalManager));
+
+        let response = server
+            .execute_tool(
+                "zellij_attach",
+                json!({
+                    "session_name": "gpu",
+                    "tab_name": "editor",
+                    "alias": "main-editor"
+                }),
+            )
+            .expect("attach tool should accept location intent without selector");
+
+        assert_eq!(response["handle"], "zh_test");
+        assert_eq!(response["attached"], true);
+    }
+
+    #[test]
+    fn describes_attach_as_location_intent_tool() {
+        let server = McpServer::new(Box::new(MockTerminalManager));
+        let attach = server
+            .tool_definitions()
+            .iter()
+            .find(|tool| tool.name == "zellij_attach")
+            .expect("attach tool should exist");
+
+        assert!(attach.description.contains("location intent"));
+    }
+
+    #[test]
     fn executes_discover_tool() {
         let server = McpServer::new(Box::new(MockTerminalManager));
 
@@ -640,6 +672,45 @@ mod tests {
                 }),
             )
             .expect("send tool should succeed");
+
+        assert_eq!(response["accepted"], true);
+    }
+
+    #[test]
+    fn executes_send_tool_with_location_intent() {
+        let server = McpServer::new(Box::new(MockTerminalManager));
+
+        let response = server
+            .execute_tool(
+                "zellij_send",
+                json!({
+                    "session_name": "gpu",
+                    "tab_name": "editor",
+                    "selector": "id:terminal:7",
+                    "text": "printf 'ok'",
+                    "submit": true
+                }),
+            )
+            .expect("intent send tool should succeed");
+
+        assert_eq!(response["accepted"], true);
+    }
+
+    #[test]
+    fn executes_send_tool_with_selector_less_location_intent() {
+        let server = McpServer::new(Box::new(MockTerminalManager));
+
+        let response = server
+            .execute_tool(
+                "zellij_send",
+                json!({
+                    "session_name": "gpu",
+                    "tab_name": "editor",
+                    "text": "printf 'ok'",
+                    "submit": true
+                }),
+            )
+            .expect("intent send tool should succeed without selector");
 
         assert_eq!(response["accepted"], true);
     }

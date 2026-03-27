@@ -1,6 +1,6 @@
 # Zellij MCP
 
-Rust MCP daemon for safe agent interaction with Zellij panes through `zjctl`.
+Rust MCP daemon for safe agent interaction with Zellij panes through an in-repo backend.
 
 Current release line: `0.1.0`
 
@@ -28,8 +28,9 @@ Recent spawn hardening:
 ## Requirements
 
 - Rust toolchain
-- local `zjctl`
-- Zellij session with the required plugin approved for `zjctl` RPC use
+- Zellij session with the required plugin approved for daemon RPC use
+
+Normal daemon operation uses the in-repo backend directly. You do not need to install or invoke an external `zjctl` wrapper for the local MCP flow.
 
 ## Build
 
@@ -55,7 +56,6 @@ target/wasm32-wasip1/release/zrpc.wasm
 The daemon serves MCP over stdio.
 
 ```bash
-ZJCTL_BIN=/home/yang/Documents/git/zjctl/target/release/zjctl \
 ZELLIJ_MCP_STATE_DIR=/home/yang/.local/state/zellij-mcp-opencode \
 ./target/release/zellij_mcp
 ```
@@ -94,7 +94,7 @@ The current model keeps a single local MCP daemon and lets selection tools opt i
 - set `target` on `zellij_spawn`, `zellij_attach`, `zellij_discover`, or `zellij_list` to select an SSH target alias such as `aws`
 - the target value can be a bare alias like `aws`, and the daemon resolves it canonically to `ssh:aws`
 - follow-up tools such as `zellij_send`, `zellij_wait`, `zellij_capture`, and `zellij_close` do not need `target`; the daemon routes them by the persisted handle binding
-- remote `zjctl` and `zellij` commands are executed over SSH by the local daemon
+- remote backend commands and `zellij` are executed over SSH by the local daemon
 
 Runtime configuration is daemon-side through `ZELLIJ_MCP_TARGETS`.
 
@@ -114,6 +114,7 @@ Readiness and remediation:
 - the daemon checks remote SSH targets before it tries to use them, then classifies the target as `Ready`, `AutoFixable`, or `ManualActionRequired`
 - `AutoFixable` means the daemon can safely apply bounded remediation, such as copying the repo-built `zrpc.wasm` into the standard plugin directory, starting a detached helper client, and retrying readiness exactly once
 - `AutoFixable` is used specifically for missing binaries, helper-client absence, and RPC-not-ready drift that can still be recovered through deterministic user-space setup
+- missing plugin artifacts are reported distinctly from those retryable states, because launching the plugin cannot repair a host that does not have the expected `zrpc.wasm` installed yet
 - when the remote command path does not already include it, the daemon prepends `$HOME/.local/bin` for non-interactive SSH probing and execution so ordinary hosts do not need per-host binary paths
 - `ManualActionRequired` covers the remaining non-auto-fixable cases, including unmanaged plugin approval prompts and daemon/plugin protocol-version skew that requires matching artifacts before retrying
 - readiness does not claim zero-touch success for every host, it only fixes the safe, bounded cases automatically
@@ -128,7 +129,7 @@ Practical setup note:
 
 - if a locally copied Linux binary fails on the remote host with a glibc version error, build it natively on the remote host in user space and install it into the remote `~/.local/bin`
 - the daemon normalizes the remote HOME and PATH for non-interactive SSH probing and execution, so remote tools installed in `~/.local/bin` are found without per-host path overrides
-- `zjctl` RPC still needs an attached Zellij client, so a headless remote host may still need a user-space helper such as a detached `tmux` session running `zellij attach <session>`
+- the plugin RPC path still needs an attached Zellij client, so a headless remote host may still need a user-space helper such as a detached `tmux` session running `zellij attach <session>`
 
 Bootstrap helper:
 
@@ -136,7 +137,16 @@ Bootstrap helper:
 ./scripts/zellij-mcp-bootstrap-ssh a100 --session a100
 ```
 
-The bootstrap helper stays entirely in user space. It installs Rust if needed, syncs this repo, clones or updates `zjctl`, builds `zellij_mcp`, `zjctl`, and the repo-owned `zrpc.wasm` natively on the remote host, copies the plugin artifact into the standard Zellij plugin directory, starts a detached helper client, and finishes by running `zjctl doctor`.
+The bootstrap helper stays entirely in user space. It installs Rust if needed, syncs this repo, clones or updates the compatibility helper repo, builds `zellij_mcp`, the optional compatibility `zjctl` binary used by the backend layer, and the repo-owned `zrpc.wasm` natively on the remote host, copies the plugin artifact into the standard Zellij plugin directory, starts a detached helper client, and finishes by running the current readiness check.
+
+The final bootstrap output is repo-owned and intentionally compact:
+
+- `readiness_state=READY` means the remote host finished the current bootstrap path and the repo-owned RPC probe succeeded
+- `readiness_state=AUTO_FIXABLE` means the host still needs bounded remediation such as helper-client or RPC recovery and the MCP-facing class is still `PLUGIN_NOT_READY`
+- `readiness_state=MANUAL_ACTION_REQUIRED` means the host needs human action or matching artifacts before retrying; `readiness_reason` distinguishes missing plugin, plugin approval, and protocol/version skew
+- `mcp_error_code` mirrors the daemon-facing error family you should expect next: `PLUGIN_NOT_READY`, `PROTOCOL_VERSION_MISMATCH`, or `ZJCTL_UNAVAILABLE`
+
+The script no longer treats raw `zjctl doctor` text as the final source of truth. It ends with a bounded repo-owned readiness probe (`zjctl panes ls --json` plus this repo's readiness classification rules) so the bootstrap output matches the daemon's actual error model.
 
 Operational helper note:
 
@@ -161,9 +171,8 @@ Target and handle semantics:
 - selection tools accept the alias form from the user, while follow-up calls keep using the persisted handle binding
 - that separation keeps the single local MCP architecture intact and avoids nested remote daemons
 
-Configured runtime values:
+Configured runtime values on this machine:
 
-- `ZJCTL_BIN=/home/yang/Documents/git/zjctl/target/release/zjctl`
 - `ZELLIJ_MCP_STATE_DIR=/home/yang/.local/state/zellij-mcp-opencode`
 
 ## Recommended agent flow
@@ -193,9 +202,11 @@ Notes:
 
 - `TARGET_NOT_FOUND`: the selected alias is unknown or the remote pane selector no longer resolves; verify `ZELLIJ_MCP_TARGETS`, the session name, and whether the pane still exists
 - `CAPTURE_FAILED`: the handle exists but the capture path degraded; retry with the same handle, then use `zellij_list` to revalidate ownership before assuming the pane is gone
-- `PLUGIN_NOT_READY`: the host is reachable but RPC preconditions are missing; distinguish helper-client absence, RPC-not-ready drift, and manual plugin approval before retrying
+- `PLUGIN_NOT_READY`: the host is reachable but plugin/runtime preconditions are missing; distinguish missing plugin artifacts, manual plugin approval, helper-client absence, and RPC-not-ready drift before retrying
 - `PROTOCOL_VERSION_MISMATCH`: the daemon and loaded `zrpc` plugin disagree on `PROTOCOL_VERSION`; rebuild or reload matching artifacts before retrying because helper/plugin relaunch alone will not fix skew
-- `ZJCTL_UNAVAILABLE`: the transport or remote binary path is the problem; verify SSH reachability, native remote install, and that `zjctl` / `zellij` resolve in the non-interactive remote PATH
+- `ZJCTL_UNAVAILABLE`: the transport or remote binary path is the problem; verify SSH reachability, native remote install, and that the required remote binaries resolve in the non-interactive remote PATH
+
+When you use `scripts/zellij-mcp-bootstrap-ssh`, those same readiness families are surfaced explicitly as `readiness_state`, `readiness_reason`, and `mcp_error_code`, so shell bootstrap and MCP runtime diagnostics use the same repo-owned vocabulary.
 
 ## More detail
 

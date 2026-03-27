@@ -1,0 +1,27 @@
+F3 Real Manual QA
+Date: 2026-03-27
+Verdict: APPROVE
+
+Local latest-release proof:
+- session: sisyphus-i3-verify-local5
+- second identical spawn reused the same selector
+- send + wait succeeded
+- capture contained the expected marker
+- forced close returned closed=true
+- follow-up layout no longer contained the managed selector/tab
+
+A100 latest-release proof:
+- session: sisyphus-i3-verify-remote6
+- second identical spawn reused the same selector
+- send + wait succeeded
+- remote proof file contained the expected marker
+- forced close returned closed=true
+- follow-up layout no longer contained the managed selector/tab
+
+Verification basis:
+- release binary: ./target/release/zellij_mcp
+- manual MCP invocations via mcp2cli
+- remote side-effect proof over ssh for a100
+
+Conclusion:
+Manual QA approved on both local and a100.

@@ -1,0 +1,74 @@
+Phase 4 readiness-matrix evidence
+Timestamp: 2026-03-27T01:49:30Z
+
+Repo-owned readiness classes now surfaced consistently
+- `PLUGIN_NOT_READY` remains the stable MCP-facing umbrella for:
+  - missing plugin artifact
+  - plugin permission prompt
+  - helper client missing
+  - RPC not ready / timeout drift
+- `PROTOCOL_VERSION_MISMATCH` remains separate when daemon/plugin artifacts disagree on `PROTOCOL_VERSION`
+- `ZJCTL_UNAVAILABLE` remains the transport / remote-binary class
+- SSH bootstrap helper now emits repo-owned shell summaries using:
+  - `readiness_state=READY | AUTO_FIXABLE | MANUAL_ACTION_REQUIRED`
+  - `readiness_reason=missing_plugin | plugin_permission_prompt | helper_client_missing | rpc_not_ready | protocol_version_mismatch | ssh_unreachable`
+  - `mcp_error_code=PLUGIN_NOT_READY | PROTOCOL_VERSION_MISMATCH | ZJCTL_UNAVAILABLE`
+
+Verification commands and outcomes
+1. bash tests/zellij-mcp-bootstrap-ssh.sh
+   - result: PASS
+   - outcome:
+     - success path emits repo-owned readiness summary fields
+     - final readiness probe uses `zjctl panes ls --json` instead of `zjctl doctor`
+     - protocol mismatch is classified explicitly in shell/bootstrap coverage
+
+2. cargo test
+   - result: PASS
+   - readiness-specific proof points:
+     - readiness_classifies_missing_binaries_as_auto_fixable
+     - readiness_classifies_missing_plugin_distinctly
+     - readiness_classifies_plugin_permission_prompt_as_manual_action
+     - readiness_classifies_helper_client_absence_as_auto_fixable
+     - readiness_classifies_zrpc_no_response_as_rpc_not_ready
+     - readiness_classifies_rpc_timeout_as_auto_fixable
+     - readiness_classifies_protocol_version_mismatch_distinctly
+     - readiness_auto_fix_starts_helper_client_when_missing
+     - readiness_auto_fix_launches_repo_owned_plugin_before_retry
+     - readiness_auto_fix_skips_missing_plugin
+     - readiness_auto_fix_skips_protocol_version_mismatch
+
+3. cargo build --release
+   - result: PASS
+
+Fresh-daemon live readiness proof
+1. local
+   - command:
+     - `mcp2cli --mcp-stdio "./target/release/zellij_mcp" --env "ZELLIJ_MCP_STATE_DIR=/tmp/zellij-mcp-phase4-local" --pretty zellij-discover --session-name sisyphus-verify-local`
+   - result: PASS
+   - outcome:
+     - returned `_daemon` identity metadata
+     - returned `target_id="local"` candidates from a live session
+     - included repo-owned plugin panes (`file:/home/yang/.config/zellij/plugins/zrpc.wasm`) and live terminal panes in one discover result
+
+2. aws
+   - command:
+     - `mcp2cli --mcp-stdio "./target/release/zellij_mcp" --env "ZELLIJ_MCP_STATE_DIR=/tmp/zellij-mcp-phase4-aws" --env 'ZELLIJ_MCP_TARGETS={...aws/a100...}' --pretty zellij-discover --session-name aws --target aws`
+   - result: PASS
+   - outcome:
+     - returned `_daemon` identity metadata
+     - returned `target_id="ssh:aws"` candidates from the live remote session
+     - included repo-owned remote plugin panes (`file:/home/ubuntu/.config/zellij/plugins/zrpc.wasm`) and remote terminals without relying on external doctor wording
+
+3. a100
+   - command:
+     - `mcp2cli --mcp-stdio "./target/release/zellij_mcp" --env "ZELLIJ_MCP_STATE_DIR=/tmp/zellij-mcp-phase4-a100" --env 'ZELLIJ_MCP_TARGETS={...aws/a100...}' --pretty zellij-discover --session-name a100 --target a100`
+   - result: PASS
+   - outcome:
+     - returned `_daemon` identity metadata
+     - returned `target_id="ssh:a100"` candidates from the live remote session
+     - included repo-owned remote plugin panes (`file:/home/jiaye.yang/.config/zellij/plugins/zrpc.wasm`) and remote terminals in the same readiness proof
+
+Interpretation
+- The daemon's repo-owned readiness matrix is now documented and visible consistently across Rust errors, shell/bootstrap output, and fresh-daemon MCP behavior.
+- Local, `aws`, and `a100` readiness can be explained from repo outputs alone: daemon identity metadata, MCP error families, and bootstrap readiness summary fields.
+- The remaining local-only limitation is not readiness semantics but host toolchain setup for `cargo build-plugin` on this machine.

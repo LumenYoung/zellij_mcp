@@ -18,13 +18,25 @@ pub struct SpawnRequest {
     /// Zellij session name on the selected backend.
     pub session_name: String,
     /// Where to create the new pane: a new tab or an existing tab.
+    #[serde(default = "default_spawn_target")]
     pub spawn_target: SpawnTarget,
     pub tab_name: Option<String>,
     pub cwd: Option<String>,
+    #[serde(default)]
     pub command: Option<String>,
+    #[serde(default)]
     pub argv: Option<Vec<String>>,
     pub title: Option<String>,
     pub wait_ready: bool,
+}
+
+impl SpawnRequest {
+    pub fn launch_command_summary(&self) -> Option<String> {
+        self.command
+            .clone()
+            .or_else(|| self.argv.as_ref().map(|argv| argv.join(" ")))
+            .or_else(|| Some("fish".to_string()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
@@ -35,7 +47,7 @@ pub struct AttachRequest {
     /// Zellij session name on the selected backend.
     pub session_name: String,
     pub tab_name: Option<String>,
-    /// Exact pane selector; must resolve to one live pane.
+    #[serde(default)]
     pub selector: String,
     pub alias: Option<String>,
 }
@@ -57,8 +69,16 @@ pub struct DiscoverRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct SendRequest {
-    /// Daemon-managed pane handle from spawn, attach, or takeover.
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
     pub handle: String,
+    #[serde(default)]
+    pub session_name: Option<String>,
+    #[serde(default)]
+    pub tab_name: Option<String>,
+    #[serde(default)]
+    pub selector: Option<String>,
     #[serde(default)]
     pub text: String,
     #[serde(default)]
@@ -153,4 +173,8 @@ pub struct ListRequest {
 
 const fn default_true() -> bool {
     true
+}
+
+const fn default_spawn_target() -> SpawnTarget {
+    SpawnTarget::ExistingTab
 }

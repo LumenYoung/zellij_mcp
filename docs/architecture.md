@@ -4,7 +4,7 @@
 
 Build a Rust MCP daemon that exposes a small, stable Zellij control surface to agents over MCP stdio.
 
-The daemon owns agent-facing handles, persistence, and capture semantics. It does not expose raw `zellij action` primitives. The daemon delegates terminal targeting and low-level interaction to `zjctl`.
+The daemon owns agent-facing handles, persistence, and capture semantics. It does not expose raw `zellij action` primitives. The daemon delegates terminal targeting and low-level interaction to its backend layer, which currently executes the repo-owned `zjctl` implementation internally.
 
 ## Phase 1 Scope
 
@@ -41,8 +41,8 @@ agent
     -> zellij MCP daemon
       -> tool handlers
         -> domain services
-          -> zjctl adapter
-            -> zjctl + Zellij plugin
+          -> backend adapter
+            -> repo-owned terminal backend + Zellij plugin
 ```
 
 ### MCP transport
@@ -73,9 +73,9 @@ Services own business semantics:
 - stale target revalidation
 - per-handle serialization
 
-### Zjctl adapter
+### Backend adapter
 
-The adapter is the only layer allowed to spawn `zjctl` or parse its output. It provides a typed interface for:
+The adapter is the only layer allowed to execute backend commands or parse backend output. In the current implementation that means invoking the repo-owned `zjctl` backend. It provides a typed interface for:
 
 - spawning targets
 - resolving selectors
@@ -92,6 +92,12 @@ For `target="existing_tab"`, the adapter still uses the normal `zjctl` spawn pat
 Live verification showed one important runtime constraint: the `zrpc.wasm` plugin must be loaded in the target session and its first-run permission prompt must be approved before `zjctl` RPC calls will succeed.
 
 For SSH-backed deployment, the important boundary is still the same: `zjctl` and `zellij` must execute on the same host as the target Zellij session. The current implementation satisfies that with an SSH-aware adapter inside the local daemon rather than by launching a separate remote MCP daemon.
+
+Phase 4 readiness ownership note:
+
+- the daemon owns the readiness matrix and reports it through stable domain classes rather than deferring to wrapper-era `zjctl doctor` wording
+- the SSH bootstrap helper now emits the same repo-owned readiness vocabulary at the shell layer: `readiness_state`, `readiness_reason`, and `mcp_error_code`
+- protocol/version skew remains distinct from broader plugin/runtime drift because the fix is matching artifacts, not another helper or plugin relaunch
 
 ### Persistence
 
@@ -230,7 +236,7 @@ The daemon returns stable domain errors rather than backend-specific command out
 - `PROTOCOL_VERSION_MISMATCH`
 - `PERSISTENCE_ERROR`
 
-`PLUGIN_NOT_READY` should cover cases where `zjctl` is installed but the target session still lacks RPC readiness. In practice that includes manual plugin approval, helper-client absence, and post-start RPC drift.
+`PLUGIN_NOT_READY` should cover cases where the daemon can reach the target host but the repo-owned plugin/runtime preconditions are still incomplete. In practice that includes missing `zrpc.wasm`, manual plugin approval, helper-client absence, and post-start RPC drift.
 
 `PROTOCOL_VERSION_MISMATCH` covers the narrower compatibility case where the daemon reaches the loaded `zrpc` plugin but the plugin replies with a different protocol version than the daemon expects. That is a compatibility problem, not transient RPC drift, so the daemon treats it as non-retryable until matching artifacts are loaded.
 
@@ -248,7 +254,7 @@ Phase 1 should validate these scenarios:
 
 Verified so far:
 
-1. a fresh session can host the `zrpc` plugin after approval and pass `zjctl doctor`
+1. a fresh session can host the repo-owned `zrpc` plugin, clear approval/readiness preconditions, and answer daemon RPC requests successfully
 2. a `lazygit` pane can be attached, listed, captured, and controlled with printable-key input through the daemon
 3. a new managed pane can be spawned, waited on, and closed through the daemon, with closed status persisted in local state
 4. named `up` and `escape` key input have been verified through a real pane using the daemon's special-key send path

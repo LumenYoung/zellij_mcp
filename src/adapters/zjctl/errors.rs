@@ -2,14 +2,14 @@ use thiserror::Error;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AdapterError {
-    #[error("zjctl command execution is not implemented yet")]
+    #[error("backend command execution is not implemented yet")]
     Unimplemented,
-    #[error("zjctl is not available on PATH")]
+    #[error("required backend binaries are not available on PATH")]
     ZjctlUnavailable,
-    #[error("zjctl command failed: {0}")]
+    #[error("backend command failed: {0}")]
     CommandFailed(String),
-    #[error("zjctl output could not be parsed: {0}")]
+    #[error("backend output could not be parsed: {0}")]
     ParseError(String),
-    #[error("zjctl command timed out")]
+    #[error("backend command timed out")]
     Timeout,
 }

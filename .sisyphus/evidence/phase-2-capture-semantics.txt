@@ -1,0 +1,22 @@
+Phase 2 evidence: capture semantics and persistence hardening
+
+Date: 2026-03-26
+Repo: /home/yang/Documents/git/zellij-skill
+
+Commands run:
+- cargo fmt
+- cargo test capture_preserves_refreshed_selector_after_revalidation
+- cargo test capture_recreates_missing_observation
+- cargo test send_recreates_missing_observation_state
+- cargo test
+- cargo build --release
+
+Observed results:
+- Added a regression test that proves revalidation updates to selector/pane_id are not overwritten by later capture writeback.
+- Added a regression test that proves `capture` recreates a missing persisted observation instead of failing the handle.
+- Added a regression test that proves `send` recreates missing observation state before interaction tracking.
+- Full suite passed with 134 tests.
+
+Interpretation:
+- `full`, `delta`, and `current` semantics remain covered by the existing service tests and the new persistence/revalidation regressions.
+- Follow-up steady-state operations are now resilient to observation drift and do not silently revert refreshed selector state.

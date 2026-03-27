@@ -151,7 +151,11 @@ impl TerminalManager for TargetRouter {
     }
 
     fn send(&self, request: SendRequest) -> Result<SendResponse, DomainError> {
-        self.backend_for_handle(&request.handle)?.send(request)
+        if request.handle.trim().is_empty() {
+            self.backend_for_target(request.target.as_deref())?.send(request)
+        } else {
+            self.backend_for_handle(&request.handle)?.send(request)
+        }
     }
 
     fn replace(&self, request: ReplaceRequest) -> Result<ReplaceResponse, DomainError> {
@@ -628,13 +632,7 @@ mod tests {
             })
             .expect("capture should route by binding target");
         router
-            .send(SendRequest {
-                handle: "zh_send".to_string(),
-                text: "printf 'ok'".to_string(),
-                keys: Vec::new(),
-                input_mode: None,
-                submit: true,
-            })
+            .send(SendRequest { target: None, handle: "zh_send".to_string(), session_name: None, tab_name: None, selector: None, text: "printf 'ok'".to_string(), keys: Vec::new(), input_mode: None, submit: true })
             .expect("send should route by binding target");
         router
             .wait(WaitRequest {
@@ -664,6 +662,36 @@ mod tests {
                 Call::Wait("zh_wait".to_string()),
                 Call::Close("zh_close".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn send_without_handle_routes_by_target_selection() {
+        let registry_store = RegistryStore::new(temp_registry_path());
+        let local = RecordingTerminalManager::new("local");
+        let remote = RecordingTerminalManager::new("ssh:a100");
+        let local_calls = local.calls.clone();
+        let remote_calls = remote.calls.clone();
+        let router = build_router(registry_store, local, Some(remote));
+
+        router
+            .send(SendRequest {
+                target: Some("a100".to_string()),
+                handle: String::new(),
+                session_name: Some("gpu".to_string()),
+                tab_name: Some("editor".to_string()),
+                selector: Some("id:terminal:7".to_string()),
+                text: "printf 'ok'".to_string(),
+                keys: Vec::new(),
+                input_mode: None,
+                submit: true,
+            })
+            .expect("intent send should route by target selection");
+
+        assert!(local_calls.lock().expect("calls lock should succeed").is_empty());
+        assert_eq!(
+            *remote_calls.lock().expect("calls lock should succeed"),
+            vec![Call::Send(String::new())]
         );
     }
 

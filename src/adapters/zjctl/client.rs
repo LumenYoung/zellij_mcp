@@ -21,6 +21,38 @@ fn quote_posix_sh(value: &str) -> String {
 const RPC_PIPE_NAME: &str = "zjctl-rpc";
 const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const HELPER_CLIENT_COLS: usize = 160;
+const HELPER_CLIENT_ROWS: usize = 48;
+
+fn parse_helper_geometry_value(value: Option<String>) -> Option<usize> {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn helper_client_geometry_from_sources(
+    explicit_cols: Option<usize>,
+    explicit_rows: Option<usize>,
+    terminal_cols: Option<usize>,
+    terminal_rows: Option<usize>,
+) -> (usize, usize) {
+    let cols = explicit_cols
+        .or_else(|| terminal_cols.map(|value| value.max(HELPER_CLIENT_COLS)))
+        .unwrap_or(HELPER_CLIENT_COLS);
+    let rows = explicit_rows
+        .or_else(|| terminal_rows.map(|value| value.max(HELPER_CLIENT_ROWS)))
+        .unwrap_or(HELPER_CLIENT_ROWS);
+    (cols, rows)
+}
+
+fn helper_client_geometry() -> (usize, usize) {
+    helper_client_geometry_from_sources(
+        parse_helper_geometry_value(std::env::var("ZELLIJ_MCP_HELPER_COLS").ok()),
+        parse_helper_geometry_value(std::env::var("ZELLIJ_MCP_HELPER_ROWS").ok()),
+        parse_helper_geometry_value(std::env::var("COLUMNS").ok()),
+        parse_helper_geometry_value(std::env::var("LINES").ok()),
+    )
+}
 
 fn wait_for_output_with_timeout(
     mut child: Child,
@@ -61,6 +93,12 @@ struct PaneInfo {
     cols: usize,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct TabInfo {
+    position: usize,
+    name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedTarget {
     pub selector: String,
@@ -79,7 +117,7 @@ pub struct CaptureSnapshot {
     pub truncated: bool,
 }
 
-pub trait ZjctlAdapter {
+pub trait BackendAdapter {
     fn is_available(&self) -> bool;
     fn ensure_session_ready(&self, session_name: &str) -> Result<(), AdapterError>;
     fn spawn(&self, request: &SpawnRequest) -> Result<ResolvedTarget, AdapterError>;
@@ -115,7 +153,7 @@ pub trait ZjctlAdapter {
 }
 
 #[derive(Debug, Clone)]
-pub struct ZjctlClient;
+pub struct LocalBackend;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct SshTargetConfig {
@@ -129,7 +167,7 @@ pub struct SshTargetConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct SshZjctlClient {
+pub struct SshBackend {
     config: SshTargetConfig,
 }
 
@@ -144,6 +182,7 @@ pub enum SshBackendReadiness {
 pub enum SshReadinessFailure {
     MissingBinary { host: String, binary: String },
     SshUnreachable { host: String, detail: String },
+    MissingPlugin { host: String, detail: String },
     PluginPermissionPrompt { host: String, detail: String },
     HelperClientMissing { host: String, detail: String },
     RpcNotReady { host: String, detail: String },
@@ -251,7 +290,7 @@ impl RemoteProbe for SshRemoteProbe<'_> {
         config: &SshTargetConfig,
         session_name: &str,
     ) -> Result<(), AdapterError> {
-        let client = SshZjctlClient::new(config.clone());
+        let client = SshBackend::new(config.clone());
         client.list_targets_for_session(session_name).map(|_| ())
     }
 }
@@ -303,6 +342,7 @@ fn attempt_safe_ssh_readiness_remediation_with_probe_and_runner(
         | SshReadinessFailure::HelperClientMissing { .. }
         | SshReadinessFailure::RpcNotReady { .. } => {}
         SshReadinessFailure::SshUnreachable { .. }
+        | SshReadinessFailure::MissingPlugin { .. }
         | SshReadinessFailure::PluginPermissionPrompt { .. }
         | SshReadinessFailure::ProtocolVersionMismatch { .. } => return false,
     }
@@ -389,8 +429,9 @@ impl SshReadinessRemediationContext {
             assignments.push(("PATH".to_string(), path.clone()));
         }
 
+        assignments.retain(|(key, _)| key != "ZELLIJ_SESSION_NAME");
+
         if include_session {
-            assignments.retain(|(key, _)| key != "ZELLIJ_SESSION_NAME");
             assignments.push(("ZELLIJ_SESSION_NAME".to_string(), self.session_name.clone()));
         }
 
@@ -483,13 +524,16 @@ fn start_helper_client(
     zellij_bin: &str,
     runner: &dyn RemoteRemediationRunner,
 ) -> bool {
+    let (helper_cols, helper_rows) = helper_client_geometry();
     let attach_command = build_remote_exec_env_command(
         zellij_bin,
-        &context.env_assignments(config, true),
+        &context.env_assignments(config, false),
         &["attach".to_string(), context.session_name.clone()],
     );
     let command = format!(
-        "if {tmux} has-session -t {helper} >/dev/null 2>&1; then exit 0; fi; {tmux} new-session -d -s {helper} {attach}",
+        "if {tmux} has-session -t {helper} >/dev/null 2>&1; then exit 0; fi; {tmux} new-session -d -x {cols} -y {rows} -s {helper} {attach}",
+        cols = helper_cols,
+        rows = helper_rows,
         tmux = quote_posix_sh(tmux_bin),
         helper = quote_posix_sh(&context.helper_session_name),
         attach = quote_posix_sh(&attach_command),
@@ -523,6 +567,15 @@ fn classify_ssh_readiness_failure(host: &str, error: AdapterError) -> SshBackend
                     host: host.to_string(),
                     binary,
                 });
+            }
+
+            if is_missing_plugin_message(&message) {
+                return SshBackendReadiness::ManualActionRequired(
+                    SshReadinessFailure::MissingPlugin {
+                        host: host.to_string(),
+                        detail: message,
+                    },
+                );
             }
 
             if is_plugin_permission_prompt(&message) {
@@ -579,6 +632,7 @@ fn readiness_failure_to_adapter_error(failure: SshReadinessFailure) -> AdapterEr
             "remote binary `{binary}` was not found after probing PATH and common locations"
         )),
         SshReadinessFailure::SshUnreachable { detail, .. }
+        | SshReadinessFailure::MissingPlugin { detail, .. }
         | SshReadinessFailure::PluginPermissionPrompt { detail, .. }
         | SshReadinessFailure::HelperClientMissing { detail, .. }
         | SshReadinessFailure::RpcNotReady { detail, .. }
@@ -601,6 +655,12 @@ pub fn is_plugin_permission_prompt(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     (lower.contains("plugin") || lower.contains("zjctl"))
         && (lower.contains("permission") || lower.contains("approve") || lower.contains("allow"))
+}
+
+pub fn is_missing_plugin_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("zrpc plugin not found at")
+        || (lower.contains("plugin not found at") && lower.contains("zrpc"))
 }
 
 pub fn is_rpc_not_ready_message(message: &str) -> bool {
@@ -942,6 +1002,17 @@ fn pane_info_to_target(pane: PaneInfo, session_name: Option<&str>) -> ResolvedTa
     }
 }
 
+fn pane_info_to_target_with_tab_names(
+    mut pane: PaneInfo,
+    session_name: Option<&str>,
+    tab_names: &BTreeMap<usize, String>,
+) -> ResolvedTarget {
+    if let Some(tab_name) = tab_names.get(&pane.tab_index) {
+        pane.tab_name = tab_name.clone();
+    }
+    pane_info_to_target(pane, session_name)
+}
+
 fn resolve_from_candidates(
     request: &AttachRequest,
     candidates: Vec<ResolvedTarget>,
@@ -998,7 +1069,7 @@ fn is_unsupported_action_pane_target(error: &AdapterError) -> bool {
     matches!(error, AdapterError::CommandFailed(message) if message.contains("Found argument '--pane-id'"))
 }
 
-impl ZjctlClient {
+impl LocalBackend {
     pub fn new() -> Self {
         Self
     }
@@ -1127,6 +1198,16 @@ impl ZjctlClient {
         serde_json::from_value(result).map_err(|error| AdapterError::ParseError(error.to_string()))
     }
 
+    fn list_tab_names_once(&self, session_name: &str) -> Result<BTreeMap<usize, String>, AdapterError> {
+        let output = self.run_zellij_action(
+            session_name,
+            &["list-tabs".to_string(), "--json".to_string()],
+        )?;
+        let tabs: Vec<TabInfo> = serde_json::from_slice(&output)
+            .map_err(|error| AdapterError::ParseError(error.to_string()))?;
+        Ok(tabs.into_iter().map(|tab| (tab.position, tab.name)).collect())
+    }
+
     fn list_targets_for_session(
         &self,
         session_name: &str,
@@ -1136,13 +1217,16 @@ impl ZjctlClient {
         let interval = Duration::from_millis(50);
 
         let mut panes = self.list_panes_once(session_name)?;
+        let tab_names = self.list_tab_names_once(session_name).unwrap_or_default();
         let mut ids = pane_ids(&panes);
 
         loop {
             if start.elapsed() >= timeout {
                 return Ok(panes
                     .into_iter()
-                    .map(|pane| pane_info_to_target(pane, Some(session_name)))
+                    .map(|pane| {
+                        pane_info_to_target_with_tab_names(pane, Some(session_name), &tab_names)
+                    })
                     .collect());
             }
 
@@ -1152,7 +1236,9 @@ impl ZjctlClient {
             if next_ids == ids {
                 return Ok(next
                     .into_iter()
-                    .map(|pane| pane_info_to_target(pane, Some(session_name)))
+                    .map(|pane| {
+                        pane_info_to_target_with_tab_names(pane, Some(session_name), &tab_names)
+                    })
                     .collect());
             }
             panes = next;
@@ -1279,15 +1365,64 @@ impl ZjctlClient {
     }
 }
 
-impl Default for ZjctlClient {
+impl Default for LocalBackend {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SshZjctlClient {
+impl SshBackend {
     pub fn new(config: SshTargetConfig) -> Self {
         Self { config }
+    }
+
+    fn wait_for_target_absent(
+        &self,
+        session_name: &str,
+        selector: &str,
+    ) -> Result<bool, AdapterError> {
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_millis(750);
+        let interval = Duration::from_millis(50);
+
+        loop {
+            let still_present = self
+                .list_targets_for_session(session_name)?
+                .into_iter()
+                .any(|target| matches_selector(selector, &target));
+            if !still_present {
+                return Ok(true);
+            }
+
+            if start.elapsed() >= timeout {
+                return Ok(false);
+            }
+
+            std::thread::sleep(interval);
+        }
+    }
+
+    fn ensure_close_effective(
+        &self,
+        session_name: &str,
+        selector: &str,
+        force: bool,
+        used_zjctl_close: bool,
+    ) -> Result<(), AdapterError> {
+        if self.wait_for_target_absent(session_name, selector)? {
+            return Ok(());
+        }
+
+        if !used_zjctl_close {
+            self.close_via_zjctl(session_name, selector, force)?;
+            if self.wait_for_target_absent(session_name, selector)? {
+                return Ok(());
+            }
+        }
+
+        Err(AdapterError::CommandFailed(format!(
+            "close reported success but selector `{selector}` is still present"
+        )))
     }
 
     fn remote_env_assignments(&self, session_name: Option<&str>) -> Vec<(String, String)> {
@@ -1380,6 +1515,25 @@ impl SshZjctlClient {
             .spawn()
             .map(|_| ())
             .map_err(|_| AdapterError::ZjctlUnavailable)
+    }
+
+    fn run_remote_command_checked(
+        &self,
+        remote_command: &str,
+        timeout: Duration,
+    ) -> Result<(), AdapterError> {
+        let output = run_remote_command_output_with_timeout(&self.config, remote_command, timeout)?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let message = if stderr.is_empty() {
+            format!("command exited with status {}", output.status)
+        } else {
+            stderr
+        };
+        Err(AdapterError::CommandFailed(message))
     }
 
     fn run_remote_zjctl_command(
@@ -1537,6 +1691,22 @@ impl SshZjctlClient {
         serde_json::from_value(result).map_err(|error| AdapterError::ParseError(error.to_string()))
     }
 
+    fn list_tab_names_once(&self, session_name: &str) -> Result<BTreeMap<usize, String>, AdapterError> {
+        let remote_command = self.build_remote_exec_command(
+            &self.config.remote_zellij_bin,
+            &self.remote_env_assignments(Some(session_name)),
+            &["action".to_string(), "list-tabs".to_string(), "--json".to_string()],
+        );
+        let output = run_remote_command_output_with_timeout(
+            &self.config,
+            &remote_command,
+            REMOTE_COMMAND_TIMEOUT,
+        )?;
+        let tabs: Vec<TabInfo> = serde_json::from_slice(&output.stdout)
+            .map_err(|error| AdapterError::ParseError(error.to_string()))?;
+        Ok(tabs.into_iter().map(|tab| (tab.position, tab.name)).collect())
+    }
+
     fn list_targets_for_session(
         &self,
         session_name: &str,
@@ -1546,13 +1716,16 @@ impl SshZjctlClient {
         let interval = Duration::from_millis(50);
 
         let mut panes = self.list_panes_once(session_name)?;
+        let tab_names = self.list_tab_names_once(session_name).unwrap_or_default();
         let mut ids = pane_ids(&panes);
 
         loop {
             if start.elapsed() >= timeout {
                 return Ok(panes
                     .into_iter()
-                    .map(|pane| pane_info_to_target(pane, Some(session_name)))
+                    .map(|pane| {
+                        pane_info_to_target_with_tab_names(pane, Some(session_name), &tab_names)
+                    })
                     .collect());
             }
 
@@ -1562,7 +1735,9 @@ impl SshZjctlClient {
             if next_ids == ids {
                 return Ok(next
                     .into_iter()
-                    .map(|pane| pane_info_to_target(pane, Some(session_name)))
+                    .map(|pane| {
+                        pane_info_to_target_with_tab_names(pane, Some(session_name), &tab_names)
+                    })
                     .collect());
             }
             panes = next;
@@ -1784,7 +1959,7 @@ impl SshZjctlClient {
     }
 }
 
-impl ZjctlAdapter for SshZjctlClient {
+impl BackendAdapter for SshBackend {
     fn is_available(&self) -> bool {
         self.run_zellij_command(None, &["--help".to_string()])
             .is_ok()
@@ -1821,11 +1996,20 @@ impl ZjctlAdapter for SshZjctlClient {
     }
 
     fn spawn(&self, request: &SpawnRequest) -> Result<ResolvedTarget, AdapterError> {
-        let spawn_command = resolve_spawn_command(request)?;
+        let before = self.list_targets_for_session(&request.session_name)?;
+        let prepared = prepare_spawn(request, &before)?;
+
+        let (action_args, spawn_command, command_via_action) = match prepared {
+            PreparedSpawn::Reuse(target) => return Ok(target),
+            PreparedSpawn::Launch {
+                action_args,
+                command,
+                command_via_action,
+            } => (action_args, command, command_via_action),
+        };
         let command_summary = spawn_command.join(" ");
 
-        let before = self.list_targets_for_session(&request.session_name)?;
-        if let Some(action_args) = prepare_spawn_action_args(request) {
+        if let Some(action_args) = action_args {
             self.run_zellij_command(
                 Some(&request.session_name),
                 &std::iter::once("action".to_string())
@@ -1834,18 +2018,22 @@ impl ZjctlAdapter for SshZjctlClient {
             )?;
         }
 
-        let mut run_args = vec!["run".to_string()];
-        if let Some(cwd) = &request.cwd {
-            run_args.push("--cwd".to_string());
-            run_args.push(cwd.clone());
-        }
-        if let Some(title) = &request.title {
-            run_args.push("--name".to_string());
-            run_args.push(title.clone());
-        }
-        run_args.push("--".to_string());
-        run_args.extend(spawn_command);
-        let output = self.run_zellij_command(Some(&request.session_name), &run_args)?;
+        let output = if command_via_action {
+            Vec::new()
+        } else {
+            let mut run_args = vec!["run".to_string()];
+            if let Some(cwd) = &request.cwd {
+                run_args.push("--cwd".to_string());
+                run_args.push(cwd.clone());
+            }
+            if let Some(title) = &request.title {
+                run_args.push("--name".to_string());
+                run_args.push(title.clone());
+            }
+            run_args.push("--".to_string());
+            run_args.extend(spawn_command);
+            self.run_zellij_command(Some(&request.session_name), &run_args)?
+        };
 
         let after = self.list_targets_for_session(&request.session_name)?;
         resolve_spawned_target_from_run_output(
@@ -1858,9 +2046,19 @@ impl ZjctlAdapter for SshZjctlClient {
     }
 
     fn launch_spawn(&self, request: &SpawnRequest) -> Result<Option<ResolvedTarget>, AdapterError> {
-        let spawn_command = resolve_spawn_command(request)?;
+        let before = self.list_targets_for_session(&request.session_name)?;
+        let prepared = prepare_spawn(request, &before)?;
 
-        if let Some(action_args) = prepare_spawn_action_args(request) {
+        let (action_args, spawn_command, command_via_action) = match prepared {
+            PreparedSpawn::Reuse(target) => return Ok(Some(target)),
+            PreparedSpawn::Launch {
+                action_args,
+                command,
+                command_via_action,
+            } => (action_args, command, command_via_action),
+        };
+
+        if let Some(action_args) = action_args {
             let action_command = self.build_remote_exec_command(
                 &self.config.remote_zellij_bin,
                 &self.remote_env_assignments(Some(&request.session_name)),
@@ -1868,28 +2066,82 @@ impl ZjctlAdapter for SshZjctlClient {
                     .chain(action_args.into_iter())
                     .collect::<Vec<_>>(),
             );
-            self.run_remote_command_detached(&action_command)?;
-            std::thread::sleep(Duration::from_millis(200));
+            if command_via_action {
+                match self.run_remote_command_checked(&action_command, REMOTE_COMMAND_TIMEOUT) {
+                    Ok(()) => {
+                        let after = self.list_targets_for_session(&request.session_name)?;
+                        let resolved = resolve_spawned_target(
+                            request,
+                            before,
+                            after,
+                            &spawn_command.join(" "),
+                        )?;
+                        return Ok(Some(resolved));
+                    }
+                    Err(AdapterError::CommandFailed(message))
+                        if is_unsupported_new_tab_initial_command(&message)
+                            && is_default_fish_spawn_request(request, &spawn_command) =>
+                    {
+                        let compat_action_args = prepare_new_tab_action_args(request)
+                            .expect("new-tab action args should exist for missing-tab compatibility fallback");
+                        let compat_action_command = self.build_remote_exec_command(
+                            &self.config.remote_zellij_bin,
+                            &self.remote_env_assignments(Some(&request.session_name)),
+                            &std::iter::once("action".to_string())
+                                .chain(compat_action_args.into_iter())
+                                .collect::<Vec<_>>(),
+                        );
+                        self.run_remote_command_checked(
+                            &compat_action_command,
+                            REMOTE_COMMAND_TIMEOUT,
+                        )?;
+
+                        let after = self.list_targets_for_session(&request.session_name)?;
+                        let resolved = resolve_spawned_target(
+                            request,
+                            before,
+                            after,
+                            &spawn_command.join(" "),
+                        )?;
+                        if !matches!(shell_name(resolved.command.as_deref()).as_deref(), Some("fish"))
+                        {
+                            self.send_input(
+                                &request.session_name,
+                                &resolved.selector,
+                                "exec fish",
+                                true,
+                            )?;
+                        }
+                        return Ok(Some(resolved));
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                self.run_remote_command_detached(&action_command)?;
+                std::thread::sleep(Duration::from_millis(200));
+            }
         }
 
-        let mut run_args = vec!["run".to_string()];
-        if let Some(cwd) = &request.cwd {
-            run_args.push("--cwd".to_string());
-            run_args.push(cwd.clone());
-        }
-        if let Some(title) = &request.title {
-            run_args.push("--name".to_string());
-            run_args.push(title.clone());
-        }
-        run_args.push("--".to_string());
-        run_args.extend(spawn_command);
+        if !command_via_action {
+            let mut run_args = vec!["run".to_string()];
+            if let Some(cwd) = &request.cwd {
+                run_args.push("--cwd".to_string());
+                run_args.push(cwd.clone());
+            }
+            if let Some(title) = &request.title {
+                run_args.push("--name".to_string());
+                run_args.push(title.clone());
+            }
+            run_args.push("--".to_string());
+            run_args.extend(spawn_command);
 
-        let remote_command = self.build_remote_exec_command(
-            &self.config.remote_zellij_bin,
-            &self.remote_env_assignments(Some(&request.session_name)),
-            &run_args,
-        );
-        self.run_remote_command_detached(&remote_command)?;
+            let remote_command = self.build_remote_exec_command(
+                &self.config.remote_zellij_bin,
+                &self.remote_env_assignments(Some(&request.session_name)),
+                &run_args,
+            );
+            self.run_remote_command_detached(&remote_command)?;
+        }
         Ok(None)
     }
 
@@ -1983,15 +2235,20 @@ impl ZjctlAdapter for SshZjctlClient {
 
     fn close(&self, session_name: &str, handle: &str, force: bool) -> Result<(), AdapterError> {
         if selector_to_action_pane_id(handle).is_none() {
-            return self.close_via_zjctl(session_name, handle, force);
+            self.close_via_zjctl(session_name, handle, force)?;
+            return self.ensure_close_effective(session_name, handle, force, true);
         }
         match self.close_handle(session_name, handle, force) {
             Err(error) if is_unsupported_action_pane_target(&error) => {
                 let target = self.resolved_target(session_name, handle)?;
                 self.close_focused_pane(session_name, &target.selector)
                     .or_else(|_| self.close_via_zjctl(session_name, &target.selector, force))
+                    .and_then(|_| {
+                        self.ensure_close_effective(session_name, &target.selector, force, false)
+                    })
             }
-            other => other,
+            Ok(()) => self.ensure_close_effective(session_name, handle, force, false),
+            Err(error) => Err(error),
         }
     }
 
@@ -2002,7 +2259,7 @@ impl ZjctlAdapter for SshZjctlClient {
     }
 }
 
-impl ZjctlAdapter for ZjctlClient {
+impl BackendAdapter for LocalBackend {
     fn is_available(&self) -> bool {
         self.run_zellij_command(None, &["--help".to_string()])
             .is_ok()
@@ -2013,33 +2270,75 @@ impl ZjctlAdapter for ZjctlClient {
     }
 
     fn spawn(&self, request: &SpawnRequest) -> Result<ResolvedTarget, AdapterError> {
-        let spawn_command = resolve_spawn_command(request)?;
+        let before = self.list_targets_for_session(&request.session_name)?;
+        let prepared = prepare_spawn(request, &before)?;
+
+        let (action_args, spawn_command, command_via_action) = match prepared {
+            PreparedSpawn::Reuse(target) => return Ok(target),
+            PreparedSpawn::Launch {
+                action_args,
+                command,
+                command_via_action,
+            } => (action_args, command, command_via_action),
+        };
         let command_summary = spawn_command.join(" ");
 
-        let before = self.list_targets_for_session(&request.session_name)?;
-        if let Some(action_args) = prepare_spawn_action_args(request) {
-            self.run_zellij_action(&request.session_name, &action_args)?;
+        let action_output = if let Some(action_args) = action_args {
+            self.run_zellij_action(&request.session_name, &action_args)?
+        } else {
+            Vec::new()
+        };
+
+        if command_via_action && is_default_fish_spawn_request(request, &spawn_command) {
+            if let (Some(tab_name), Some(tab_id)) = (
+                request.tab_name.as_deref(),
+                parse_action_created_tab_id(&action_output),
+            ) {
+                self.run_zellij_action(
+                    &request.session_name,
+                    &[
+                        "rename-tab-by-id".to_string(),
+                        tab_id,
+                        tab_name.to_string(),
+                    ],
+                )?;
+            }
+            let after = self.list_targets_for_session(&request.session_name)?;
+            let resolved = resolve_spawned_target(request, before, after, &command_summary)?;
+            if !matches!(shell_name(resolved.command.as_deref()).as_deref(), Some("fish")) {
+                self.send_input(
+                    &request.session_name,
+                    &resolved.selector,
+                    "exec fish",
+                    true,
+                )?;
+            }
+            return Ok(resolved);
         }
 
-        let mut run_args = vec!["run".to_string()];
-        if let Some(cwd) = &request.cwd {
-            run_args.push("--cwd".to_string());
-            run_args.push(cwd.clone());
-        }
-        if let Some(title) = &request.title {
-            run_args.push("--name".to_string());
-            run_args.push(title.clone());
-        }
-        run_args.push("--".to_string());
-        run_args.extend(spawn_command);
-        let output = self.run_zellij_command(Some(&request.session_name), &run_args)?;
+        let output = if command_via_action {
+            Vec::new()
+        } else {
+            let mut run_args = vec!["run".to_string()];
+            if let Some(cwd) = &request.cwd {
+                run_args.push("--cwd".to_string());
+                run_args.push(cwd.clone());
+            }
+            if let Some(title) = &request.title {
+                run_args.push("--name".to_string());
+                run_args.push(title.clone());
+            }
+            run_args.push("--".to_string());
+            run_args.extend(spawn_command);
+            self.run_zellij_command(Some(&request.session_name), &run_args)?.stdout
+        };
 
         let after = self.list_targets_for_session(&request.session_name)?;
         resolve_spawned_target_from_run_output(
             request,
             before,
             after,
-            &output.stdout,
+            &output,
             &command_summary,
         )
     }
@@ -2267,6 +2566,14 @@ fn resolve_spawned_target_from_run_output(
     resolve_spawned_target(request, before, after, command_summary)
 }
 
+fn parse_action_created_tab_id(stdout: &[u8]) -> Option<String> {
+    let trimmed = String::from_utf8_lossy(stdout).trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.chars().all(|ch| ch.is_ascii_digit()).then_some(trimmed)
+}
+
 fn parse_command(command: &str) -> Result<Vec<String>, AdapterError> {
     shell_words::split(command)
         .map_err(|error| AdapterError::ParseError(format!("invalid spawn command: {error}")))
@@ -2277,9 +2584,7 @@ fn resolve_spawn_command(request: &SpawnRequest) -> Result<Vec<String>, AdapterE
         (Some(_), Some(_)) => Err(AdapterError::ParseError(
             "spawn requires either `command` or `argv`, not both".to_string(),
         )),
-        (None, None) => Err(AdapterError::ParseError(
-            "spawn requires either `command` or `argv`".to_string(),
-        )),
+        (None, None) => Ok(vec!["fish".to_string()]),
         (Some(command), None) => {
             if command.trim().is_empty() {
                 return Err(AdapterError::ParseError(
@@ -2306,20 +2611,22 @@ fn resolve_spawn_command(request: &SpawnRequest) -> Result<Vec<String>, AdapterE
     }
 }
 
+fn prepare_new_tab_action_args(request: &SpawnRequest) -> Option<Vec<String>> {
+    let mut args = vec!["new-tab".to_string()];
+    if let Some(tab_name) = &request.tab_name {
+        args.push("--name".to_string());
+        args.push(tab_name.clone());
+    }
+    if let Some(cwd) = &request.cwd {
+        args.push("--cwd".to_string());
+        args.push(cwd.clone());
+    }
+    Some(args)
+}
+
 fn prepare_spawn_action_args(request: &SpawnRequest) -> Option<Vec<String>> {
     match request.spawn_target {
-        SpawnTarget::NewTab => {
-            let mut args = vec!["new-tab".to_string()];
-            if let Some(tab_name) = &request.tab_name {
-                args.push("--name".to_string());
-                args.push(tab_name.clone());
-            }
-            if let Some(cwd) = &request.cwd {
-                args.push("--cwd".to_string());
-                args.push(cwd.clone());
-            }
-            Some(args)
-        }
+        SpawnTarget::NewTab => prepare_new_tab_action_args(request),
         SpawnTarget::ExistingTab => request
             .tab_name
             .as_ref()
@@ -2329,16 +2636,122 @@ fn prepare_spawn_action_args(request: &SpawnRequest) -> Option<Vec<String>> {
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PreparedSpawn {
-    action_args: Option<Vec<String>>,
-    command: Vec<String>,
+enum PreparedSpawn {
+    Reuse(ResolvedTarget),
+    Launch {
+        action_args: Option<Vec<String>>,
+        command: Vec<String>,
+        command_via_action: bool,
+    },
+}
+
+fn shell_name(command: Option<&str>) -> Option<String> {
+    let command = command?.trim();
+    if command.is_empty() {
+        return None;
+    }
+
+    let first = command.split_whitespace().next()?.rsplit('/').next()?;
+    Some(first.to_ascii_lowercase())
+}
+
+fn is_reusable_terminal_target(target: &ResolvedTarget) -> bool {
+    is_terminal_target(target)
+        && matches!(
+            shell_name(target.command.as_deref()).as_deref(),
+            Some("sh" | "bash" | "zsh" | "fish")
+        )
+}
+
+fn is_unsupported_new_tab_initial_command(message: &str) -> bool {
+    message.contains("Found argument") && message.contains("wasn't expected")
+}
+
+fn is_default_fish_spawn_request(request: &SpawnRequest, command: &[String]) -> bool {
+    request.command.is_none()
+        && request.argv.is_none()
+        && matches!(command, [single] if single == "fish")
+}
+
+fn terminal_targets_in_tab<'a>(tab_targets: &'a [ResolvedTarget]) -> Vec<&'a ResolvedTarget> {
+    tab_targets
+        .iter()
+        .filter(|target| is_terminal_target(target))
+        .collect()
+}
+
+fn is_reusable_terminal_target_for_request(
+    request: &SpawnRequest,
+    command: &[String],
+    tab_targets: &[ResolvedTarget],
+    target: &ResolvedTarget,
+) -> bool {
+    if is_reusable_terminal_target(target) {
+        return true;
+    }
+
+    let terminal_targets = terminal_targets_in_tab(tab_targets);
+
+    is_default_fish_spawn_request(request, command)
+        && terminal_targets.len() == 1
+        && is_terminal_target(target)
+        && target.command.is_none()
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn prepare_spawn(request: &SpawnRequest) -> Result<PreparedSpawn, AdapterError> {
-    Ok(PreparedSpawn {
-        action_args: prepare_spawn_action_args(request),
-        command: resolve_spawn_command(request)?,
+fn prepare_spawn(
+    request: &SpawnRequest,
+    existing_targets: &[ResolvedTarget],
+) -> Result<PreparedSpawn, AdapterError> {
+    let command = resolve_spawn_command(request)?;
+
+    if matches!(request.spawn_target, SpawnTarget::NewTab) {
+        return Ok(PreparedSpawn::Launch {
+            action_args: prepare_spawn_action_args(request),
+            command,
+            command_via_action: false,
+        });
+    }
+
+    let Some(tab_name) = request.tab_name.as_deref() else {
+        return Ok(PreparedSpawn::Launch {
+            action_args: None,
+            command,
+            command_via_action: false,
+        });
+    };
+
+    let tab_targets: Vec<ResolvedTarget> = existing_targets
+        .iter()
+        .filter(|target| target.tab_name.as_deref() == Some(tab_name))
+        .cloned()
+        .collect();
+
+    if tab_targets.is_empty() {
+        let mut action_args = prepare_new_tab_action_args(request)
+            .expect("new-tab action args should exist for explicit tab routing");
+        action_args.push("--".to_string());
+        action_args.extend(command.clone());
+        return Ok(PreparedSpawn::Launch {
+            action_args: Some(action_args),
+            command,
+            command_via_action: true,
+        });
+    }
+
+    let reusable_targets: Vec<ResolvedTarget> = tab_targets
+        .iter()
+        .filter(|target| is_reusable_terminal_target_for_request(request, &command, &tab_targets, target))
+        .cloned()
+        .collect();
+    if let [target] = reusable_targets.as_slice() {
+        return Ok(PreparedSpawn::Reuse(target.clone()));
+    }
+
+    Ok(PreparedSpawn::Launch {
+        action_args: Some(vec!["go-to-tab-name".to_string(), tab_name.to_string()]),
+        command,
+        command_via_action: false,
     })
 }
 
@@ -2367,7 +2780,11 @@ mod tests {
         augment_path_with_binary_dirs,
         attempt_safe_ssh_readiness_remediation_with_probe_and_runner,
         classify_ssh_backend_readiness_with_probe, format_seconds,
-        is_protocol_version_mismatch_message, matches_selector, parse_command, parse_rpc_output,
+        helper_client_geometry_from_sources,
+        is_missing_plugin_message, is_protocol_version_mismatch_message,
+        is_reusable_terminal_target_for_request, is_unsupported_new_tab_initial_command,
+        matches_selector, parse_action_created_tab_id, terminal_targets_in_tab,
+        parse_command, parse_rpc_output,
         prepare_spawn, resolve_spawn_command, resolve_spawned_target,
         resolve_spawned_target_from_run_output,
         resolve_ssh_runtime_config_with_probe,
@@ -2558,6 +2975,22 @@ mod tests {
     }
 
     #[test]
+    fn spawn_defaults_to_interactive_fish_when_command_is_omitted() {
+        let request: SpawnRequest = serde_json::from_value(serde_json::json!({
+            "session_name": "gpu",
+            "tab_name": "editor",
+            "wait_ready": false
+        }))
+        .expect("spawn request should deserialize with defaults");
+
+        assert_eq!(request.spawn_target, SpawnTarget::ExistingTab);
+        assert_eq!(
+            resolve_spawn_command(&request).expect("default command should resolve"),
+            vec!["fish".to_string()]
+        );
+    }
+
+    #[test]
     fn spawn_rejects_command_and_argv_together() {
         let request = SpawnRequest {
             target: None,
@@ -2581,7 +3014,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_rejects_missing_command_and_argv() {
+    fn prepare_spawn_reuses_single_shell_like_terminal_in_requested_tab() {
         let request = SpawnRequest {
             target: None,
             session_name: "gpu".to_string(),
@@ -2593,10 +3026,20 @@ mod tests {
             title: None,
             wait_ready: false,
         };
+        let existing_targets = vec![ResolvedTarget {
+            selector: "id:terminal:7".to_string(),
+            pane_id: Some("terminal:7".to_string()),
+            session_name: "gpu".to_string(),
+            tab_name: Some("editor".to_string()),
+            title: Some("shell".to_string()),
+            command: Some("fish".to_string()),
+            focused: true,
+        }];
 
-        let error = resolve_spawn_command(&request).expect_err("missing command forms should fail");
-        assert!(matches!(error, AdapterError::ParseError(_)));
-        assert!(error.to_string().contains("either `command` or `argv`"));
+        assert_eq!(
+            prepare_spawn(&request, &existing_targets).expect("spawn should plan a reuse"),
+            PreparedSpawn::Reuse(existing_targets[0].clone())
+        );
     }
 
     #[test]
@@ -2674,7 +3117,8 @@ mod tests {
             wait_ready: false,
         };
 
-        let error = prepare_spawn(&request).expect_err("invalid spawn should fail before planning");
+        let error =
+            prepare_spawn(&request, &[]).expect_err("invalid spawn should fail before planning");
         assert!(matches!(error, AdapterError::ParseError(_)));
     }
 
@@ -2693,8 +3137,8 @@ mod tests {
         };
 
         assert_eq!(
-            prepare_spawn(&request).expect("spawn should prepare"),
-            PreparedSpawn {
+            prepare_spawn(&request, &[]).expect("spawn should prepare"),
+            PreparedSpawn::Launch {
                 action_args: Some(vec![
                     "new-tab".to_string(),
                     "--name".to_string(),
@@ -2703,6 +3147,365 @@ mod tests {
                     "/tmp".to_string(),
                 ]),
                 command: vec!["git".to_string(), "status".to_string()],
+                command_via_action: false,
+            }
+        );
+    }
+
+    #[test]
+    fn prepare_spawn_creates_new_tab_when_requested_tab_is_missing() {
+        let request = SpawnRequest {
+            target: None,
+            session_name: "gpu".to_string(),
+            spawn_target: SpawnTarget::ExistingTab,
+            tab_name: Some("editor".to_string()),
+            cwd: Some("/tmp".to_string()),
+            command: None,
+            argv: None,
+            title: None,
+            wait_ready: false,
+        };
+
+        assert_eq!(
+            prepare_spawn(&request, &[]).expect("missing requested tab should create one"),
+            PreparedSpawn::Launch {
+                action_args: Some(vec![
+                    "new-tab".to_string(),
+                    "--name".to_string(),
+                    "editor".to_string(),
+                    "--cwd".to_string(),
+                    "/tmp".to_string(),
+                    "--".to_string(),
+                    "fish".to_string(),
+                ]),
+                command: vec!["fish".to_string()],
+                command_via_action: true,
+            }
+        );
+    }
+
+    #[test]
+    fn detects_old_remote_new_tab_rejecting_trailing_command() {
+        assert!(is_unsupported_new_tab_initial_command(
+            "error: Found argument 'fish' which wasn't expected"
+        ));
+        assert!(!is_unsupported_new_tab_initial_command(
+            "error: failed to contact session"
+        ));
+    }
+
+    #[test]
+    fn prepare_spawn_reuses_requested_existing_tab_when_exactly_one_shell_like_terminal_exists() {
+        let request = SpawnRequest {
+            target: None,
+            session_name: "gpu".to_string(),
+            spawn_target: SpawnTarget::ExistingTab,
+            tab_name: Some("editor".to_string()),
+            cwd: None,
+            command: None,
+            argv: None,
+            title: None,
+            wait_ready: false,
+        };
+        let existing_targets = vec![
+            ResolvedTarget {
+                selector: "id:terminal:7".to_string(),
+                pane_id: Some("terminal:7".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("shell".to_string()),
+                command: Some("fish".to_string()),
+                focused: true,
+            },
+            ResolvedTarget {
+                selector: "id:terminal:8".to_string(),
+                pane_id: Some("terminal:8".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("editor".to_string()),
+                title: Some("job".to_string()),
+                command: Some("cargo test".to_string()),
+                focused: false,
+            },
+        ];
+
+        assert_eq!(
+            prepare_spawn(&request, &existing_targets)
+                .expect("existing tab with one reusable shell should be reused"),
+            PreparedSpawn::Reuse(existing_targets[0].clone())
+        );
+    }
+
+    #[test]
+    fn resolve_spawned_target_accepts_single_new_terminal_in_requested_tab_without_command_match() {
+        let request = SpawnRequest {
+            target: None,
+            session_name: "gpu".to_string(),
+            spawn_target: SpawnTarget::ExistingTab,
+            tab_name: Some("reuse-remote-fix2".to_string()),
+            cwd: None,
+            command: None,
+            argv: None,
+            title: None,
+            wait_ready: false,
+        };
+        let before = vec![];
+        let after = vec![ResolvedTarget {
+            selector: "id:terminal:1".to_string(),
+            pane_id: Some("terminal:1".to_string()),
+            session_name: "gpu".to_string(),
+            tab_name: Some("reuse-remote-fix2".to_string()),
+            title: Some("shell".to_string()),
+            command: Some("bash".to_string()),
+            focused: true,
+        }];
+
+        let resolved = resolve_spawned_target(&request, before, after, "fish")
+            .expect("single new terminal in requested tab should still reconcile");
+
+        assert_eq!(resolved.pane_id.as_deref(), Some("terminal:1"));
+        assert_eq!(resolved.tab_name.as_deref(), Some("reuse-remote-fix2"));
+    }
+
+    #[test]
+    fn prepare_spawn_reuses_second_identical_default_spawn_after_missing_tab_creation() {
+        let request = SpawnRequest {
+            target: None,
+            session_name: "gpu".to_string(),
+            spawn_target: SpawnTarget::ExistingTab,
+            tab_name: Some("reuse-local".to_string()),
+            cwd: None,
+            command: None,
+            argv: None,
+            title: None,
+            wait_ready: false,
+        };
+        let existing_targets = vec![ResolvedTarget {
+            selector: "id:terminal:2".to_string(),
+            pane_id: Some("terminal:2".to_string()),
+            session_name: "gpu".to_string(),
+            tab_name: Some("reuse-local".to_string()),
+            title: Some("shell".to_string()),
+            command: Some("fish".to_string()),
+            focused: true,
+        }];
+
+        assert_eq!(
+            prepare_spawn(&request, &existing_targets)
+                .expect("second default spawn should reuse the single fish terminal"),
+            PreparedSpawn::Reuse(existing_targets[0].clone())
+        );
+    }
+
+    #[test]
+    fn parse_action_created_tab_id_accepts_integer_stdout() {
+        assert_eq!(parse_action_created_tab_id(b"17\n"), Some("17".to_string()));
+        assert_eq!(parse_action_created_tab_id(b"\n"), None);
+        assert_eq!(parse_action_created_tab_id(b"terminal_7\n"), None);
+    }
+
+    #[test]
+    fn old_remote_single_terminal_with_missing_command_is_reusable_for_default_fish_spawn() {
+        let request = SpawnRequest {
+            target: None,
+            session_name: "gpu".to_string(),
+            spawn_target: SpawnTarget::ExistingTab,
+            tab_name: Some("reuse-remote-fix3".to_string()),
+            cwd: None,
+            command: None,
+            argv: None,
+            title: None,
+            wait_ready: false,
+        };
+        let tab_targets = vec![ResolvedTarget {
+            selector: "id:terminal:1".to_string(),
+            pane_id: Some("terminal:1".to_string()),
+            session_name: "gpu".to_string(),
+            tab_name: Some("reuse-remote-fix3".to_string()),
+            title: Some("~".to_string()),
+            command: None,
+            focused: true,
+        }];
+
+        assert!(is_reusable_terminal_target_for_request(
+            &request,
+            &["fish".to_string()],
+            &tab_targets,
+            &tab_targets[0],
+        ));
+        assert_eq!(
+            prepare_spawn(&request, &tab_targets)
+                .expect("second default spawn should reuse compat-created single pane"),
+            PreparedSpawn::Reuse(tab_targets[0].clone())
+        );
+    }
+
+    #[test]
+    fn old_remote_single_terminal_with_plugin_pane_is_still_reusable_for_default_fish_spawn() {
+        let request = SpawnRequest {
+            target: None,
+            session_name: "gpu".to_string(),
+            spawn_target: SpawnTarget::ExistingTab,
+            tab_name: Some("reuse-remote-verify5".to_string()),
+            cwd: None,
+            command: None,
+            argv: None,
+            title: None,
+            wait_ready: false,
+        };
+        let tab_targets = vec![
+            ResolvedTarget {
+                selector: "id:plugin:1".to_string(),
+                pane_id: Some("plugin:1".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("reuse-remote-verify5".to_string()),
+                title: Some("zrpc".to_string()),
+                command: None,
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:terminal:1".to_string(),
+                pane_id: Some("terminal:1".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("reuse-remote-verify5".to_string()),
+                title: Some("~".to_string()),
+                command: None,
+                focused: true,
+            },
+        ];
+
+        let terminal_targets = terminal_targets_in_tab(&tab_targets);
+        assert_eq!(terminal_targets.len(), 1);
+        assert_eq!(terminal_targets[0].pane_id.as_deref(), Some("terminal:1"));
+        assert!(is_reusable_terminal_target_for_request(
+            &request,
+            &["fish".to_string()],
+            &tab_targets,
+            &tab_targets[1],
+        ));
+        assert_eq!(
+            prepare_spawn(&request, &tab_targets)
+                .expect("second default spawn should reuse compat-created terminal even with plugin pane present"),
+            PreparedSpawn::Reuse(tab_targets[1].clone())
+        );
+    }
+
+    #[test]
+    fn missing_command_terminal_is_not_reused_for_non_default_spawn_requests() {
+        let request = SpawnRequest {
+            target: None,
+            session_name: "gpu".to_string(),
+            spawn_target: SpawnTarget::ExistingTab,
+            tab_name: Some("reuse-remote-fix3".to_string()),
+            cwd: None,
+            command: Some("lazygit".to_string()),
+            argv: None,
+            title: None,
+            wait_ready: false,
+        };
+        let tab_targets = vec![ResolvedTarget {
+            selector: "id:terminal:1".to_string(),
+            pane_id: Some("terminal:1".to_string()),
+            session_name: "gpu".to_string(),
+            tab_name: Some("reuse-remote-fix3".to_string()),
+            title: Some("~".to_string()),
+            command: None,
+            focused: true,
+        }];
+
+        assert!(!is_reusable_terminal_target_for_request(
+            &request,
+            &["lazygit".to_string()],
+            &tab_targets,
+            &tab_targets[0],
+        ));
+        assert!(matches!(
+            prepare_spawn(&request, &tab_targets)
+                .expect("non-default spawn should still launch a new pane in existing tab"),
+            PreparedSpawn::Launch { .. }
+        ));
+    }
+
+    #[test]
+    fn null_command_terminal_with_plugin_pane_is_not_reused_for_non_default_spawn_requests() {
+        let request = SpawnRequest {
+            target: None,
+            session_name: "gpu".to_string(),
+            spawn_target: SpawnTarget::ExistingTab,
+            tab_name: Some("reuse-remote-verify5".to_string()),
+            cwd: None,
+            command: Some("lazygit".to_string()),
+            argv: None,
+            title: None,
+            wait_ready: false,
+        };
+        let tab_targets = vec![
+            ResolvedTarget {
+                selector: "id:plugin:1".to_string(),
+                pane_id: Some("plugin:1".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("reuse-remote-verify5".to_string()),
+                title: Some("zrpc".to_string()),
+                command: None,
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:terminal:1".to_string(),
+                pane_id: Some("terminal:1".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("reuse-remote-verify5".to_string()),
+                title: Some("~".to_string()),
+                command: None,
+                focused: true,
+            },
+        ];
+
+        assert!(!is_reusable_terminal_target_for_request(
+            &request,
+            &["lazygit".to_string()],
+            &tab_targets,
+            &tab_targets[1],
+        ));
+        assert!(matches!(
+            prepare_spawn(&request, &tab_targets)
+                .expect("non-default spawn should still create a new pane when only null-command terminal is present"),
+            PreparedSpawn::Launch { .. }
+        ));
+    }
+
+    #[test]
+    fn prepare_spawn_respects_explicit_new_tab_even_when_reusable_terminal_exists() {
+        let request = SpawnRequest {
+            target: None,
+            session_name: "gpu".to_string(),
+            spawn_target: SpawnTarget::NewTab,
+            tab_name: Some("editor".to_string()),
+            cwd: None,
+            command: None,
+            argv: None,
+            title: None,
+            wait_ready: false,
+        };
+        let existing_targets = vec![ResolvedTarget {
+            selector: "id:terminal:7".to_string(),
+            pane_id: Some("terminal:7".to_string()),
+            session_name: "gpu".to_string(),
+            tab_name: Some("editor".to_string()),
+            title: Some("shell".to_string()),
+            command: Some("fish".to_string()),
+            focused: true,
+        }];
+
+        assert_eq!(
+            prepare_spawn(&request, &existing_targets)
+                .expect("explicit new-tab should bypass reuse"),
+            PreparedSpawn::Launch {
+                action_args: Some(vec![
+                    "new-tab".to_string(),
+                    "--name".to_string(),
+                    "editor".to_string(),
+                ]),
+                command: vec!["fish".to_string()],
+                command_via_action: false,
             }
         );
     }
@@ -3176,6 +3979,37 @@ mod tests {
     }
 
     #[test]
+    fn readiness_classifies_missing_plugin_distinctly() {
+        let config = SshTargetConfig {
+            host: "aws".to_string(),
+            remote_zjctl_bin: "/home/remote/.local/bin/zjctl".to_string(),
+            remote_zellij_bin: "/home/remote/.local/bin/zellij".to_string(),
+            remote_env: BTreeMap::new(),
+            ssh_options: Vec::new(),
+        };
+        let message = "zrpc plugin not found at /home/remote/.config/zellij/plugins/zrpc.wasm"
+            .to_string();
+        let probe = FakeProbe {
+            home: None,
+            path: None,
+            command_v: HashMap::new(),
+            executables: HashMap::new(),
+            rpc_readiness: Some(Err(AdapterError::CommandFailed(message.clone()))),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let readiness = classify_ssh_backend_readiness_with_probe(&config, "aws", &probe);
+
+        assert_eq!(
+            readiness,
+            SshBackendReadiness::ManualActionRequired(SshReadinessFailure::MissingPlugin {
+                host: "aws".to_string(),
+                detail: message,
+            })
+        );
+    }
+
+    #[test]
     fn readiness_classifies_no_active_session_as_helper_client_missing() {
         let config = SshTargetConfig {
             host: "a100".to_string(),
@@ -3327,7 +4161,7 @@ mod tests {
                 .commands
                 .borrow()
                 .iter()
-                .any(|command| command.contains("new-session -d -s"))
+                .any(|command| command.contains("new-session -d -x 160 -y 48 -s"))
         );
         assert!(
             runner
@@ -3336,6 +4170,64 @@ mod tests {
                 .iter()
                 .any(|command| command.contains("action") && command.contains("launch-plugin"))
         );
+    }
+
+    #[test]
+    fn readiness_auto_fix_helper_attach_does_not_export_target_session_env() {
+        let config = SshTargetConfig {
+            host: "aws".to_string(),
+            remote_zjctl_bin: "zjctl".to_string(),
+            remote_zellij_bin: "zellij".to_string(),
+            remote_env: BTreeMap::from([(
+                "ZELLIJ_SESSION_NAME".to_string(),
+                "i1-proof-helper-20260327".to_string(),
+            )]),
+            ssh_options: Vec::new(),
+        };
+        let home = "/home/remote";
+        let probe = FakeProbe {
+            home: Some(home.to_string()),
+            path: Some("/usr/local/bin:/usr/bin:/bin".to_string()),
+            command_v: HashMap::from([
+                (
+                    "zjctl".to_string(),
+                    Some(format!("{home}/.local/bin/zjctl")),
+                ),
+                (
+                    "zellij".to_string(),
+                    Some(format!("{home}/.local/bin/zellij")),
+                ),
+                ("tmux".to_string(), Some("/usr/bin/tmux".to_string())),
+            ]),
+            executables: HashMap::new(),
+            rpc_readiness: None,
+            calls: RefCell::new(Vec::new()),
+        };
+        let runner = RecordingRemediationRunner::default();
+
+        let remediated = attempt_safe_ssh_readiness_remediation_with_probe_and_runner(
+            &config,
+            "i1-proof-helper-20260327",
+            &SshReadinessFailure::HelperClientMissing {
+                host: "aws".to_string(),
+                detail: "Plugins must have a client id, none was provided and none are connected"
+                    .to_string(),
+            },
+            &probe,
+            &runner,
+        );
+
+        assert!(remediated);
+        let helper_command = runner
+            .commands
+            .borrow()
+            .iter()
+            .find(|command| command.contains("new-session -d -x 160 -y 48 -s"))
+            .cloned()
+            .expect("helper start command should be recorded");
+        assert!(helper_command.contains("attach"));
+        assert!(helper_command.contains("i1-proof-helper-20260327"));
+        assert!(!helper_command.contains("ZELLIJ_SESSION_NAME=i1-proof-helper-20260327"));
     }
 
     #[test]
@@ -3476,6 +4368,34 @@ mod tests {
     }
 
     #[test]
+    fn readiness_auto_fix_skips_missing_plugin() {
+        let config = SshTargetConfig {
+            host: "aws".to_string(),
+            remote_zjctl_bin: "zjctl".to_string(),
+            remote_zellij_bin: "zellij".to_string(),
+            remote_env: BTreeMap::new(),
+            ssh_options: Vec::new(),
+        };
+        let probe = FakeProbe::default();
+        let runner = RecordingRemediationRunner::default();
+
+        let remediated = attempt_safe_ssh_readiness_remediation_with_probe_and_runner(
+            &config,
+            "aws",
+            &SshReadinessFailure::MissingPlugin {
+                host: "aws".to_string(),
+                detail: "zrpc plugin not found at /home/remote/.config/zellij/plugins/zrpc.wasm"
+                    .to_string(),
+            },
+            &probe,
+            &runner,
+        );
+
+        assert!(!remediated);
+        assert!(runner.commands.borrow().is_empty());
+    }
+
+    #[test]
     fn detects_protocol_version_mismatch_messages() {
         assert!(is_protocol_version_mismatch_message(
             &format!(
@@ -3487,6 +4407,48 @@ mod tests {
         assert!(!is_protocol_version_mismatch_message(
             "Error: no response from zrpc plugin"
         ));
+    }
+
+    #[test]
+    fn detects_missing_plugin_messages() {
+        assert!(is_missing_plugin_message(
+            "zrpc plugin not found at /tmp/zrpc.wasm"
+        ));
+        assert!(!is_missing_plugin_message(
+            "Error: no response from zrpc plugin"
+        ));
+    }
+
+    #[test]
+    fn helper_client_geometry_prefers_explicit_over_terminal_size() {
+        assert_eq!(
+            helper_client_geometry_from_sources(Some(220), Some(70), Some(180), Some(55)),
+            (220, 70)
+        );
+    }
+
+    #[test]
+    fn helper_client_geometry_uses_terminal_size_when_explicit_missing() {
+        assert_eq!(
+            helper_client_geometry_from_sources(None, None, Some(180), Some(55)),
+            (180, 55)
+        );
+    }
+
+    #[test]
+    fn helper_client_geometry_clamps_small_terminal_size_to_safe_defaults() {
+        assert_eq!(
+            helper_client_geometry_from_sources(None, None, Some(80), Some(24)),
+            (160, 48)
+        );
+    }
+
+    #[test]
+    fn helper_client_geometry_falls_back_to_defaults() {
+        assert_eq!(
+            helper_client_geometry_from_sources(None, None, None, None),
+            (160, 48)
+        );
     }
 
     #[test]

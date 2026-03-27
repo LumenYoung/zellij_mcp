@@ -1,0 +1,52 @@
+Phase 3 evidence: busy spawn recovery on a100
+
+Date: 2026-03-26
+Repo: /home/yang/Documents/git/zellij-skill
+
+Precondition recovery on `a100`:
+- Both helper tmux sessions existed and were already running `zellij`, but RPC still failed.
+- `zellij list-sessions` was healthy while `zjctl doctor` and `zjctl panes ls --json` were not, proving the remaining issue was plugin/RPC state rather than basic session existence.
+- Explicit bounded plugin launch repaired the live host:
+  - `ssh -oBatchMode=yes a100 'export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"; export ZELLIJ_SESSION_NAME=a100; timeout 15 zellij action launch-plugin "file:$HOME/.config/zellij/plugins/zrpc.wasm"; printf "exit=%s\n" "$?"'`
+  - observed: `exit=0`
+- Fresh-daemon readiness then recovered:
+  - `zellij-layout --session-name a100 --target a100` succeeded
+  - `zellij-discover --stdin` with `{"session_name":"a100","target":"a100","include_preview":false}` succeeded and returned candidates
+
+Busy-handle recovery proof on `a100`:
+
+Case 1: `new_tab`
+- Spawn:
+  - returned in `2.00s`
+  - `status="busy"`
+  - handle `zh_f80da347e6884a47955bfedfb1998a65`
+- Follow-up list:
+  - returned in `1.85s`
+  - upgraded the binding to `status="ready"`
+  - reconciled `selector="id:terminal:20"`, `pane_id="terminal:20"`
+- Follow-up wait:
+  - returned in `10.51s`
+  - `status="idle"`
+- Follow-up capture:
+  - returned in `7.57s`
+  - succeeded on the same handle
+
+Case 2: `existing_tab`
+- Spawn:
+  - returned in `1.99s`
+  - `status="busy"`
+  - handle `zh_a5a9a90196f94e5d869f21eb9d76d417`
+- Follow-up list:
+  - returned in `3.89s`
+  - upgraded the binding to `status="ready"`
+  - reconciled `selector="id:terminal:21"`, `pane_id="terminal:21"`
+- Follow-up wait:
+  - returned in `9.45s`
+  - `status="idle"`
+- Follow-up capture:
+  - returned in `5.35s`
+  - succeeded on the same handle
+
+Interpretation:
+- After host readiness was restored, Phase 3’s recoverable-busy design worked as intended on a fresh daemon.
+- `list`, `wait`, and `capture` all recovered the launched pane after a `busy` spawn result on `a100` for both spawn modes.

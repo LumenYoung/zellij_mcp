@@ -1,0 +1,63 @@
+I6 interactive-first QA evidence
+
+Date: 2026-03-27
+Repo: /home/yang/Documents/git/zellij-skill
+
+Code changes validated during this proof:
+- local target listing now enriches pane tab names from `zellij action list-tabs --json`
+- local default interactive spawn now resolves named tabs truthfully enough for reuse/discover/planner flows
+- service-side location planner is shared by takeover and handle-less send
+
+Local proof: APPROVED
+- session: `sisyphus-verify-local`
+- proof tab: `interactive-proof-357805`
+- first default spawn returned:
+  - `status="ready"`
+  - `selector="id:terminal:34"`
+  - `tab_name="interactive-proof-357805"`
+- second identical default spawn reused the same selector:
+  - first selector `id:terminal:34`
+  - second selector `id:terminal:34`
+- `zellij_discover --tab-name interactive-proof-357805` returned the terminal pane with:
+  - `command="fish"`
+  - `selector="id:terminal:34"`
+- handle-less `zellij_send` by location intent succeeded with:
+  - `session_name="sisyphus-verify-local"`
+  - `tab_name="interactive-proof-357805"`
+  - `selector="focused"`
+  - response `accepted=true`, `handle=""`
+- follow-up managed-handle flow succeeded:
+  - `zellij_wait` returned `status="idle"`
+  - `zellij_capture` contained marker `i6-local-314bc872`
+  - `zellij_close --force` returned `closed=true`
+- post-close layout no longer contained the proof tab
+
+Interpretation for local:
+- default spawn is human-shell-first (`fish`)
+- repeated spawn against the same named tab is reuse-first
+- handle-less location-intent send works against the live pane without creating daemon state
+- the same pane remains daemon-manageable through wait/capture/close
+
+A100 proof: PARTIAL / BLOCKED
+- stable reuse path is still proven on a named existing tab:
+  - session: `a100`
+  - tab: `phase3-a100-proof`
+  - first spawn returned `selector="id:terminal:19"`, `tab_name="phase3-a100-proof"`, `status="ready"`
+  - second identical spawn reused `selector="id:terminal:19"`
+  - handle-less exact-selector send returned `accepted=true`, `handle=""`
+  - `zellij_wait` on the managed handle returned `status="idle"`
+  - `zellij_close --force` returned `closed=true`
+- remote `zellij_capture` on that reused pane did not surface the marker text reliably
+- remote side-effect proof could not be completed on the same tab after close, because later retries fell back to the separate missing-tab default-shell path and hit `WAIT_TIMEOUT`
+- focused-intent shorthand on `a100` (`selector="focused"` + `tab_name=...`) returned `TARGET_NOT_FOUND` in the exercised session even though exact-selector intent worked
+
+Interpretation for a100:
+- existing named-tab reuse remains viable and daemon-manageable
+- exact-selector location intent works on the remote stable reuse path
+- two remote gaps remain before I6 can be marked fully complete:
+  1. fresh missing-tab default interactive spawn on `a100` still times out intermittently
+  2. focused-intent shorthand is not yet reliable enough on the exercised remote session
+
+Current conclusion:
+- local I6 proof is complete
+- remote I6 proof is not yet complete; it is blocked on the two remote behavior gaps above
