@@ -57,7 +57,7 @@ Notes:
 
 - `target` is optional backend selection; omit it for local, set it to a configured SSH alias such as `a100`, or use the canonical form `ssh:a100`
 - `spawn_target` supports `new_tab` and `existing_tab`
-- `existing_tab` means spawn a new dedicated pane inside the tab
+- `existing_tab` now means "use the requested tab as the planning target"; if that tab has exactly one reusable shell-like terminal pane, the daemon reuses it, otherwise it may require an explicit choice or create a new pane only when reuse is not possible
 - phase 1 does not replace existing processes in an existing pane
 - use either `command` or `argv`, not both
 - `command` is parsed with shell-style quoting, so inputs like `bash -lc 'echo hello world'` preserve the intended argv shape
@@ -65,7 +65,7 @@ Notes:
 - malformed shell quoting in `command`, blank `command`, empty `argv`, blank `argv[0]`, or mixed `command` + `argv` input fails early as an argument parse error instead of spawning a mangled command
 - `wait_ready=true` runs the same rendered-screen idle check as `zellij_wait`; it works for shell-like startup and was live-tested with `lazygit`, but redraw-heavy TUIs may still make it a noisy readiness proxy
 - when that bounded idle check times out after the pane is already real, `zellij_spawn` returns the new handle with `status="busy"` instead of failing the whole launch
-- `spawn_target="new_tab"` now creates the tab, launches the command with `zellij run`, then resolves the spawned pane from post-launch session state; this avoids the earlier fresh-tab RPC handoff stall where the pane could exist before the request returned
+- default interactive `spawn_target="new_tab"` now binds the new tab's default terminal pane instead of implicitly creating a second shell pane; command-launch fallback still exists for non-default spawn requests and older compatibility paths
 - fatal post-launch errors that happen after early persistence now clean up the provisional binding instead of leaving an orphaned busy handle behind
 
 Remote readiness and bootstrap note:
@@ -218,6 +218,10 @@ Location-intent input:
 ```
 
 Notes:
+
+- handle-based submit flows on fish panes now use a clean wrapper entrypoint (`__zellij_mcp_run_b64`) for complex commands instead of exposing the full inline interaction script in the pane
+- the canonical fish wrapper script supports `-p` preview mode and lives at `scripts/__zellij_mcp_run_b64.fish`
+- when the clean fish wrapper entrypoint is unavailable in the target shell, the daemon retries once with the legacy inline wrapper so the command still executes
 
 - `zellij_send` accepts exactly one targeting mode: either `handle`, or location intent via `session_name` + `selector`
 - when `handle` is omitted, `session_name` and `selector` are required, `tab_name` is optional narrowing context, and `target` may be used to select a local or SSH backend directly

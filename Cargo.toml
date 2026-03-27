@@ -16,6 +16,7 @@ license = "MIT"
 repository = "https://github.com/mrshu/zjctl"
 
 [workspace.dependencies]
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 rmcp = { version = "1.2", features = ["server", "macros", "transport-io"] }
@@ -36,6 +37,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64.workspace = true
 chrono.workspace = true
 rmcp.workspace = true
 serde.workspace = true

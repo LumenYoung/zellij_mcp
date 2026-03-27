@@ -10,6 +10,8 @@ pub enum AdapterError {
     CommandFailed(String),
     #[error("backend output could not be parsed: {0}")]
     ParseError(String),
+    #[error("backend target selection is ambiguous: {0}")]
+    AmbiguousTarget(String),
     #[error("backend command timed out")]
     Timeout,
 }

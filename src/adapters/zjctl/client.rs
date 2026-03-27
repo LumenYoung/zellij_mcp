@@ -549,6 +549,12 @@ fn classify_ssh_readiness_failure(host: &str, error: AdapterError) -> SshBackend
                 detail: message,
             })
         }
+        AdapterError::AmbiguousTarget(message) => {
+            SshBackendReadiness::ManualActionRequired(SshReadinessFailure::RpcNotReady {
+                host: host.to_string(),
+                detail: message,
+            })
+        }
         AdapterError::ZjctlUnavailable => {
             SshBackendReadiness::ManualActionRequired(SshReadinessFailure::SshUnreachable {
                 host: host.to_string(),
@@ -2006,6 +2012,23 @@ impl BackendAdapter for SshBackend {
                 command,
                 command_via_action,
             } => (action_args, command, command_via_action),
+            PreparedSpawn::Ambiguous {
+                tab_name,
+                reusable_targets,
+            } => {
+                let choices = reusable_targets
+                    .iter()
+                    .map(|target| {
+                        let selector = target.selector.as_str();
+                        let title = target.title.as_deref().unwrap_or("<untitled>");
+                        format!("{selector} ({title})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(AdapterError::AmbiguousTarget(format!(
+                    "tab `{tab_name}` has multiple reusable panes; choose an existing pane selector or create a new pane explicitly: {choices}"
+                )));
+            }
         };
         let command_summary = spawn_command.join(" ");
 
@@ -2056,6 +2079,23 @@ impl BackendAdapter for SshBackend {
                 command,
                 command_via_action,
             } => (action_args, command, command_via_action),
+            PreparedSpawn::Ambiguous {
+                tab_name,
+                reusable_targets,
+            } => {
+                let choices = reusable_targets
+                    .iter()
+                    .map(|target| {
+                        let selector = target.selector.as_str();
+                        let title = target.title.as_deref().unwrap_or("<untitled>");
+                        format!("{selector} ({title})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(AdapterError::AmbiguousTarget(format!(
+                    "tab `{tab_name}` has multiple reusable panes; choose an existing pane selector or create a new pane explicitly: {choices}"
+                )));
+            }
         };
 
         if let Some(action_args) = action_args {
@@ -2280,6 +2320,23 @@ impl BackendAdapter for LocalBackend {
                 command,
                 command_via_action,
             } => (action_args, command, command_via_action),
+            PreparedSpawn::Ambiguous {
+                tab_name,
+                reusable_targets,
+            } => {
+                let choices = reusable_targets
+                    .iter()
+                    .map(|target| {
+                        let selector = target.selector.as_str();
+                        let title = target.title.as_deref().unwrap_or("<untitled>");
+                        format!("{selector} ({title})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(AdapterError::AmbiguousTarget(format!(
+                    "tab `{tab_name}` has multiple reusable panes; choose an existing pane selector or create a new pane explicitly: {choices}"
+                )));
+            }
         };
         let command_summary = spawn_command.join(" ");
 
@@ -2643,6 +2700,10 @@ enum PreparedSpawn {
         command: Vec<String>,
         command_via_action: bool,
     },
+    Ambiguous {
+        tab_name: String,
+        reusable_targets: Vec<ResolvedTarget>,
+    },
 }
 
 fn shell_name(command: Option<&str>) -> Option<String> {
@@ -2706,10 +2767,11 @@ fn prepare_spawn(
     let command = resolve_spawn_command(request)?;
 
     if matches!(request.spawn_target, SpawnTarget::NewTab) {
+        let command_via_action = is_default_fish_spawn_request(request, &command);
         return Ok(PreparedSpawn::Launch {
             action_args: prepare_spawn_action_args(request),
             command,
-            command_via_action: false,
+            command_via_action,
         });
     }
 
@@ -2730,12 +2792,15 @@ fn prepare_spawn(
     if tab_targets.is_empty() {
         let mut action_args = prepare_new_tab_action_args(request)
             .expect("new-tab action args should exist for explicit tab routing");
-        action_args.push("--".to_string());
-        action_args.extend(command.clone());
+        let command_via_action = !is_default_fish_spawn_request(request, &command);
+        if command_via_action {
+            action_args.push("--".to_string());
+            action_args.extend(command.clone());
+        }
         return Ok(PreparedSpawn::Launch {
             action_args: Some(action_args),
             command,
-            command_via_action: true,
+            command_via_action,
         });
     }
 
@@ -2746,6 +2811,13 @@ fn prepare_spawn(
         .collect();
     if let [target] = reusable_targets.as_slice() {
         return Ok(PreparedSpawn::Reuse(target.clone()));
+    }
+
+    if reusable_targets.len() > 1 {
+        return Ok(PreparedSpawn::Ambiguous {
+            tab_name: tab_name.to_string(),
+            reusable_targets,
+        });
     }
 
     Ok(PreparedSpawn::Launch {
@@ -3175,13 +3247,79 @@ mod tests {
                     "editor".to_string(),
                     "--cwd".to_string(),
                     "/tmp".to_string(),
-                    "--".to_string(),
-                    "fish".to_string(),
+                ]),
+                command: vec!["fish".to_string()],
+                command_via_action: false,
+            }
+        );
+    }
+
+    #[test]
+    fn prepare_spawn_new_tab_default_fish_binds_default_pane_without_extra_launch() {
+        let request = SpawnRequest {
+            target: None,
+            session_name: "gpu".to_string(),
+            spawn_target: SpawnTarget::NewTab,
+            tab_name: Some("docker".to_string()),
+            cwd: None,
+            command: None,
+            argv: None,
+            title: None,
+            wait_ready: false,
+        };
+
+        assert_eq!(
+            prepare_spawn(&request, &[]).expect("new-tab default fish should prepare"),
+            PreparedSpawn::Launch {
+                action_args: Some(vec![
+                    "new-tab".to_string(),
+                    "--name".to_string(),
+                    "docker".to_string(),
                 ]),
                 command: vec!["fish".to_string()],
                 command_via_action: true,
             }
         );
+    }
+
+    #[test]
+    fn prepare_spawn_returns_ambiguity_when_tab_has_multiple_reusable_terminals() {
+        let request = SpawnRequest {
+            target: None,
+            session_name: "gpu".to_string(),
+            spawn_target: SpawnTarget::ExistingTab,
+            tab_name: Some("docker".to_string()),
+            cwd: None,
+            command: None,
+            argv: None,
+            title: None,
+            wait_ready: false,
+        };
+        let targets = vec![
+            ResolvedTarget {
+                selector: "id:terminal:2".to_string(),
+                pane_id: Some("terminal:2".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("docker".to_string()),
+                title: Some("left".to_string()),
+                command: Some("fish".to_string()),
+                focused: false,
+            },
+            ResolvedTarget {
+                selector: "id:terminal:3".to_string(),
+                pane_id: Some("terminal:3".to_string()),
+                session_name: "gpu".to_string(),
+                tab_name: Some("docker".to_string()),
+                title: Some("right".to_string()),
+                command: Some("fish".to_string()),
+                focused: true,
+            },
+        ];
+
+        assert!(matches!(
+            prepare_spawn(&request, &targets).expect("planning should succeed"),
+            PreparedSpawn::Ambiguous { .. }
+        ));
     }
 
     #[test]
@@ -3505,7 +3643,7 @@ mod tests {
                     "editor".to_string(),
                 ]),
                 command: vec!["fish".to_string()],
-                command_via_action: false,
+                command_via_action: true,
             }
         );
     }

@@ -69,6 +69,7 @@ Services own business semantics:
 - discover vs attach behavior
 - command boundary resets
 - explicit interaction markers for daemon-submitted shell commands on supported shell-like panes
+- reuse-first default pane planning for session/tab intent, with ambiguity surfaced instead of silently choosing among multiple plausible panes
 - delta and current capture behavior
 - stale target revalidation
 - per-handle serialization
@@ -87,7 +88,9 @@ The adapter is the only layer allowed to execute backend commands or parse backe
 
 The spawn path now accepts either a shell-style `command` string or an explicit `argv` vector before building `zjctl` argv. String commands still use shell-aware quoting so quoted arguments survive intact, while explicit `argv` bypasses shell parsing completely. Mixed `command` + `argv`, missing both, blank `command`, empty `argv`, and blank `argv[0]` all fail before any pane is launched.
 
-For `target="existing_tab"`, the adapter still uses the normal `zjctl` spawn path. For `target="new_tab"`, the adapter now creates the tab, launches the command via direct `zellij run`, then resolves the spawned pane from the before/after session listing. This avoids the earlier case where a fresh tab could contain the real pane while the older RPC-backed selector handoff was still stalled.
+For `target="existing_tab"`, the adapter now treats the named tab as a planning target rather than automatically meaning "create another pane". If that tab contains one obvious reusable shell-like terminal, the daemon binds it directly; if it contains multiple plausible terminals, the daemon surfaces ambiguity instead of silently choosing. For default interactive `target="new_tab"`, the adapter now binds the new tab's default terminal pane instead of implicitly creating a second shell pane.
+
+For fish-backed wrapped submit flows, the service layer now emits a compact `__zellij_mcp_run_b64` wrapper entrypoint instead of the full inline interaction script. The wrapper still preserves daemon-owned interaction markers internally, but the pane-visible command is cleaner and supports user preview via `-p`. If the target fish shell does not have that wrapper entrypoint available, the service detects the failure from pane capture and retries once with the legacy inline wrapper path so the command still executes.
 
 Live verification showed one important runtime constraint: the `zrpc.wasm` plugin must be loaded in the target session and its first-run permission prompt must be approved before `zjctl` RPC calls will succeed.
 

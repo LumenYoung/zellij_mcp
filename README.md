@@ -23,7 +23,15 @@ Recent spawn hardening:
 
 - `zellij_spawn(wait_ready=true)` may return `status="busy"` when the pane is real but rendered-screen idle detection does not settle within the bounded wait window
 - the daemon now persists spawned handles before post-launch probing so a real launch is not lost just because follow-up readiness or capture work degrades
-- `spawn_target="new_tab"` now uses a direct `zellij run` + post-list resolution path because the older fresh-tab RPC handoff could stall after the pane was already created
+- default interactive `spawn_target="new_tab"` now binds the new tab's default terminal pane instead of implicitly creating a second shell pane
+- default planner behavior prefers reusing the obvious single shell-like terminal pane in a requested tab and now rejects ambiguous multi-pane tabs instead of silently picking one
+
+Wrapped command presentation:
+
+- fish-backed wrapped submit flows now use a clean `__zellij_mcp_run_b64 <interaction-id> <payload>` entrypoint instead of printing the full inline interaction script into the pane
+- the canonical fish wrapper implementation lives at `scripts/__zellij_mcp_run_b64.fish`
+- the wrapper supports `-p` preview mode so users can inspect the decoded command without executing it
+- if that clean fish wrapper entrypoint is unavailable in the target shell, the daemon falls back to the legacy inline wrapper so the command still runs
 
 ## Requirements
 

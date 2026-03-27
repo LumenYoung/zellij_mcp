@@ -2,6 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use crate::adapters::zjctl::{
     AdapterError, BackendAdapter, is_missing_plugin_message, is_plugin_permission_prompt,
     is_protocol_version_mismatch_message, is_rpc_not_ready_message, missing_binary_name,
@@ -371,6 +372,9 @@ where
             }
             AdapterError::ParseError(message) => {
                 DomainError::new(ErrorCode::InvalidArgument, message, false)
+            }
+            AdapterError::AmbiguousTarget(message) => {
+                DomainError::new(ErrorCode::SelectorNotUnique, message, false)
             }
             AdapterError::Timeout => {
                 DomainError::new(ErrorCode::WaitTimeout, error.to_string(), true)
@@ -991,6 +995,10 @@ where
         "__ZELLIJ_MCP_INTERACTION__"
     }
 
+    fn clean_fish_wrapper_entrypoint() -> &'static str {
+        "__zellij_mcp_run_b64"
+    }
+
     fn next_interaction_id() -> String {
         format!("zi_{}", uuid::Uuid::new_v4().simple())
     }
@@ -1012,15 +1020,18 @@ where
         )
     }
 
-    fn build_wrapped_submit_payload(
-        binding: &TerminalBinding,
+    fn encode_wrapped_command_payload(text: &str) -> String {
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(text.as_bytes())
+    }
+
+    fn build_inline_wrapped_submit_payload(
+        shell: &str,
         text: &str,
         interaction_id: &str,
     ) -> Option<String> {
-        let shell = Self::shell_name(binding.launch_command.as_deref())?;
         let marker = Self::explicit_interaction_marker_prefix();
 
-        match shell.as_str() {
+        match shell {
             "sh" | "bash" | "zsh" => Some(format!(
                 "printf '{marker}:start:{id}\\n'; {text}; __zellij_mcp_status=$?; printf '\\n{marker}:end:{id}:%s\\n' \"$__zellij_mcp_status\"",
                 marker = marker,
@@ -1032,6 +1043,33 @@ where
                 marker = marker,
                 id = interaction_id,
                 text = text,
+            )),
+            _ => None,
+        }
+    }
+
+    fn missing_clean_fish_wrapper(snapshot: &crate::adapters::zjctl::CaptureSnapshot) -> bool {
+        let content = snapshot.content.as_str();
+        content.contains("Unknown command: __zellij_mcp_run_b64")
+            || content.contains("command not found: __zellij_mcp_run_b64")
+    }
+
+    fn build_wrapped_submit_payload(
+        binding: &TerminalBinding,
+        text: &str,
+        interaction_id: &str,
+    ) -> Option<String> {
+        let shell = Self::shell_name(binding.launch_command.as_deref())?;
+
+        match shell.as_str() {
+            "sh" | "bash" | "zsh" => {
+                Self::build_inline_wrapped_submit_payload(shell.as_str(), text, interaction_id)
+            }
+            "fish" => Some(format!(
+                "{entrypoint} {id} {payload}",
+                entrypoint = Self::clean_fish_wrapper_entrypoint(),
+                id = interaction_id,
+                payload = Self::encode_wrapped_command_payload(text),
             )),
             _ => None,
         }
@@ -1876,6 +1914,39 @@ where
                     .send_input(&binding.session_name, &binding.selector, &payload, submit)
             },
         )?;
+
+        if let Some(interaction_id) = interaction_id.as_deref()
+            && Self::shell_name(binding.launch_command.as_deref()).as_deref() == Some("fish")
+            && let Some(fallback_payload) = Self::build_inline_wrapped_submit_payload(
+                "fish",
+                &request.text,
+                interaction_id,
+            )
+        {
+            std::thread::sleep(Duration::from_millis(75));
+            if let Ok(snapshot) = self.run_binding_operation_with_retry(
+                &request.handle,
+                &binding,
+                ErrorCode::CaptureFailed,
+                |binding| self.adapter.capture_full(&binding.session_name, &binding.selector),
+            )
+                && Self::missing_clean_fish_wrapper(&snapshot)
+            {
+                self.run_binding_operation_with_retry(
+                    &request.handle,
+                    &binding,
+                    ErrorCode::SendFailed,
+                    |binding| {
+                        self.adapter.send_input(
+                            &binding.session_name,
+                            &binding.selector,
+                            &fallback_payload,
+                            submit,
+                        )
+                    },
+                )?;
+            }
+        }
 
         if let Some(interaction_id) = interaction_id {
             let mut observations = self.read_observations()?;
@@ -4266,10 +4337,12 @@ mod tests {
         assert!(
             sent[0]
                 .0
-                .starts_with("\u{15}printf '__ZELLIJ_MCP_INTERACTION__:start:")
+                .starts_with(&format!(
+                    "\u{15}{} zi_",
+                    TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint()
+                ))
         );
-        assert!(sent[0].0.contains("echo ok"));
-        assert!(sent[0].0.contains("__ZELLIJ_MCP_INTERACTION__:end:"));
+        assert!(sent[0].0.contains(&TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo ok")));
         assert!(sent[0].1);
     }
 
@@ -4341,10 +4414,11 @@ mod tests {
         assert!(
             sent[0]
                 .0
-                .starts_with("\u{15}printf '__ZELLIJ_MCP_INTERACTION__:start:")
+                .starts_with(&format!(
+                    "\u{15}{} zi_",
+                    TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint()
+                ))
         );
-        assert!(sent[0].0.contains("echo hello"));
-        assert!(sent[0].0.contains("__ZELLIJ_MCP_INTERACTION__:end:"));
         assert!(sent[0].1);
 
         let observations = service
@@ -4385,10 +4459,11 @@ mod tests {
         assert!(
             sent[0]
                 .0
-                .starts_with("printf '__ZELLIJ_MCP_INTERACTION__:start:")
+                .starts_with(&format!(
+                    "{} zi_",
+                    TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint()
+                ))
         );
-        assert!(sent[0].0.contains("echo hello"));
-        assert!(sent[0].0.contains("__ZELLIJ_MCP_INTERACTION__:end:"));
         assert!(sent[0].1);
     }
 
@@ -4417,8 +4492,100 @@ mod tests {
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].0.starts_with("printf '__ZELLIJ_MCP_INTERACTION__:start:"));
+        assert!(sent[0].0.starts_with(&format!(
+            "{} zi_",
+            TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint()
+        )));
         assert!(sent[0].1);
+    }
+
+    #[test]
+    fn fish_wrapped_submit_payload_uses_clean_entrypoint() {
+        let binding = TerminalBinding {
+            handle: "zh_test".to_string(),
+            target_id: "local".to_string(),
+            alias: None,
+            session_name: "gpu".to_string(),
+            tab_name: Some("test".to_string()),
+            selector: "id:terminal:1".to_string(),
+            pane_id: Some("terminal:1".to_string()),
+            cwd: None,
+            launch_command: Some("fish".to_string()),
+            source: BindingSource::Attached,
+            status: TerminalStatus::Ready,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let payload = TerminalService::<MockAdapter>::build_wrapped_submit_payload(
+            &binding,
+            "docker ps | grep docling",
+            "zi_test",
+        )
+        .expect("fish payload should exist");
+
+        assert!(payload.starts_with("__zellij_mcp_run_b64 zi_test "));
+        assert!(!payload.contains("printf '__ZELLIJ_MCP_INTERACTION__"));
+    }
+
+    #[test]
+    fn fish_send_falls_back_to_inline_wrapper_when_clean_entrypoint_is_unavailable() {
+        let adapter = MockAdapter::capture_sequence(&[
+            "ready",
+            "fish: Unknown command: __zellij_mcp_run_b64",
+        ]);
+        let sent_inputs = adapter.sent_inputs.clone();
+        let service = make_service(adapter);
+        let spawn = service
+            .spawn(SpawnRequest {
+                target: None,
+                session_name: "gpu".to_string(),
+                spawn_target: SpawnTarget::ExistingTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: None,
+                wait_ready: false,
+            })
+            .expect("spawn should succeed");
+
+        service
+            .send(SendRequest {
+                target: None,
+                handle: spawn.handle,
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "echo fallback".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: true,
+            })
+            .expect("send should fall back and succeed");
+
+        let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].0.starts_with(&format!(
+            "{} zi_",
+            TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint()
+        )));
+        assert!(sent[1]
+            .0
+            .starts_with("printf '__ZELLIJ_MCP_INTERACTION__:start:"));
+        assert!(sent[1].0.contains("echo fallback"));
+        assert!(sent[1].0.contains("__ZELLIJ_MCP_INTERACTION__:end:"));
+    }
+
+    #[test]
+    fn adapter_ambiguity_maps_to_selector_not_unique() {
+        let service = make_service(MockAdapter::single_capture("ready"));
+        let error = service.map_adapter_error(
+            AdapterError::AmbiguousTarget("multiple panes".to_string()),
+            ErrorCode::SpawnFailed,
+        );
+
+        assert_eq!(error.code, ErrorCode::SelectorNotUnique);
     }
 
     #[test]
@@ -5247,10 +5414,12 @@ mod tests {
         assert!(
             sent[0]
                 .0
-                .starts_with("printf '__ZELLIJ_MCP_INTERACTION__:start:")
+                .starts_with(&format!(
+                    "{} zi_",
+                    TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint()
+                ))
         );
-        assert!(sent[0].0.contains("echo retry"));
-        assert!(sent[0].0.contains("__ZELLIJ_MCP_INTERACTION__:end:"));
+        assert!(sent[0].0.contains(&TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo retry")));
     }
 
     #[test]
@@ -5285,9 +5454,12 @@ mod tests {
         assert!(
             sent[1]
                 .0
-                .starts_with("\u{15}printf '__ZELLIJ_MCP_INTERACTION__:start:")
+                .starts_with(&format!(
+                    "\u{15}{} zi_",
+                    TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint()
+                ))
         );
-        assert!(sent[1].0.contains("echo swapped"));
+        assert!(sent[1].0.contains(&TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo swapped")));
     }
 
     #[test]
