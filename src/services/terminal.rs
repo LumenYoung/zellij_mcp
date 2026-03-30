@@ -1,5 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -999,6 +1000,14 @@ where
         "__zellij_mcp_run_b64"
     }
 
+    fn clean_fish_wrapper_hash_flag() -> &'static str {
+        "--hash"
+    }
+
+    fn clean_fish_wrapper_hash_placeholder() -> &'static str {
+        "__ZELLIJ_MCP_CANONICAL_HASH__"
+    }
+
     fn next_interaction_id() -> String {
         format!("zi_{}", uuid::Uuid::new_v4().simple())
     }
@@ -1021,7 +1030,57 @@ where
     }
 
     fn encode_wrapped_command_payload(text: &str) -> String {
-        base64::engine::general_purpose::STANDARD_NO_PAD.encode(text.as_bytes())
+        base64::engine::general_purpose::STANDARD.encode(text.as_bytes())
+    }
+
+    fn stable_wrapper_hash(content: &str) -> String {
+        const OFFSET: u64 = 0xcbf29ce484222325;
+        const PRIME: u64 = 0x100000001b3;
+
+        let mut hash = OFFSET;
+        for byte in content.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        format!("{:016x}", hash)
+    }
+
+    fn canonical_fish_wrapper_template() -> &'static str {
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/__zellij_mcp_run_b64.fish"
+        ))
+    }
+
+    fn canonical_fish_wrapper_hash() -> &'static str {
+        static HASH: OnceLock<String> = OnceLock::new();
+        HASH.get_or_init(|| Self::stable_wrapper_hash(Self::canonical_fish_wrapper_template()))
+            .as_str()
+    }
+
+    fn canonical_fish_wrapper_source() -> &'static str {
+        static SOURCE: OnceLock<String> = OnceLock::new();
+        SOURCE
+            .get_or_init(|| {
+                Self::canonical_fish_wrapper_template().replace(
+                    Self::clean_fish_wrapper_hash_placeholder(),
+                    Self::canonical_fish_wrapper_hash(),
+                )
+            })
+            .as_str()
+    }
+
+    fn encode_canonical_fish_wrapper_source() -> String {
+        base64::engine::general_purpose::STANDARD
+            .encode(Self::canonical_fish_wrapper_source().as_bytes())
+    }
+
+    fn observation_has_validated_fish_wrapper(
+        observation: Option<&crate::domain::observation::TerminalObservation>,
+    ) -> bool {
+        observation
+            .and_then(|item| item.validated_wrapper_hash.as_deref())
+            == Some(Self::canonical_fish_wrapper_hash())
     }
 
     fn build_inline_wrapped_submit_payload(
@@ -1054,10 +1113,32 @@ where
             || content.contains("command not found: __zellij_mcp_run_b64")
     }
 
+    fn build_clean_fish_wrapper_payload(text: &str, interaction_id: &str) -> String {
+        format!(
+            "{entrypoint} {id} {payload}",
+            entrypoint = Self::clean_fish_wrapper_entrypoint(),
+            id = interaction_id,
+            payload = Self::encode_wrapped_command_payload(text),
+        )
+    }
+
+    fn build_fish_wrapper_bootstrap_payload(text: &str, interaction_id: &str) -> String {
+        format!(
+            "set -l __zellij_mcp_expected_hash '{expected_hash}'; set -l __zellij_mcp_current_hash ''; if functions -q {entrypoint}; set __zellij_mcp_current_hash ({entrypoint} {hash_flag} 2>/dev/null); end; if test \"$__zellij_mcp_current_hash\" != \"$__zellij_mcp_expected_hash\"; printf '%s' '{wrapper_source}' | base64 --decode | source; end; {entrypoint} {id} {payload}",
+            expected_hash = Self::canonical_fish_wrapper_hash(),
+            entrypoint = Self::clean_fish_wrapper_entrypoint(),
+            hash_flag = Self::clean_fish_wrapper_hash_flag(),
+            wrapper_source = Self::encode_canonical_fish_wrapper_source(),
+            id = interaction_id,
+            payload = Self::encode_wrapped_command_payload(text),
+        )
+    }
+
     fn build_wrapped_submit_payload(
         binding: &TerminalBinding,
         text: &str,
         interaction_id: &str,
+        canonical_wrapper_validated: bool,
     ) -> Option<String> {
         let shell = Self::shell_name(binding.launch_command.as_deref())?;
 
@@ -1065,12 +1146,11 @@ where
             "sh" | "bash" | "zsh" => {
                 Self::build_inline_wrapped_submit_payload(shell.as_str(), text, interaction_id)
             }
-            "fish" => Some(format!(
-                "{entrypoint} {id} {payload}",
-                entrypoint = Self::clean_fish_wrapper_entrypoint(),
-                id = interaction_id,
-                payload = Self::encode_wrapped_command_payload(text),
-            )),
+            "fish" => Some(if canonical_wrapper_validated {
+                Self::build_clean_fish_wrapper_payload(text, interaction_id)
+            } else {
+                Self::build_fish_wrapper_bootstrap_payload(text, interaction_id)
+            }),
             _ => None,
         }
     }
@@ -1881,6 +1961,11 @@ where
         }
 
         let (mut payload, submit) = Self::build_send_payload(&request, send_mode)?;
+        let mut observations = self.read_observations()?;
+        let observation_index = Self::ensure_observation_slot(&mut observations, &request.handle);
+        let canonical_wrapper_validated = Self::observation_has_validated_fish_wrapper(
+            observations.get(observation_index),
+        );
         let interaction_id = if matches!(
             send_mode,
             ResolvedSendMode::Legacy | ResolvedSendMode::SubmitLine
@@ -1895,7 +1980,12 @@ where
 
         if let Some(interaction_id) = interaction_id.as_deref()
             && let Some(wrapped) =
-                Self::build_wrapped_submit_payload(&binding, &request.text, interaction_id)
+                Self::build_wrapped_submit_payload(
+                    &binding,
+                    &request.text,
+                    interaction_id,
+                    canonical_wrapper_validated,
+                )
         {
             payload = wrapped;
         }
@@ -1915,6 +2005,8 @@ where
             },
         )?;
 
+        let mut wrapper_fallback_triggered = false;
+
         if let Some(interaction_id) = interaction_id.as_deref()
             && Self::shell_name(binding.launch_command.as_deref()).as_deref() == Some("fish")
             && let Some(fallback_payload) = Self::build_inline_wrapped_submit_payload(
@@ -1932,6 +2024,7 @@ where
             )
                 && Self::missing_clean_fish_wrapper(&snapshot)
             {
+                wrapper_fallback_triggered = true;
                 self.run_binding_operation_with_retry(
                     &request.handle,
                     &binding,
@@ -1948,13 +2041,23 @@ where
             }
         }
 
-        if let Some(interaction_id) = interaction_id {
-            let mut observations = self.read_observations()?;
-            let index = Self::ensure_observation_slot(&mut observations, &request.handle);
-            let observation = &mut observations[index];
-            observation.start_interaction(interaction_id, Utc::now());
-            self.write_observations(&observations)?;
+        let observation = &mut observations[observation_index];
+        if Self::shell_name(binding.launch_command.as_deref()).as_deref() == Some("fish")
+            && request.keys.is_empty()
+            && !request.text.is_empty()
+            && Self::supports_explicit_interaction_markers(&binding)
+        {
+            if wrapper_fallback_triggered {
+                observation.clear_wrapper_hash();
+            } else {
+                observation.remember_wrapper_hash(Self::canonical_fish_wrapper_hash().to_string());
+            }
         }
+
+        if let Some(interaction_id) = interaction_id {
+            observation.start_interaction(interaction_id, Utc::now());
+        }
+        self.write_observations(&observations)?;
 
         if matches!(send_mode, ResolvedSendMode::SubmitLine)
             || (matches!(send_mode, ResolvedSendMode::Legacy)
@@ -4337,11 +4440,9 @@ mod tests {
         assert!(
             sent[0]
                 .0
-                .starts_with(&format!(
-                    "\u{15}{} zi_",
-                    TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint()
-                ))
+                .starts_with("\u{15}set -l __zellij_mcp_expected_hash '")
         );
+        assert!(sent[0].0.contains("functions -q __zellij_mcp_run_b64"));
         assert!(sent[0].0.contains(&TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo ok")));
         assert!(sent[0].1);
     }
@@ -4414,11 +4515,9 @@ mod tests {
         assert!(
             sent[0]
                 .0
-                .starts_with(&format!(
-                    "\u{15}{} zi_",
-                    TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint()
-                ))
+                .starts_with("\u{15}set -l __zellij_mcp_expected_hash '")
         );
+        assert!(sent[0].0.contains("functions -q __zellij_mcp_run_b64"));
         assert!(sent[0].1);
 
         let observations = service
@@ -4456,14 +4555,8 @@ mod tests {
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
         assert_eq!(sent.len(), 1);
-        assert!(
-            sent[0]
-                .0
-                .starts_with(&format!(
-                    "{} zi_",
-                    TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint()
-                ))
-        );
+        assert!(sent[0].0.starts_with("set -l __zellij_mcp_expected_hash '"));
+        assert!(sent[0].0.contains("functions -q __zellij_mcp_run_b64"));
         assert!(sent[0].1);
     }
 
@@ -4492,10 +4585,8 @@ mod tests {
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].0.starts_with(&format!(
-            "{} zi_",
-            TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint()
-        )));
+        assert!(sent[0].0.starts_with("set -l __zellij_mcp_expected_hash '"));
+        assert!(sent[0].0.contains("functions -q __zellij_mcp_run_b64"));
         assert!(sent[0].1);
     }
 
@@ -4521,11 +4612,206 @@ mod tests {
             &binding,
             "docker ps | grep docling",
             "zi_test",
+            true,
         )
         .expect("fish payload should exist");
 
         assert!(payload.starts_with("__zellij_mcp_run_b64 zi_test "));
         assert!(!payload.contains("printf '__ZELLIJ_MCP_INTERACTION__"));
+    }
+
+    #[test]
+    fn canonical_fish_wrapper_source_renders_runtime_hash() {
+        let source = TerminalService::<MockAdapter>::canonical_fish_wrapper_source();
+        assert!(source.contains(TerminalService::<MockAdapter>::canonical_fish_wrapper_hash()));
+        assert!(!source.contains(TerminalService::<MockAdapter>::clean_fish_wrapper_hash_placeholder()));
+    }
+
+    #[test]
+    fn canonical_fish_wrapper_hash_matches_template_identity() {
+        assert_eq!(
+            TerminalService::<MockAdapter>::canonical_fish_wrapper_hash(),
+            TerminalService::<MockAdapter>::stable_wrapper_hash(
+                TerminalService::<MockAdapter>::canonical_fish_wrapper_template(),
+            )
+        );
+    }
+
+    #[test]
+    fn wrapped_command_payload_uses_standard_padded_base64() {
+        assert_eq!(
+            TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo hello world"),
+            "ZWNobyBoZWxsbyB3b3JsZA=="
+        );
+    }
+
+    #[test]
+    fn fish_wrapped_submit_payload_bootstraps_when_wrapper_not_validated() {
+        let binding = TerminalBinding {
+            handle: "zh_test".to_string(),
+            target_id: "local".to_string(),
+            alias: None,
+            session_name: "gpu".to_string(),
+            tab_name: Some("test".to_string()),
+            selector: "id:terminal:1".to_string(),
+            pane_id: Some("terminal:1".to_string()),
+            cwd: None,
+            launch_command: Some("fish".to_string()),
+            source: BindingSource::Attached,
+            status: TerminalStatus::Ready,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let payload = TerminalService::<MockAdapter>::build_wrapped_submit_payload(
+            &binding,
+            "echo bootstrap",
+            "zi_test",
+            false,
+        )
+        .expect("fish payload should exist");
+
+        assert!(payload.contains("functions -q __zellij_mcp_run_b64"));
+        assert!(payload.contains(TerminalService::<MockAdapter>::clean_fish_wrapper_hash_flag()));
+        assert!(payload.contains(TerminalService::<MockAdapter>::canonical_fish_wrapper_hash()));
+        assert!(payload.ends_with(&format!(
+            "__zellij_mcp_run_b64 zi_test {}",
+            TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo bootstrap")
+        )));
+    }
+
+    #[test]
+    fn fish_wrapped_submit_payload_reuses_validated_wrapper_without_bootstrap() {
+        let binding = TerminalBinding {
+            handle: "zh_test".to_string(),
+            target_id: "local".to_string(),
+            alias: None,
+            session_name: "gpu".to_string(),
+            tab_name: Some("test".to_string()),
+            selector: "id:terminal:1".to_string(),
+            pane_id: Some("terminal:1".to_string()),
+            cwd: None,
+            launch_command: Some("fish".to_string()),
+            source: BindingSource::Attached,
+            status: TerminalStatus::Ready,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let payload = TerminalService::<MockAdapter>::build_wrapped_submit_payload(
+            &binding,
+            "echo direct",
+            "zi_test",
+            true,
+        )
+        .expect("fish payload should exist");
+
+        assert_eq!(
+            payload,
+            TerminalService::<MockAdapter>::build_clean_fish_wrapper_payload("echo direct", "zi_test")
+        );
+    }
+
+    #[test]
+    fn fish_send_remembers_wrapper_hash_after_bootstrap_send() {
+        let adapter = MockAdapter::capture_sequence(&["ready"]);
+        let service = make_service(adapter);
+        let spawn = service
+            .spawn(SpawnRequest {
+                target: None,
+                session_name: "gpu".to_string(),
+                spawn_target: SpawnTarget::ExistingTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: None,
+                wait_ready: false,
+            })
+            .expect("spawn should succeed");
+
+        service
+            .send(SendRequest {
+                target: None,
+                handle: spawn.handle.clone(),
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "echo bootstrap".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: true,
+            })
+            .expect("send should succeed");
+
+        let observations = service
+            .observation_store
+            .load()
+            .expect("observations should load");
+        let observation = observations
+            .iter()
+            .find(|item| item.handle == spawn.handle)
+            .expect("observation should exist");
+        assert_eq!(
+            observation.validated_wrapper_hash.as_deref(),
+            Some(TerminalService::<MockAdapter>::canonical_fish_wrapper_hash())
+        );
+    }
+
+    #[test]
+    fn fish_send_reuses_cached_wrapper_without_resending_bootstrap() {
+        let adapter = MockAdapter::capture_sequence(&["ready", "ready"]);
+        let sent_inputs = adapter.sent_inputs.clone();
+        let service = make_service(adapter);
+        let spawn = service
+            .spawn(SpawnRequest {
+                target: None,
+                session_name: "gpu".to_string(),
+                spawn_target: SpawnTarget::ExistingTab,
+                tab_name: Some("editor".to_string()),
+                cwd: None,
+                command: Some("fish".to_string()),
+                argv: None,
+                title: None,
+                wait_ready: false,
+            })
+            .expect("spawn should succeed");
+
+        service
+            .send(SendRequest {
+                target: None,
+                handle: spawn.handle.clone(),
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "echo first".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: true,
+            })
+            .expect("first send should succeed");
+        service
+            .send(SendRequest {
+                target: None,
+                handle: spawn.handle,
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "echo second".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: true,
+            })
+            .expect("second send should succeed");
+
+        let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].0.contains("functions -q __zellij_mcp_run_b64"));
+        assert!(!sent[1].0.contains("functions -q __zellij_mcp_run_b64"));
+        assert!(sent[1]
+            .0
+            .starts_with(&format!("{} zi_", TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint())));
+        assert!(sent[1].0.contains(&TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo second")));
     }
 
     #[test]
@@ -4566,10 +4852,7 @@ mod tests {
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
         assert_eq!(sent.len(), 2);
-        assert!(sent[0].0.starts_with(&format!(
-            "{} zi_",
-            TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint()
-        )));
+        assert!(sent[0].0.contains("functions -q __zellij_mcp_run_b64"));
         assert!(sent[1]
             .0
             .starts_with("printf '__ZELLIJ_MCP_INTERACTION__:start:"));
@@ -5411,14 +5694,8 @@ mod tests {
         assert!(response.accepted);
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
         assert_eq!(sent.len(), 1);
-        assert!(
-            sent[0]
-                .0
-                .starts_with(&format!(
-                    "{} zi_",
-                    TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint()
-                ))
-        );
+        assert!(sent[0].0.starts_with("set -l __zellij_mcp_expected_hash '"));
+        assert!(sent[0].0.contains("functions -q __zellij_mcp_run_b64"));
         assert!(sent[0].0.contains(&TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo retry")));
     }
 
@@ -5451,14 +5728,8 @@ mod tests {
         assert!(response.interaction_id.is_some());
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[0].0, "\u{3}");
-        assert!(
-            sent[1]
-                .0
-                .starts_with(&format!(
-                    "\u{15}{} zi_",
-                    TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint()
-                ))
-        );
+        assert!(sent[1].0.starts_with("\u{15}set -l __zellij_mcp_expected_hash '"));
+        assert!(sent[1].0.contains("functions -q __zellij_mcp_run_b64"));
         assert!(sent[1].0.contains(&TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo swapped")));
     }
 

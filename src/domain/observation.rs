@@ -17,6 +17,8 @@ pub struct TerminalObservation {
     pub interaction_completed_at: Option<DateTime<Utc>>,
     pub interaction_exit_code: Option<i32>,
     #[serde(default)]
+    pub validated_wrapper_hash: Option<String>,
+    #[serde(default)]
     pub spawn_before_pane_ids: Vec<String>,
     pub spawn_target: Option<SpawnTarget>,
     pub spawn_tab_name: Option<String>,
@@ -74,6 +76,14 @@ impl TerminalObservation {
         self.interaction_started_at = None;
         self.interaction_completed_at = None;
         self.interaction_exit_code = None;
+    }
+
+    pub fn remember_wrapper_hash(&mut self, hash: String) {
+        self.validated_wrapper_hash = Some(hash);
+    }
+
+    pub fn clear_wrapper_hash(&mut self) {
+        self.validated_wrapper_hash = None;
     }
 
     pub fn set_spawn_hints(

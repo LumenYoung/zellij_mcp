@@ -1,8 +1,14 @@
 function __zellij_mcp_run_b64
     set -l preview 0
-    if test (count $argv) -gt 0; and test "$argv[1]" = "-p"
-        set preview 1
-        set -e argv[1]
+    if test (count $argv) -gt 0
+        switch "$argv[1]"
+            case '--hash'
+                printf '%s\n' '__ZELLIJ_MCP_CANONICAL_HASH__'
+                return 0
+            case '-p'
+                set preview 1
+                set -e argv[1]
+        end
     end
 
     if test (count $argv) -lt 2
