@@ -220,8 +220,10 @@ Location-intent input:
 Notes:
 
 - handle-based submit flows on fish panes now use a clean wrapper entrypoint (`__zellij_mcp_run_b64`) for complex commands instead of exposing the full inline interaction script in the pane
-- the canonical fish wrapper script supports `-p` preview mode and lives at `scripts/__zellij_mcp_run_b64.fish`
-- when the clean fish wrapper entrypoint is unavailable in the target shell, the daemon retries once with the legacy inline wrapper so the command still executes
+- the daemon embeds the canonical fish wrapper source into the binary, validates any existing fish definition via the wrapper hash contract, and lazily bootstraps the wrapper into a pane only when it is missing or stale
+- the repo copy at `scripts/__zellij_mcp_run_b64.fish` remains the source artifact for the wrapper contract and still supports `-p` preview mode
+- once a pane has the canonical wrapper loaded, repeated wrapped commands reuse it without resending the definition on every command
+- when wrapper validation, bootstrap, or clean invocation fails at runtime, the daemon retries once with the legacy inline wrapper so the command still executes
 
 - `zellij_send` accepts exactly one targeting mode: either `handle`, or location intent via `session_name` + `selector`
 - when `handle` is omitted, `session_name` and `selector` are required, `tab_name` is optional narrowing context, and `target` may be used to select a local or SSH backend directly

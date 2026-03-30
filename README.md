@@ -28,10 +28,10 @@ Recent spawn hardening:
 
 Wrapped command presentation:
 
-- fish-backed wrapped submit flows now use a clean `__zellij_mcp_run_b64 <interaction-id> <payload>` entrypoint instead of printing the full inline interaction script into the pane
-- the canonical fish wrapper implementation lives at `scripts/__zellij_mcp_run_b64.fish`
-- the wrapper supports `-p` preview mode so users can inspect the decoded command without executing it
-- if that clean fish wrapper entrypoint is unavailable in the target shell, the daemon falls back to the legacy inline wrapper so the command still runs
+- fish-backed wrapped submit flows use a clean `__zellij_mcp_run_b64 <interaction-id> <payload>` entrypoint instead of printing the full inline interaction script into the pane
+- the daemon embeds the canonical fish wrapper implementation into the binary and lazily bootstraps it into fish panes when needed, so runtime does not depend on the repo checkout or dotfiles being present
+- `scripts/__zellij_mcp_run_b64.fish` remains the repo-owned source artifact for the wrapper contract and still supports `-p` preview mode so users can inspect the decoded command without executing it
+- if wrapper validation, bootstrap, or clean invocation still fails at runtime, the daemon falls back to the legacy inline wrapper so the command still runs
 
 ## Requirements
 
