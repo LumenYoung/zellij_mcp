@@ -3,8 +3,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use zellij_mcp::adapters::zjctl::{
-    LocalBackend, SshBackend, SshTargetConfig, missing_binary_name,
-    resolve_ssh_runtime_config,
+    LocalBackend, SshBackend, SshTargetConfig, missing_binary_name, resolve_ssh_runtime_config,
 };
 use zellij_mcp::domain::errors::DomainError;
 use zellij_mcp::persistence::{ObservationStore, RegistryStore};

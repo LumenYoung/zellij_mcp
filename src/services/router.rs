@@ -152,7 +152,8 @@ impl TerminalManager for TargetRouter {
 
     fn send(&self, request: SendRequest) -> Result<SendResponse, DomainError> {
         if request.handle.trim().is_empty() {
-            self.backend_for_target(request.target.as_deref())?.send(request)
+            self.backend_for_target(request.target.as_deref())?
+                .send(request)
         } else {
             self.backend_for_handle(&request.handle)?.send(request)
         }
@@ -632,7 +633,17 @@ mod tests {
             })
             .expect("capture should route by binding target");
         router
-            .send(SendRequest { target: None, handle: "zh_send".to_string(), session_name: None, tab_name: None, selector: None, text: "printf 'ok'".to_string(), keys: Vec::new(), input_mode: None, submit: true })
+            .send(SendRequest {
+                target: None,
+                handle: "zh_send".to_string(),
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "printf 'ok'".to_string(),
+                keys: Vec::new(),
+                input_mode: None,
+                submit: true,
+            })
             .expect("send should route by binding target");
         router
             .wait(WaitRequest {
@@ -688,7 +699,12 @@ mod tests {
             })
             .expect("intent send should route by target selection");
 
-        assert!(local_calls.lock().expect("calls lock should succeed").is_empty());
+        assert!(
+            local_calls
+                .lock()
+                .expect("calls lock should succeed")
+                .is_empty()
+        );
         assert_eq!(
             *remote_calls.lock().expect("calls lock should succeed"),
             vec![Call::Send(String::new())]

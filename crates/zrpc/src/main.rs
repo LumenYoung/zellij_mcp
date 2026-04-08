@@ -7,7 +7,7 @@ Use: cargo build -p zjctl-zrpc --target wasm32-wasip1 --release"
 use std::collections::BTreeMap;
 use zellij_tile::prelude::*;
 use zjctl_proto::{
-    methods, PaneSelector, PaneType, RpcError, RpcErrorCode, RpcRequest, RpcResponse,
+    PaneSelector, PaneType, RpcError, RpcErrorCode, RpcRequest, RpcResponse, methods,
 };
 
 mod state;

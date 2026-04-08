@@ -58,8 +58,7 @@ pub const TOOL_DEFINITIONS: [ToolDefinition; 12] = [
     },
     ToolDefinition {
         name: "zellij_layout",
-        description:
-            "Inspect tabs and panes in a session on the local backend or selected SSH target.",
+        description: "Inspect tabs and panes in a session on the local backend or selected SSH target.",
     },
     ToolDefinition {
         name: "zellij_cleanup",

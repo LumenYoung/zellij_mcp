@@ -3,7 +3,6 @@ use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use base64::Engine;
 use crate::adapters::zjctl::{
     AdapterError, BackendAdapter, is_missing_plugin_message, is_plugin_permission_prompt,
     is_protocol_version_mismatch_message, is_rpc_not_ready_message, missing_binary_name,
@@ -11,6 +10,7 @@ use crate::adapters::zjctl::{
 use crate::domain::binding::TerminalBinding;
 use crate::domain::errors::{DomainError, ErrorCode};
 use crate::domain::observation::{CaptureResult, TerminalObservation};
+use base64::Engine;
 use chrono::Utc;
 
 use crate::domain::requests::{
@@ -73,7 +73,10 @@ where
         request: &SendRequest,
     ) -> Result<Option<SendLocationIntent>, DomainError> {
         if !request.handle.trim().is_empty() {
-            if request.session_name.is_some() || request.tab_name.is_some() || request.selector.is_some() {
+            if request.session_name.is_some()
+                || request.tab_name.is_some()
+                || request.selector.is_some()
+            {
                 return Err(DomainError::new(
                     ErrorCode::InvalidArgument,
                     "send accepts either `handle` or location intent, not both".to_string(),
@@ -202,9 +205,11 @@ where
         binding: &TerminalBinding,
         target: &crate::adapters::zjctl::ResolvedTarget,
     ) -> bool {
-        binding.pane_id.as_deref().is_some_and(|pane_id| {
-            target.pane_id.as_deref() == Some(pane_id)
-        }) || Self::discover_matches_selector(&binding.selector, target)
+        binding
+            .pane_id
+            .as_deref()
+            .is_some_and(|pane_id| target.pane_id.as_deref() == Some(pane_id))
+            || Self::discover_matches_selector(&binding.selector, target)
     }
 
     fn verify_binding_closed(&self, binding: &TerminalBinding) -> Result<(), DomainError> {
@@ -395,7 +400,9 @@ where
             AdapterError::CommandFailed(message) if is_plugin_permission_prompt(&message) => {
                 DomainError::new(ErrorCode::PluginNotReady, message, false)
             }
-            AdapterError::CommandFailed(message) if is_protocol_version_mismatch_message(&message) => {
+            AdapterError::CommandFailed(message)
+                if is_protocol_version_mismatch_message(&message) =>
+            {
                 DomainError::new(ErrorCode::ProtocolVersionMismatch, message, false)
             }
             AdapterError::CommandFailed(message) if is_rpc_not_ready_message(&message) => {
@@ -825,10 +832,7 @@ where
         });
         self.write_observations(&observations)?;
 
-        let baseline_established = match self
-            .adapter
-            .capture_full(&session_name, &selector)
-        {
+        let baseline_established = match self.adapter.capture_full(&session_name, &selector) {
             Ok(snapshot) => {
                 let hash = Self::hash_content(&snapshot.content);
                 let mut observations = self.read_observations()?;
@@ -839,7 +843,8 @@ where
                 self.write_observations(&observations)?;
 
                 let mut bindings = self.read_bindings()?;
-                if let Some(binding) = bindings.iter_mut().find(|binding| binding.handle == handle) {
+                if let Some(binding) = bindings.iter_mut().find(|binding| binding.handle == handle)
+                {
                     binding.status = TerminalStatus::Ready;
                     binding.updated_at = snapshot.captured_at;
                 }
@@ -1078,8 +1083,7 @@ where
     fn observation_has_validated_fish_wrapper(
         observation: Option<&crate::domain::observation::TerminalObservation>,
     ) -> bool {
-        observation
-            .and_then(|item| item.validated_wrapper_hash.as_deref())
+        observation.and_then(|item| item.validated_wrapper_hash.as_deref())
             == Some(Self::canonical_fish_wrapper_hash())
     }
 
@@ -1963,9 +1967,8 @@ where
         let (mut payload, submit) = Self::build_send_payload(&request, send_mode)?;
         let mut observations = self.read_observations()?;
         let observation_index = Self::ensure_observation_slot(&mut observations, &request.handle);
-        let canonical_wrapper_validated = Self::observation_has_validated_fish_wrapper(
-            observations.get(observation_index),
-        );
+        let canonical_wrapper_validated =
+            Self::observation_has_validated_fish_wrapper(observations.get(observation_index));
         let interaction_id = if matches!(
             send_mode,
             ResolvedSendMode::Legacy | ResolvedSendMode::SubmitLine
@@ -1979,13 +1982,12 @@ where
         };
 
         if let Some(interaction_id) = interaction_id.as_deref()
-            && let Some(wrapped) =
-                Self::build_wrapped_submit_payload(
-                    &binding,
-                    &request.text,
-                    interaction_id,
-                    canonical_wrapper_validated,
-                )
+            && let Some(wrapped) = Self::build_wrapped_submit_payload(
+                &binding,
+                &request.text,
+                interaction_id,
+                canonical_wrapper_validated,
+            )
         {
             payload = wrapped;
         }
@@ -2009,20 +2011,19 @@ where
 
         if let Some(interaction_id) = interaction_id.as_deref()
             && Self::shell_name(binding.launch_command.as_deref()).as_deref() == Some("fish")
-            && let Some(fallback_payload) = Self::build_inline_wrapped_submit_payload(
-                "fish",
-                &request.text,
-                interaction_id,
-            )
+            && let Some(fallback_payload) =
+                Self::build_inline_wrapped_submit_payload("fish", &request.text, interaction_id)
         {
             std::thread::sleep(Duration::from_millis(75));
             if let Ok(snapshot) = self.run_binding_operation_with_retry(
                 &request.handle,
                 &binding,
                 ErrorCode::CaptureFailed,
-                |binding| self.adapter.capture_full(&binding.session_name, &binding.selector),
-            )
-                && Self::missing_clean_fish_wrapper(&snapshot)
+                |binding| {
+                    self.adapter
+                        .capture_full(&binding.session_name, &binding.selector)
+                },
+            ) && Self::missing_clean_fish_wrapper(&snapshot)
             {
                 wrapper_fallback_triggered = true;
                 self.run_binding_operation_with_retry(
@@ -2614,7 +2615,10 @@ mod tests {
             Ok(self.target.clone())
         }
 
-        fn launch_spawn(&self, request: &SpawnRequest) -> Result<Option<ResolvedTarget>, AdapterError> {
+        fn launch_spawn(
+            &self,
+            request: &SpawnRequest,
+        ) -> Result<Option<ResolvedTarget>, AdapterError> {
             if self.detached_launch {
                 let _ = request;
                 Ok(None)
@@ -2933,7 +2937,10 @@ mod tests {
                 focused: false,
             },
         ];
-        let service = make_service(MockAdapter::with_targets_and_captures(targets, vec!["baseline"]));
+        let service = make_service(MockAdapter::with_targets_and_captures(
+            targets,
+            vec!["baseline"],
+        ));
 
         let response = service
             .attach(AttachRequest {
@@ -2982,7 +2989,10 @@ mod tests {
                 focused: false,
             },
         ];
-        let service = make_service(MockAdapter::with_targets_and_captures(targets, vec!["baseline"]));
+        let service = make_service(MockAdapter::with_targets_and_captures(
+            targets,
+            vec!["baseline"],
+        ));
 
         let response = service
             .attach(AttachRequest {
@@ -3021,7 +3031,10 @@ mod tests {
                 focused: false,
             },
         ];
-        let service = make_service(MockAdapter::with_targets_and_captures(targets, vec!["baseline"]));
+        let service = make_service(MockAdapter::with_targets_and_captures(
+            targets,
+            vec!["baseline"],
+        ));
 
         let response = service
             .attach(AttachRequest {
@@ -3061,7 +3074,10 @@ mod tests {
                 focused: false,
             },
         ];
-        let service = make_service(MockAdapter::with_targets_and_captures(targets, vec!["baseline"]));
+        let service = make_service(MockAdapter::with_targets_and_captures(
+            targets,
+            vec!["baseline"],
+        ));
 
         let error = service
             .attach(AttachRequest {
@@ -3133,7 +3149,10 @@ mod tests {
             .expect("observations should load");
 
         assert_eq!(bindings[0].status, TerminalStatus::Ready);
-        assert_eq!(observations[0].last_full_content.as_deref(), Some("recovered baseline"));
+        assert_eq!(
+            observations[0].last_full_content.as_deref(),
+            Some("recovered baseline")
+        );
     }
 
     #[test]
@@ -4001,7 +4020,17 @@ mod tests {
             .expect("attach should succeed");
 
         let response = service
-            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: "printf 'ok'".to_string(), keys: vec![], input_mode: None, submit: true })
+            .send(SendRequest {
+                target: None,
+                handle: attach.handle,
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "printf 'ok'".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: true,
+            })
             .expect("send should succeed");
 
         assert!(response.accepted);
@@ -4034,16 +4063,20 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, "printf 'ok'");
         assert!(sent[0].1);
-        assert!(service
-            .registry_store
-            .load()
-            .expect("bindings should load")
-            .is_empty());
-        assert!(service
-            .observation_store
-            .load()
-            .expect("observations should load")
-            .is_empty());
+        assert!(
+            service
+                .registry_store
+                .load()
+                .expect("bindings should load")
+                .is_empty()
+        );
+        assert!(
+            service
+                .observation_store
+                .load()
+                .expect("observations should load")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4164,7 +4197,10 @@ mod tests {
                 focused: true,
             },
         ];
-        let service = make_service(MockAdapter::with_targets_and_captures(targets, vec!["baseline"]));
+        let service = make_service(MockAdapter::with_targets_and_captures(
+            targets,
+            vec!["baseline"],
+        ));
 
         let error = service
             .send(SendRequest {
@@ -4259,7 +4295,10 @@ mod tests {
                 focused: false,
             },
         ];
-        let service = make_service(MockAdapter::with_targets_and_captures(targets, vec!["baseline"]));
+        let service = make_service(MockAdapter::with_targets_and_captures(
+            targets,
+            vec!["baseline"],
+        ));
 
         let error = service
             .send(SendRequest {
@@ -4295,7 +4334,17 @@ mod tests {
             .expect("attach should succeed");
 
         service
-            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: String::new(), keys: vec!["up".to_string(), "escape".to_string(), "tab".to_string()], input_mode: None, submit: false })
+            .send(SendRequest {
+                target: None,
+                handle: attach.handle,
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: String::new(),
+                keys: vec!["up".to_string(), "escape".to_string(), "tab".to_string()],
+                input_mode: None,
+                submit: false,
+            })
             .expect("send should succeed");
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
@@ -4319,13 +4368,23 @@ mod tests {
             .expect("attach should succeed");
 
         service
-            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: String::new(), keys: vec![
-                "home".to_string(),
-                "end".to_string(),
-                "page_up".to_string(),
-                "f5".to_string(),
-                "shift_tab".to_string(),
-            ], input_mode: Some(InputMode::Raw), submit: false })
+            .send(SendRequest {
+                target: None,
+                handle: attach.handle,
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: String::new(),
+                keys: vec![
+                    "home".to_string(),
+                    "end".to_string(),
+                    "page_up".to_string(),
+                    "f5".to_string(),
+                    "shift_tab".to_string(),
+                ],
+                input_mode: Some(InputMode::Raw),
+                submit: false,
+            })
             .expect("send should succeed");
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
@@ -4349,7 +4408,17 @@ mod tests {
             .expect("attach should succeed");
 
         service
-            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: String::new(), keys: vec!["ctrl_a".to_string(), "ctrl_z".to_string()], input_mode: Some(InputMode::Raw), submit: false })
+            .send(SendRequest {
+                target: None,
+                handle: attach.handle,
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: String::new(),
+                keys: vec!["ctrl_a".to_string(), "ctrl_z".to_string()],
+                input_mode: Some(InputMode::Raw),
+                submit: false,
+            })
             .expect("send should succeed");
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
@@ -4371,7 +4440,17 @@ mod tests {
             .expect("attach should succeed");
 
         let error = service
-            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: String::new(), keys: vec!["hyperjump".to_string()], input_mode: None, submit: false })
+            .send(SendRequest {
+                target: None,
+                handle: attach.handle,
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: String::new(),
+                keys: vec!["hyperjump".to_string()],
+                input_mode: None,
+                submit: false,
+            })
             .expect_err("unknown key should fail");
 
         assert_eq!(error.code, ErrorCode::InvalidArgument);
@@ -4391,7 +4470,17 @@ mod tests {
             .expect("attach should succeed");
 
         let error = service
-            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: "q".to_string(), keys: Vec::new(), input_mode: Some(InputMode::Raw), submit: true })
+            .send(SendRequest {
+                target: None,
+                handle: attach.handle,
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "q".to_string(),
+                keys: Vec::new(),
+                input_mode: Some(InputMode::Raw),
+                submit: true,
+            })
             .expect_err("raw mode should reject submit");
 
         assert_eq!(error.code, ErrorCode::InvalidArgument);
@@ -4411,7 +4500,17 @@ mod tests {
             .expect("attach should succeed");
 
         let error = service
-            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: "ls".to_string(), keys: vec!["enter".to_string()], input_mode: Some(InputMode::SubmitLine), submit: false })
+            .send(SendRequest {
+                target: None,
+                handle: attach.handle,
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "ls".to_string(),
+                keys: vec!["enter".to_string()],
+                input_mode: Some(InputMode::SubmitLine),
+                submit: false,
+            })
             .expect_err("submit_line mode should reject named keys");
 
         assert_eq!(error.code, ErrorCode::InvalidArgument);
@@ -4433,7 +4532,17 @@ mod tests {
             .expect("attach should succeed");
 
         service
-            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: "echo ok".to_string(), keys: Vec::new(), input_mode: Some(InputMode::SubmitLine), submit: false })
+            .send(SendRequest {
+                target: None,
+                handle: attach.handle,
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "echo ok".to_string(),
+                keys: Vec::new(),
+                input_mode: Some(InputMode::SubmitLine),
+                submit: false,
+            })
             .expect("submit_line mode should succeed");
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
@@ -4443,7 +4552,11 @@ mod tests {
                 .starts_with("\u{15}set -l __zellij_mcp_expected_hash '")
         );
         assert!(sent[0].0.contains("functions -q __zellij_mcp_run_b64"));
-        assert!(sent[0].0.contains(&TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo ok")));
+        assert!(
+            sent[0].0.contains(
+                &TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo ok")
+            )
+        );
         assert!(sent[0].1);
     }
 
@@ -4478,7 +4591,17 @@ mod tests {
         }
 
         service
-            .send(SendRequest { target: None, handle: spawn.handle.clone(), session_name: None, tab_name: None, selector: None, text: "run".to_string(), keys: vec![], input_mode: None, submit: true })
+            .send(SendRequest {
+                target: None,
+                handle: spawn.handle.clone(),
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "run".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: true,
+            })
             .expect("send should succeed");
 
         let observations = service
@@ -4507,7 +4630,17 @@ mod tests {
             .expect("attach should succeed");
 
         service
-            .send(SendRequest { target: None, handle: attach.handle.clone(), session_name: None, tab_name: None, selector: None, text: "echo hello".to_string(), keys: vec![], input_mode: None, submit: true })
+            .send(SendRequest {
+                target: None,
+                handle: attach.handle.clone(),
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "echo hello".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: true,
+            })
             .expect("send should succeed");
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
@@ -4550,7 +4683,17 @@ mod tests {
             .expect("spawn should succeed");
 
         service
-            .send(SendRequest { target: None, handle: spawn.handle, session_name: None, tab_name: None, selector: None, text: "echo hello".to_string(), keys: vec![], input_mode: None, submit: true })
+            .send(SendRequest {
+                target: None,
+                handle: spawn.handle,
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "echo hello".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: true,
+            })
             .expect("send should succeed");
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
@@ -4580,7 +4723,17 @@ mod tests {
             .expect("spawn should default to interactive fish");
 
         service
-            .send(SendRequest { target: None, handle: spawn.handle, session_name: None, tab_name: None, selector: None, text: "echo hello".to_string(), keys: vec![], input_mode: None, submit: true })
+            .send(SendRequest {
+                target: None,
+                handle: spawn.handle,
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "echo hello".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: true,
+            })
             .expect("default fish spawn should behave like a shell for follow-up send");
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
@@ -4624,7 +4777,9 @@ mod tests {
     fn canonical_fish_wrapper_source_renders_runtime_hash() {
         let source = TerminalService::<MockAdapter>::canonical_fish_wrapper_source();
         assert!(source.contains(TerminalService::<MockAdapter>::canonical_fish_wrapper_hash()));
-        assert!(!source.contains(TerminalService::<MockAdapter>::clean_fish_wrapper_hash_placeholder()));
+        assert!(
+            !source.contains(TerminalService::<MockAdapter>::clean_fish_wrapper_hash_placeholder())
+        );
     }
 
     #[test]
@@ -4708,7 +4863,10 @@ mod tests {
 
         assert_eq!(
             payload,
-            TerminalService::<MockAdapter>::build_clean_fish_wrapper_payload("echo direct", "zi_test")
+            TerminalService::<MockAdapter>::build_clean_fish_wrapper_payload(
+                "echo direct",
+                "zi_test"
+            )
         );
     }
 
@@ -4808,10 +4966,13 @@ mod tests {
         assert_eq!(sent.len(), 2);
         assert!(sent[0].0.contains("functions -q __zellij_mcp_run_b64"));
         assert!(!sent[1].0.contains("functions -q __zellij_mcp_run_b64"));
-        assert!(sent[1]
-            .0
-            .starts_with(&format!("{} zi_", TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint())));
-        assert!(sent[1].0.contains(&TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo second")));
+        assert!(sent[1].0.starts_with(&format!(
+            "{} zi_",
+            TerminalService::<MockAdapter>::clean_fish_wrapper_entrypoint()
+        )));
+        assert!(sent[1].0.contains(
+            &TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo second")
+        ));
     }
 
     #[test]
@@ -4853,9 +5014,11 @@ mod tests {
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
         assert_eq!(sent.len(), 2);
         assert!(sent[0].0.contains("functions -q __zellij_mcp_run_b64"));
-        assert!(sent[1]
-            .0
-            .starts_with("printf '__ZELLIJ_MCP_INTERACTION__:start:"));
+        assert!(
+            sent[1]
+                .0
+                .starts_with("printf '__ZELLIJ_MCP_INTERACTION__:start:")
+        );
         assert!(sent[1].0.contains("echo fallback"));
         assert!(sent[1].0.contains("__ZELLIJ_MCP_INTERACTION__:end:"));
     }
@@ -4887,7 +5050,17 @@ mod tests {
             .expect("attach should succeed");
 
         service
-            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: String::new(), keys: vec!["up".to_string()], input_mode: None, submit: false })
+            .send(SendRequest {
+                target: None,
+                handle: attach.handle,
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: String::new(),
+                keys: vec!["up".to_string()],
+                input_mode: None,
+                submit: false,
+            })
             .expect("send should succeed");
 
         let sent = sent_inputs.lock().expect("sent inputs lock should succeed");
@@ -5517,7 +5690,17 @@ mod tests {
             .expect("observations should save");
 
         service
-            .send(SendRequest { target: None, handle: attach.handle.clone(), session_name: None, tab_name: None, selector: None, text: "echo hello".to_string(), keys: vec![], input_mode: Some(InputMode::SubmitLine), submit: false })
+            .send(SendRequest {
+                target: None,
+                handle: attach.handle.clone(),
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "echo hello".to_string(),
+                keys: vec![],
+                input_mode: Some(InputMode::SubmitLine),
+                submit: false,
+            })
             .expect("send should recreate observation state");
 
         let observations = service
@@ -5635,7 +5818,17 @@ mod tests {
             .expect("close should succeed");
 
         let error = service
-            .send(SendRequest { target: None, handle: attach.handle, session_name: None, tab_name: None, selector: None, text: "run".to_string(), keys: vec![], input_mode: None, submit: false })
+            .send(SendRequest {
+                target: None,
+                handle: attach.handle,
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "run".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: false,
+            })
             .expect_err("send should reject closed handle");
         assert_eq!(error.code, ErrorCode::TargetStale);
     }
@@ -5656,7 +5849,17 @@ mod tests {
             .expect("attach should succeed");
 
         let error = service
-            .send(SendRequest { target: None, handle: attach.handle.clone(), session_name: None, tab_name: None, selector: None, text: "run".to_string(), keys: vec![], input_mode: None, submit: false })
+            .send(SendRequest {
+                target: None,
+                handle: attach.handle.clone(),
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "run".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: false,
+            })
             .expect_err("send should fail on missing target");
         assert_eq!(error.code, ErrorCode::TargetStale);
 
@@ -5688,7 +5891,17 @@ mod tests {
             .expect("spawn should succeed");
 
         let response = service
-            .send(SendRequest { target: None, handle: spawn.handle.clone(), session_name: None, tab_name: None, selector: None, text: "echo retry".to_string(), keys: vec![], input_mode: None, submit: true })
+            .send(SendRequest {
+                target: None,
+                handle: spawn.handle.clone(),
+                session_name: None,
+                tab_name: None,
+                selector: None,
+                text: "echo retry".to_string(),
+                keys: vec![],
+                input_mode: None,
+                submit: true,
+            })
             .expect("send should retry and succeed");
 
         assert!(response.accepted);
@@ -5696,7 +5909,9 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert!(sent[0].0.starts_with("set -l __zellij_mcp_expected_hash '"));
         assert!(sent[0].0.contains("functions -q __zellij_mcp_run_b64"));
-        assert!(sent[0].0.contains(&TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo retry")));
+        assert!(sent[0].0.contains(
+            &TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo retry")
+        ));
     }
 
     #[test]
@@ -5728,9 +5943,15 @@ mod tests {
         assert!(response.interaction_id.is_some());
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[0].0, "\u{3}");
-        assert!(sent[1].0.starts_with("\u{15}set -l __zellij_mcp_expected_hash '"));
+        assert!(
+            sent[1]
+                .0
+                .starts_with("\u{15}set -l __zellij_mcp_expected_hash '")
+        );
         assert!(sent[1].0.contains("functions -q __zellij_mcp_run_b64"));
-        assert!(sent[1].0.contains(&TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo swapped")));
+        assert!(sent[1].0.contains(
+            &TerminalService::<MockAdapter>::encode_wrapped_command_payload("echo swapped")
+        ));
     }
 
     #[test]
