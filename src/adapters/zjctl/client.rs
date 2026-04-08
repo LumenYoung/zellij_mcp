@@ -60,7 +60,11 @@ fn wait_for_output_with_timeout(
 ) -> Result<Output, AdapterError> {
     let start = std::time::Instant::now();
     loop {
-        if child.try_wait().map_err(|_| AdapterError::ZjctlUnavailable)?.is_some() {
+        if child
+            .try_wait()
+            .map_err(|_| AdapterError::ZjctlUnavailable)?
+            .is_some()
+        {
             return child
                 .wait_with_output()
                 .map_err(|_| AdapterError::ZjctlUnavailable);
@@ -856,8 +860,7 @@ fn run_remote_command_output_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|_| AdapterError::ZjctlUnavailable)
-        ?;
+        .map_err(|_| AdapterError::ZjctlUnavailable)?;
     wait_for_output_with_timeout(child, timeout)
 }
 
@@ -1204,14 +1207,20 @@ impl LocalBackend {
         serde_json::from_value(result).map_err(|error| AdapterError::ParseError(error.to_string()))
     }
 
-    fn list_tab_names_once(&self, session_name: &str) -> Result<BTreeMap<usize, String>, AdapterError> {
+    fn list_tab_names_once(
+        &self,
+        session_name: &str,
+    ) -> Result<BTreeMap<usize, String>, AdapterError> {
         let output = self.run_zellij_action(
             session_name,
             &["list-tabs".to_string(), "--json".to_string()],
         )?;
         let tabs: Vec<TabInfo> = serde_json::from_slice(&output)
             .map_err(|error| AdapterError::ParseError(error.to_string()))?;
-        Ok(tabs.into_iter().map(|tab| (tab.position, tab.name)).collect())
+        Ok(tabs
+            .into_iter()
+            .map(|tab| (tab.position, tab.name))
+            .collect())
     }
 
     fn list_targets_for_session(
@@ -1443,7 +1452,10 @@ impl SshBackend {
                 .iter()
                 .find(|(key, _)| key == "PATH")
                 .map(|(_, value)| value.clone()),
-            &[&self.config.remote_zellij_bin, &self.config.remote_zjctl_bin],
+            &[
+                &self.config.remote_zellij_bin,
+                &self.config.remote_zjctl_bin,
+            ],
         );
         if let Some(path) = path {
             assignments.retain(|(key, _)| key != "PATH");
@@ -1461,7 +1473,30 @@ impl SshBackend {
         env_assignments: &[(String, String)],
         args: &[String],
     ) -> String {
-        let mut command = String::from("exec env");
+        self.build_remote_command(binary, env_assignments, args, true)
+    }
+
+    fn build_remote_shell_command(
+        &self,
+        binary: &str,
+        env_assignments: &[(String, String)],
+        args: &[String],
+    ) -> String {
+        self.build_remote_command(binary, env_assignments, args, false)
+    }
+
+    fn build_remote_command(
+        &self,
+        binary: &str,
+        env_assignments: &[(String, String)],
+        args: &[String],
+        use_exec: bool,
+    ) -> String {
+        let mut command = if use_exec {
+            String::from("exec env")
+        } else {
+            String::from("env")
+        };
         for (key, value) in env_assignments {
             command.push(' ');
             command.push_str(&quote_posix_sh(&format!("{key}={value}")));
@@ -1548,12 +1583,16 @@ impl SshBackend {
         command: ZjctlCommand,
     ) -> Result<Vec<u8>, AdapterError> {
         let timeout = match &command {
-            ZjctlCommand::WaitIdle { timeout_seconds, .. } => timeout_seconds
-                .parse::<f64>()
-                .ok()
-                .map(Duration::from_secs_f64)
-                .unwrap_or(REMOTE_COMMAND_TIMEOUT)
-                + Duration::from_secs(2),
+            ZjctlCommand::WaitIdle {
+                timeout_seconds, ..
+            } => {
+                timeout_seconds
+                    .parse::<f64>()
+                    .ok()
+                    .map(Duration::from_secs_f64)
+                    .unwrap_or(REMOTE_COMMAND_TIMEOUT)
+                    + Duration::from_secs(2)
+            }
             _ => REMOTE_COMMAND_TIMEOUT,
         };
         let remote_command = self.build_remote_exec_command(
@@ -1561,7 +1600,8 @@ impl SshBackend {
             &self.remote_env_assignments(Some(session_name)),
             &command.args(),
         );
-        let output = run_remote_command_output_with_timeout(&self.config, &remote_command, timeout)?;
+        let output =
+            run_remote_command_output_with_timeout(&self.config, &remote_command, timeout)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let message = if stderr.is_empty() {
@@ -1670,13 +1710,12 @@ impl SshBackend {
             quote_posix_sh(&pipe_plugin_configuration_for(session_name)),
             quote_posix_sh(RPC_PIPE_NAME),
         );
-        let output =
-            run_remote_command_with_stdin_timeout(
-                &self.config,
-                &remote_command,
-                request_json.as_bytes(),
-                REMOTE_PROBE_TIMEOUT,
-            )?;
+        let output = run_remote_command_with_stdin_timeout(
+            &self.config,
+            &remote_command,
+            request_json.as_bytes(),
+            REMOTE_PROBE_TIMEOUT,
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1697,11 +1736,18 @@ impl SshBackend {
         serde_json::from_value(result).map_err(|error| AdapterError::ParseError(error.to_string()))
     }
 
-    fn list_tab_names_once(&self, session_name: &str) -> Result<BTreeMap<usize, String>, AdapterError> {
+    fn list_tab_names_once(
+        &self,
+        session_name: &str,
+    ) -> Result<BTreeMap<usize, String>, AdapterError> {
         let remote_command = self.build_remote_exec_command(
             &self.config.remote_zellij_bin,
             &self.remote_env_assignments(Some(session_name)),
-            &["action".to_string(), "list-tabs".to_string(), "--json".to_string()],
+            &[
+                "action".to_string(),
+                "list-tabs".to_string(),
+                "--json".to_string(),
+            ],
         );
         let output = run_remote_command_output_with_timeout(
             &self.config,
@@ -1710,7 +1756,10 @@ impl SshBackend {
         )?;
         let tabs: Vec<TabInfo> = serde_json::from_slice(&output.stdout)
             .map_err(|error| AdapterError::ParseError(error.to_string()))?;
-        Ok(tabs.into_iter().map(|tab| (tab.position, tab.name)).collect())
+        Ok(tabs
+            .into_iter()
+            .map(|tab| (tab.position, tab.name))
+            .collect())
     }
 
     fn list_targets_for_session(
@@ -1779,7 +1828,7 @@ impl SshBackend {
         })?;
         let remote_command = format!(
             "tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; {} ; status=$?; cat \"$tmp\"; exit $status",
-            self.build_remote_exec_command(
+            self.build_remote_shell_command(
                 &self.config.remote_zellij_bin,
                 &self.remote_env_assignments(Some(session_name)),
                 &{
@@ -1814,7 +1863,7 @@ impl SshBackend {
     fn dump_focused_screen(&self, session_name: &str, full: bool) -> Result<Vec<u8>, AdapterError> {
         let remote_command = format!(
             "tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; {} ; status=$?; cat \"$tmp\"; exit $status",
-            self.build_remote_exec_command(
+            self.build_remote_shell_command(
                 &self.config.remote_zellij_bin,
                 &self.remote_env_assignments(Some(session_name)),
                 &{
@@ -2059,13 +2108,7 @@ impl BackendAdapter for SshBackend {
         };
 
         let after = self.list_targets_for_session(&request.session_name)?;
-        resolve_spawned_target_from_run_output(
-            request,
-            before,
-            after,
-            &output,
-            &command_summary,
-        )
+        resolve_spawned_target_from_run_output(request, before, after, &output, &command_summary)
     }
 
     fn launch_spawn(&self, request: &SpawnRequest) -> Result<Option<ResolvedTarget>, AdapterError> {
@@ -2143,8 +2186,10 @@ impl BackendAdapter for SshBackend {
                             after,
                             &spawn_command.join(" "),
                         )?;
-                        if !matches!(shell_name(resolved.command.as_deref()).as_deref(), Some("fish"))
-                        {
+                        if !matches!(
+                            shell_name(resolved.command.as_deref()).as_deref(),
+                            Some("fish")
+                        ) {
                             self.send_input(
                                 &request.session_name,
                                 &resolved.selector,
@@ -2238,7 +2283,9 @@ impl BackendAdapter for SshBackend {
                     idle_ms,
                     timeout_ms,
                 )
-                .or_else(|_| self.wait_via_zjctl(session_name, &target.selector, idle_ms, timeout_ms))
+                .or_else(|_| {
+                    self.wait_via_zjctl(session_name, &target.selector, idle_ms, timeout_ms)
+                })
             }
             other => other,
         }
@@ -2259,16 +2306,15 @@ impl BackendAdapter for SshBackend {
                 captured_at: Utc::now(),
                 truncated: false,
             }),
-            Err(error) if is_unsupported_action_pane_target(&error) => {
-                self.focus_pane(session_name, &target.selector)
-                    .and_then(|_| self.dump_focused_screen(session_name, true))
-                    .map(|content| CaptureSnapshot {
-                        content: parse_capture_output(&content),
-                        captured_at: Utc::now(),
-                        truncated: false,
-                    })
-                    .or_else(|_| self.capture_via_zjctl(session_name, &target.selector, true))
-            }
+            Err(error) if is_unsupported_action_pane_target(&error) => self
+                .focus_pane(session_name, &target.selector)
+                .and_then(|_| self.dump_focused_screen(session_name, true))
+                .map(|content| CaptureSnapshot {
+                    content: parse_capture_output(&content),
+                    captured_at: Utc::now(),
+                    truncated: false,
+                })
+                .or_else(|_| self.capture_via_zjctl(session_name, &target.selector, true)),
             Err(error) => Err(error),
         }
     }
@@ -2353,22 +2399,16 @@ impl BackendAdapter for LocalBackend {
             ) {
                 self.run_zellij_action(
                     &request.session_name,
-                    &[
-                        "rename-tab-by-id".to_string(),
-                        tab_id,
-                        tab_name.to_string(),
-                    ],
+                    &["rename-tab-by-id".to_string(), tab_id, tab_name.to_string()],
                 )?;
             }
             let after = self.list_targets_for_session(&request.session_name)?;
             let resolved = resolve_spawned_target(request, before, after, &command_summary)?;
-            if !matches!(shell_name(resolved.command.as_deref()).as_deref(), Some("fish")) {
-                self.send_input(
-                    &request.session_name,
-                    &resolved.selector,
-                    "exec fish",
-                    true,
-                )?;
+            if !matches!(
+                shell_name(resolved.command.as_deref()).as_deref(),
+                Some("fish")
+            ) {
+                self.send_input(&request.session_name, &resolved.selector, "exec fish", true)?;
             }
             return Ok(resolved);
         }
@@ -2387,17 +2427,12 @@ impl BackendAdapter for LocalBackend {
             }
             run_args.push("--".to_string());
             run_args.extend(spawn_command);
-            self.run_zellij_command(Some(&request.session_name), &run_args)?.stdout
+            self.run_zellij_command(Some(&request.session_name), &run_args)?
+                .stdout
         };
 
         let after = self.list_targets_for_session(&request.session_name)?;
-        resolve_spawned_target_from_run_output(
-            request,
-            before,
-            after,
-            &output,
-            &command_summary,
-        )
+        resolve_spawned_target_from_run_output(request, before, after, &output, &command_summary)
     }
 
     fn resolve_selector(&self, request: &AttachRequest) -> Result<ResolvedTarget, AdapterError> {
@@ -2628,7 +2663,10 @@ fn parse_action_created_tab_id(stdout: &[u8]) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    trimmed.chars().all(|ch| ch.is_ascii_digit()).then_some(trimmed)
+    trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_digit())
+        .then_some(trimmed)
 }
 
 fn parse_command(command: &str) -> Result<Vec<String>, AdapterError> {
@@ -2806,7 +2844,9 @@ fn prepare_spawn(
 
     let reusable_targets: Vec<ResolvedTarget> = tab_targets
         .iter()
-        .filter(|target| is_reusable_terminal_target_for_request(request, &command, &tab_targets, target))
+        .filter(|target| {
+            is_reusable_terminal_target_for_request(request, &command, &tab_targets, target)
+        })
         .cloned()
         .collect();
     if let [target] = reusable_targets.as_slice() {
@@ -2849,17 +2889,14 @@ mod tests {
     use super::{
         PreparedSpawn, RemoteProbe, RemoteRemediationRunner, ResolvedTarget, SshBackendReadiness,
         SshReadinessFailure, SshTargetConfig,
-        augment_path_with_binary_dirs,
         attempt_safe_ssh_readiness_remediation_with_probe_and_runner,
-        classify_ssh_backend_readiness_with_probe, format_seconds,
-        helper_client_geometry_from_sources,
-        is_missing_plugin_message, is_protocol_version_mismatch_message,
-        is_reusable_terminal_target_for_request, is_unsupported_new_tab_initial_command,
-        matches_selector, parse_action_created_tab_id, terminal_targets_in_tab,
-        parse_command, parse_rpc_output,
-        prepare_spawn, resolve_spawn_command, resolve_spawned_target,
-        resolve_spawned_target_from_run_output,
-        resolve_ssh_runtime_config_with_probe,
+        augment_path_with_binary_dirs, classify_ssh_backend_readiness_with_probe, format_seconds,
+        helper_client_geometry_from_sources, is_missing_plugin_message,
+        is_protocol_version_mismatch_message, is_reusable_terminal_target_for_request,
+        is_unsupported_new_tab_initial_command, matches_selector, parse_action_created_tab_id,
+        parse_command, parse_rpc_output, prepare_spawn, resolve_spawn_command,
+        resolve_spawned_target, resolve_spawned_target_from_run_output,
+        resolve_ssh_runtime_config_with_probe, terminal_targets_in_tab,
     };
 
     #[derive(Default)]
@@ -3856,7 +3893,10 @@ mod tests {
     fn augment_path_with_binary_dirs_adds_explicit_binary_parents() {
         let path = augment_path_with_binary_dirs(
             Some("/usr/bin:/bin".to_string()),
-            &["/home/remote/.local/bin/zellij", "/home/remote/.local/bin/zjctl"],
+            &[
+                "/home/remote/.local/bin/zellij",
+                "/home/remote/.local/bin/zjctl",
+            ],
         )
         .expect("path should be produced");
 
@@ -3959,6 +3999,36 @@ mod tests {
                 .iter()
                 .any(|call| call == &format!("command_v:zellij:{normalized_path}"))
         );
+    }
+
+    #[test]
+    fn dump_screen_wrappers_use_shell_command_without_exec() {
+        let backend = super::SshBackend {
+            config: SshTargetConfig {
+                host: "a100".to_string(),
+                remote_zjctl_bin: "/home/test/.local/bin/zjctl".to_string(),
+                remote_zellij_bin: "/home/test/.local/bin/zellij".to_string(),
+                remote_env: BTreeMap::new(),
+                ssh_options: Vec::new(),
+            },
+        };
+
+        let command = backend.build_remote_shell_command(
+            &backend.config.remote_zellij_bin,
+            &backend.remote_env_assignments(Some("a100")),
+            &[
+                "action".to_string(),
+                "dump-screen".to_string(),
+                "--pane-id".to_string(),
+                "terminal_4".to_string(),
+                "--path".to_string(),
+                "$tmp".to_string(),
+                "--full".to_string(),
+            ],
+        );
+
+        assert!(command.starts_with("env "));
+        assert!(!command.starts_with("exec env "));
     }
 
     #[test]
@@ -4125,8 +4195,8 @@ mod tests {
             remote_env: BTreeMap::new(),
             ssh_options: Vec::new(),
         };
-        let message = "zrpc plugin not found at /home/remote/.config/zellij/plugins/zrpc.wasm"
-            .to_string();
+        let message =
+            "zrpc plugin not found at /home/remote/.config/zellij/plugins/zrpc.wasm".to_string();
         let probe = FakeProbe {
             home: None,
             path: None,
@@ -4535,13 +4605,11 @@ mod tests {
 
     #[test]
     fn detects_protocol_version_mismatch_messages() {
-        assert!(is_protocol_version_mismatch_message(
-            &format!(
-                "zrpc protocol version mismatch: expected {}, got {}",
-                PROTOCOL_VERSION,
-                PROTOCOL_VERSION + 1
-            )
-        ));
+        assert!(is_protocol_version_mismatch_message(&format!(
+            "zrpc protocol version mismatch: expected {}, got {}",
+            PROTOCOL_VERSION,
+            PROTOCOL_VERSION + 1
+        )));
         assert!(!is_protocol_version_mismatch_message(
             "Error: no response from zrpc plugin"
         ));
