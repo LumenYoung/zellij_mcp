@@ -1,19 +1,9 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ZjctlCommand {
-    Availability,
     List,
-    Spawn {
-        cwd: Option<String>,
-        title: Option<String>,
-        command: Vec<String>,
-    },
     Capture {
         selector: String,
         full: bool,
-    },
-    Send {
-        selector: String,
-        text: String,
     },
     WaitIdle {
         selector: String,
@@ -29,32 +19,7 @@ pub enum ZjctlCommand {
 impl ZjctlCommand {
     pub fn args(&self) -> Vec<String> {
         match self {
-            Self::Availability => vec!["--help".to_string()],
             Self::List => vec!["panes".to_string(), "ls".to_string(), "--json".to_string()],
-            Self::Spawn {
-                cwd,
-                title,
-                command,
-            } => {
-                let mut args = vec!["pane".to_string(), "launch".to_string()];
-
-                if let Some(cwd) = cwd {
-                    args.push("--cwd".to_string());
-                    args.push(cwd.clone());
-                }
-
-                if let Some(title) = title {
-                    args.push("--name".to_string());
-                    args.push(title.clone());
-                }
-
-                if !command.is_empty() {
-                    args.push("--".to_string());
-                    args.extend(command.clone());
-                }
-
-                args
-            }
             Self::Capture { selector, full } => {
                 let mut args = vec![
                     "pane".to_string(),
@@ -69,14 +34,6 @@ impl ZjctlCommand {
 
                 args
             }
-            Self::Send { selector, text } => vec![
-                "pane".to_string(),
-                "send".to_string(),
-                "--pane".to_string(),
-                selector.clone(),
-                "--".to_string(),
-                text.clone(),
-            ],
             Self::WaitIdle {
                 selector,
                 idle_seconds,
@@ -128,40 +85,6 @@ mod tests {
             }
             .args(),
             vec!["pane", "capture", "--pane", "id:terminal:7", "--full"]
-        );
-    }
-
-    #[test]
-    fn builds_spawn_args() {
-        assert_eq!(
-            ZjctlCommand::Spawn {
-                cwd: Some("/tmp".to_string()),
-                title: Some("editor".to_string()),
-                command: vec!["lazygit".to_string()],
-            }
-            .args(),
-            vec![
-                "pane", "launch", "--cwd", "/tmp", "--name", "editor", "--", "lazygit"
-            ]
-        );
-    }
-
-    #[test]
-    fn builds_send_args() {
-        assert_eq!(
-            ZjctlCommand::Send {
-                selector: "id:terminal:7".to_string(),
-                text: "printf 'ok\\n'\n".to_string(),
-            }
-            .args(),
-            vec![
-                "pane",
-                "send",
-                "--pane",
-                "id:terminal:7",
-                "--",
-                "printf 'ok\\n'\n"
-            ]
         );
     }
 

@@ -2,9 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use serde::Deserialize;
-use zellij_mcp::adapters::zjctl::{
-    LocalBackend, SshBackend, SshTargetConfig, missing_binary_name, resolve_ssh_runtime_config,
-};
+use zellij_mcp::adapters::zjctl::{LocalBackend, SshBackend, SshTargetConfig};
 use zellij_mcp::domain::errors::DomainError;
 use zellij_mcp::persistence::{ObservationStore, RegistryStore};
 use zellij_mcp::server::{McpServer, RmcpServer, daemon_identity};
@@ -183,48 +181,9 @@ fn build_remote_backend(
     registry_store: &RegistryStore,
     observation_store: &ObservationStore,
 ) -> Result<Arc<dyn TerminalManager>, DomainError> {
-    let resolved_config = resolve_ssh_runtime_config(config).map_err(|error| match error {
-        zellij_mcp::adapters::zjctl::AdapterError::ZjctlUnavailable => DomainError::new(
-            zellij_mcp::domain::errors::ErrorCode::ZjctlUnavailable,
-            format!(
-                "remote target `{target_id}` on host `{}` is not reachable over SSH; verify the SSH alias, connectivity, and command availability before retrying",
-                config.host
-            ),
-            true,
-        ),
-        zellij_mcp::adapters::zjctl::AdapterError::CommandFailed(message)
-            if missing_binary_name(&message).is_some() =>
-        {
-            DomainError::new(
-                zellij_mcp::domain::errors::ErrorCode::ZjctlUnavailable,
-                format!(
-                    "remote target `{target_id}` on host `{}` could not resolve required binaries before session selection: {message}",
-                    config.host
-                ),
-                true,
-            )
-        }
-        zellij_mcp::adapters::zjctl::AdapterError::CommandFailed(message) => DomainError::new(
-            zellij_mcp::domain::errors::ErrorCode::ZjctlUnavailable,
-            format!(
-                "remote target `{target_id}` on host `{}` failed during runtime preparation before session selection: {message}",
-                config.host
-            ),
-            true,
-        ),
-        other => DomainError::new(
-            zellij_mcp::domain::errors::ErrorCode::ZjctlUnavailable,
-            format!(
-                "remote target `{target_id}` on host `{}` failed during runtime preparation before session selection: {}",
-                config.host, other
-            ),
-            true,
-        ),
-    })?;
-
     Ok(Arc::new(TerminalService::new(
         target_id,
-        SshBackend::new(resolved_config),
+        SshBackend::new(config.clone()),
         registry_store.clone(),
         observation_store.clone(),
     )) as Arc<dyn TerminalManager>)

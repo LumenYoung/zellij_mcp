@@ -12,7 +12,7 @@ use crate::domain::requests::{AttachRequest, SpawnRequest};
 use crate::domain::status::SpawnTarget;
 
 use super::commands::ZjctlCommand;
-use super::parser::{parse_capture_output, parse_spawn_output};
+use super::parser::{parse_capture_output, parse_list_output, parse_spawn_output};
 
 fn quote_posix_sh(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -883,19 +883,6 @@ fn run_remote_command_string(
     Ok(output.stdout)
 }
 
-fn run_remote_command_with_stdin(
-    config: &SshTargetConfig,
-    remote_command: &str,
-    stdin_payload: &[u8],
-) -> Result<Output, AdapterError> {
-    run_remote_command_with_stdin_timeout(
-        config,
-        remote_command,
-        stdin_payload,
-        REMOTE_COMMAND_TIMEOUT,
-    )
-}
-
 fn run_remote_command_with_stdin_timeout(
     config: &SshTargetConfig,
     remote_command: &str,
@@ -1388,6 +1375,7 @@ impl Default for LocalBackend {
 
 impl SshBackend {
     pub fn new(config: SshTargetConfig) -> Self {
+        let config = resolve_ssh_runtime_config(&config).unwrap_or(config);
         Self { config }
     }
 
@@ -1687,10 +1675,9 @@ impl SshBackend {
         let plugin_path = self.remote_plugin_path_expr();
         let plugin_url = self.remote_plugin_url_expr();
         let plugin_check = format!("[ -f \"{plugin_path}\" ]");
-        if run_remote_command_output(&self.config, &plugin_check)
+        if !run_remote_command_output(&self.config, &plugin_check)
             .map(|output| output.status.success())
             .unwrap_or(false)
-            == false
         {
             return Err(AdapterError::CommandFailed(format!(
                 "zrpc plugin not found at {plugin_path}\n\nLoad it in Zellij:\n  {}",
@@ -1731,35 +1718,9 @@ impl SshBackend {
         parse_rpc_output(&stdout, request.id, &plugin_url)
     }
 
-    fn list_panes_once(&self, session_name: &str) -> Result<Vec<PaneInfo>, AdapterError> {
-        let result = self.rpc_call(session_name, methods::PANES_LIST, serde_json::json!({}))?;
-        serde_json::from_value(result).map_err(|error| AdapterError::ParseError(error.to_string()))
-    }
-
-    fn list_tab_names_once(
-        &self,
-        session_name: &str,
-    ) -> Result<BTreeMap<usize, String>, AdapterError> {
-        let remote_command = self.build_remote_exec_command(
-            &self.config.remote_zellij_bin,
-            &self.remote_env_assignments(Some(session_name)),
-            &[
-                "action".to_string(),
-                "list-tabs".to_string(),
-                "--json".to_string(),
-            ],
-        );
-        let output = run_remote_command_output_with_timeout(
-            &self.config,
-            &remote_command,
-            REMOTE_COMMAND_TIMEOUT,
-        )?;
-        let tabs: Vec<TabInfo> = serde_json::from_slice(&output.stdout)
-            .map_err(|error| AdapterError::ParseError(error.to_string()))?;
-        Ok(tabs
-            .into_iter()
-            .map(|tab| (tab.position, tab.name))
-            .collect())
+    fn list_panes_once(&self, session_name: &str) -> Result<Vec<ResolvedTarget>, AdapterError> {
+        let output = self.run_remote_zjctl_command(session_name, ZjctlCommand::List)?;
+        parse_list_output(&String::from_utf8_lossy(&output), Some(session_name))
     }
 
     fn list_targets_for_session(
@@ -1770,32 +1731,39 @@ impl SshBackend {
         let timeout = Duration::from_millis(500);
         let interval = Duration::from_millis(50);
 
-        let mut panes = self.list_panes_once(session_name)?;
-        let tab_names = self.list_tab_names_once(session_name).unwrap_or_default();
-        let mut ids = pane_ids(&panes);
+        let mut targets = self.list_panes_once(session_name)?;
+        let mut ids: Vec<_> = targets
+            .iter()
+            .map(|target| {
+                target
+                    .pane_id
+                    .as_deref()
+                    .unwrap_or(target.selector.as_str())
+                    .to_string()
+            })
+            .collect();
 
         loop {
             if start.elapsed() >= timeout {
-                return Ok(panes
-                    .into_iter()
-                    .map(|pane| {
-                        pane_info_to_target_with_tab_names(pane, Some(session_name), &tab_names)
-                    })
-                    .collect());
+                return Ok(targets);
             }
 
             std::thread::sleep(interval);
             let next = self.list_panes_once(session_name)?;
-            let next_ids = pane_ids(&next);
+            let next_ids: Vec<_> = next
+                .iter()
+                .map(|target| {
+                    target
+                        .pane_id
+                        .as_deref()
+                        .unwrap_or(target.selector.as_str())
+                        .to_string()
+                })
+                .collect();
             if next_ids == ids {
-                return Ok(next
-                    .into_iter()
-                    .map(|pane| {
-                        pane_info_to_target_with_tab_names(pane, Some(session_name), &tab_names)
-                    })
-                    .collect());
+                return Ok(next);
             }
-            panes = next;
+            targets = next;
             ids = next_ids;
         }
     }
@@ -2146,7 +2114,7 @@ impl BackendAdapter for SshBackend {
                 &self.config.remote_zellij_bin,
                 &self.remote_env_assignments(Some(&request.session_name)),
                 &std::iter::once("action".to_string())
-                    .chain(action_args.into_iter())
+                    .chain(action_args)
                     .collect::<Vec<_>>(),
             );
             if command_via_action {
@@ -2171,7 +2139,7 @@ impl BackendAdapter for SshBackend {
                             &self.config.remote_zellij_bin,
                             &self.remote_env_assignments(Some(&request.session_name)),
                             &std::iter::once("action".to_string())
-                                .chain(compat_action_args.into_iter())
+                                .chain(compat_action_args)
                                 .collect::<Vec<_>>(),
                         );
                         self.run_remote_command_checked(
@@ -2301,11 +2269,18 @@ impl BackendAdapter for SshBackend {
         }
         let target = self.resolved_target(session_name, handle)?;
         match self.dump_screen(session_name, &target.selector, true) {
-            Ok(content) => Ok(CaptureSnapshot {
-                content: parse_capture_output(&content),
-                captured_at: Utc::now(),
-                truncated: false,
-            }),
+            Ok(content) => {
+                let parsed = parse_capture_output(&content);
+                if parsed.is_empty() {
+                    self.capture_via_zjctl(session_name, &target.selector, true)
+                } else {
+                    Ok(CaptureSnapshot {
+                        content: parsed,
+                        captured_at: Utc::now(),
+                        truncated: false,
+                    })
+                }
+            }
             Err(error) if is_unsupported_action_pane_target(&error) => self
                 .focus_pane(session_name, &target.selector)
                 .and_then(|_| self.dump_focused_screen(session_name, true))
@@ -2643,13 +2618,12 @@ fn resolve_spawned_target_from_run_output(
         request.tab_name.as_deref(),
         request.title.as_deref(),
     ) {
-        if let Some(pane_id) = parsed.pane_id.as_deref() {
-            if let Some(resolved) = after
+        if let Some(pane_id) = parsed.pane_id.as_deref()
+            && let Some(resolved) = after
                 .iter()
                 .find(|target| target.pane_id.as_deref() == Some(pane_id))
-            {
-                return Ok(resolved.clone());
-            }
+        {
+            return Ok(resolved.clone());
         }
 
         return Ok(parsed);
@@ -2772,7 +2746,7 @@ fn is_default_fish_spawn_request(request: &SpawnRequest, command: &[String]) -> 
         && matches!(command, [single] if single == "fish")
 }
 
-fn terminal_targets_in_tab<'a>(tab_targets: &'a [ResolvedTarget]) -> Vec<&'a ResolvedTarget> {
+fn terminal_targets_in_tab(tab_targets: &[ResolvedTarget]) -> Vec<&ResolvedTarget> {
     tab_targets
         .iter()
         .filter(|target| is_terminal_target(target))

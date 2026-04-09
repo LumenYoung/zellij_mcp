@@ -145,7 +145,6 @@ where
         not_found_message: &'static str,
         ambiguous_message: &'static str,
     ) -> Result<crate::adapters::zjctl::ResolvedTarget, DomainError> {
-        self.ensure_session_ready(intent.session_name, operation_error_code.clone())?;
         let candidates = self
             .adapter
             .list_targets_in_session(intent.session_name)
@@ -606,14 +605,6 @@ where
                 TerminalStatus::Stale => "stale".to_string(),
                 TerminalStatus::Closed => "closed".to_string(),
             },
-        }
-    }
-
-    fn spawn_reconcile_budget(wait_ready: bool) -> Duration {
-        if wait_ready {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_millis(300)
         }
     }
 
@@ -1740,7 +1731,6 @@ where
 
     fn discover(&self, request: DiscoverRequest) -> Result<DiscoverResponse, DomainError> {
         self.ensure_available()?;
-        self.ensure_session_ready(&request.session_name, ErrorCode::AttachFailed)?;
         let preview_lines =
             Self::validate_positive_lines(request.preview_lines, "preview_lines")?.unwrap_or(8);
 
@@ -2176,7 +2166,6 @@ where
 
     fn layout(&self, request: LayoutRequest) -> Result<LayoutResponse, DomainError> {
         self.ensure_available()?;
-        self.ensure_session_ready(&request.session_name, ErrorCode::AttachFailed)?;
 
         let mut grouped: std::collections::BTreeMap<String, Vec<DiscoverCandidate>> =
             std::collections::BTreeMap::new();
