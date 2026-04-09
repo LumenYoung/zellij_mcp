@@ -21,6 +21,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-wasip1
 
       - name: Verify tag matches Cargo version
         shell: bash
@@ -50,13 +51,17 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+      - name: Build release plugin
+        run: cargo build-plugin
+
       - name: Package release artifact
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
           cp target/release/zellij_mcp dist/zellij_mcp
-          tar -C dist -czf "dist/${ARTIFACT_BASENAME}.tar.gz" zellij_mcp
+          cp target/wasm32-wasip1/release/zrpc.wasm dist/zrpc.wasm
+          tar -C dist -czf "dist/${ARTIFACT_BASENAME}.tar.gz" zellij_mcp zrpc.wasm
           sha256sum "dist/${ARTIFACT_BASENAME}.tar.gz" > "dist/${ARTIFACT_BASENAME}.tar.gz.sha256"
 
       - name: Upload packaged artifacts
@@ -66,6 +71,7 @@ jobs:
           path: |
             dist/${{ env.ARTIFACT_BASENAME }}.tar.gz
             dist/${{ env.ARTIFACT_BASENAME }}.tar.gz.sha256
+            dist/zrpc.wasm
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
@@ -73,4 +79,5 @@ jobs:
           files: |
             dist/${{ env.ARTIFACT_BASENAME }}.tar.gz
             dist/${{ env.ARTIFACT_BASENAME }}.tar.gz.sha256
+            dist/zrpc.wasm
           generate_release_notes: true
